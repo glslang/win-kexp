@@ -79,7 +79,7 @@ pub fn io_device_control(h_device: HANDLE, dwcontrolcode: u32, lpinbuffer: *cons
     }
 }
 
-pub fn create_cmd_process() {
+pub fn create_cmd_process() -> PROCESS_INFORMATION {
     let mut si = STARTUPINFOA::default();
     si.cb = std::mem::size_of::<STARTUPINFOA>() as u32;
     si.dwFlags = STARTF_USESTDHANDLES;
@@ -104,7 +104,9 @@ pub fn create_cmd_process() {
             &si,
             &mut pi,
         )
-        .expect("Failed to create process");
+        .expect("[-] Failed to create process");
+
+        pi
     }
 }
 
