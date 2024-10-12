@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 byte-strings = "0.3.1"
+goblin = "0.8.2"
 hex = "0.4.3"
 windows-strings = "0.1.0"
 
