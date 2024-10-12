@@ -63,7 +63,12 @@ pub fn close_handle(handle: HANDLE) {
     }
 }
 
-pub fn io_device_control(h_device: HANDLE, dwcontrolcode: u32, lpinbuffer: *const c_void, inbuffersize: u32) {
+pub fn io_device_control(
+    h_device: HANDLE,
+    dwcontrolcode: u32,
+    lpinbuffer: *const c_void,
+    inbuffersize: u32,
+) {
     unsafe {
         DeviceIoControl(
             h_device,
