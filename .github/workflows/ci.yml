@@ -22,14 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: microsoft/setup-msbuild@v1.1
-      - name: Add MASM to PATH
-        shell: pwsh
-        run: |
-          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-          $vcToolsVersion = (Get-Content "$vsPath\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt").Trim()
-          $masmPath = Join-Path $vsPath "VC\Tools\MSVC\$vcToolsVersion\bin\Hostx64\x64"
-          $env:PATH = "$masmPath;$env:PATH"
-          echo "$masmPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - uses: actions/setup-masm@v1
       - name: Install Rust
         run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - name: Build
