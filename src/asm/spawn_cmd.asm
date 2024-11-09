@@ -1,5 +1,8 @@
 .code
 
+@start:                       ; Entry point label
+    jmp spawn_cmd             ; Jump to your main procedure
+
 find_kernelbase PROC
     sub rsp, 28h
     mov rcx, 60h                ; RCX = 0x60
