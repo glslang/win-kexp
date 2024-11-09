@@ -3,14 +3,19 @@ use std::process::Command;
 fn main() {
     #[cfg(target_os = "windows")]
     {
-        for file in &["src/token_stealing.asm", "src/acl_edit.asm"] {
+        for file in &[
+            "src/asm/token_stealing.asm",
+            "src/asm/acl_edit.asm",
+            "src/asm/spawn_cmd.asm",
+        ] {
             if !std::path::Path::new(file).exists() {
                 eprintln!("[-] Assembly file not found: {}", file);
             }
         }
 
-        compile_asm("src/token_stealing.asm", "src/token_stealing.obj");
-        compile_asm("src/acl_edit.asm", "src/acl_edit.obj");
+        compile_asm("src/asm/token_stealing.asm", "src/asm/token_stealing.obj");
+        compile_asm("src/asm/acl_edit.asm", "src/asm/acl_edit.obj");
+        compile_asm("src/asm/spawn_cmd.asm", "src/asm/spawn_cmd.obj");
     }
 }
 
