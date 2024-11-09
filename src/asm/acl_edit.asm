@@ -42,7 +42,7 @@ __loop:
     RESTORE_REGS
     xor r12,r12
     add rsp,28h
-    mov r15, [rsp+88h]
+    mov r15,[rsp+88h]
     ret
 acl_edit ENDP
 

