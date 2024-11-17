@@ -1,7 +1,7 @@
 use core::ffi::c_void;
 use std::usize;
 
-use windows_strings::PSTR;
+use windows_core::PSTR;
 
 pub use windows::{
     core::PCSTR,
