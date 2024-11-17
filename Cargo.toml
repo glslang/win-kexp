@@ -3,6 +3,9 @@ name = "win-kexp"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+shellcode_fallback = []
+
 [dependencies]
 byte-strings = "0.3.1"
 goblin = "0.9.2"
