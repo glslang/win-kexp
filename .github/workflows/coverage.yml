@@ -1,0 +1,54 @@
+name: Coverage
+
+on:
+  # Triggers the workflow on push or pull request events but only for the "main" branch
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  coverage:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v1.1
+      - uses: glslang/setup-masm@v1
+
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+
+      - name: Install LLVM tools
+        run: rustup component add llvm-tools-preview
+
+      - name: Install grcov
+        run: cargo install grcov
+
+      - name: Run tests with coverage
+        shell: bash
+        run: |
+          RUSTFLAGS="-C instrument-coverage" \
+          LLVM_PROFILE_FILE="coverage-%p-%m.profraw" \
+          cargo test
+
+      - name: Generate coverage report
+        shell: bash
+        run: |
+          grcov . \
+            --binary-path ./target/debug/ \
+            -s . \
+            -t lcov \
+            --branch \
+            --ignore-not-existing \
+            --ignore "/*" \
+            -o lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
