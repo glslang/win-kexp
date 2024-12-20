@@ -66,7 +66,10 @@ fn compile_asm_files() {
 
     #[cfg(target_arch = "aarch64")]
     {
-        compile_asm_arm64("src/asm/token_stealing_arm64.asm", "src/asm/token_stealing.obj");
+        compile_asm_arm64(
+            "src/asm/token_stealing_arm64.asm",
+            "src/asm/token_stealing.obj",
+        );
         compile_asm_arm64("src/asm/acl_edit_arm64.asm", "src/asm/acl_edit.obj");
         compile_asm_arm64("src/asm/spawn_cmd_arm64.asm", "src/asm/spawn_cmd.obj");
     }

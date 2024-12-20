@@ -13,6 +13,8 @@ Windows Kernel Programming
 - Use Windows API functions and structures for kernel programming.
 - Use windows-rs crate for Windows API bindings.
 - Use @Web https://microsoft.github.io/windows-docs-rs/doc/windows/ for Windows API documentation.
+- When using windows-rs, use the `windows` module for Windows API bindings.
+- When using windows-rs, declare the relevant functions and structures and add the necessary imports.
 
 Assembly Programming
 - Use MASM syntax for assembly programming on X86_64 architecture.
@@ -22,6 +24,5 @@ Assembly Programming
 
 Error Handling and Safety
 - Embrace Rust's Result and Option types for error handling.
-- Use `?` operator to propagate errors in async functions.
 - Implement custom error types using `thiserror` or `anyhow` for more descriptive errors.
 - Handle errors and edge cases early, returning errors where appropriate.

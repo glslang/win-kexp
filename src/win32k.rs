@@ -14,6 +14,7 @@ pub use windows::{
             Ioctl::{FILE_ANY_ACCESS, FILE_DEVICE_UNKNOWN, METHOD_NEITHER},
             LibraryLoader::{GetModuleHandleA, GetProcAddress},
             Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE},
+            ProcessStatus::EnumDeviceDrivers,
             Threading::{
                 CreateProcessA, CREATE_NEW_CONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
                 STARTUPINFOA,
@@ -138,5 +139,31 @@ pub fn get_function_address(dll_name: &str, function_name: &str) -> *mut c_void 
             .expect("[-] Failed to get function address");
 
         proc_addr as *mut c_void
+    }
+}
+
+pub fn get_ntoskrnl_base() -> *mut c_void {
+    unsafe {
+        let mut needed_size: u32 = 0;
+        let mut drivers: Vec<*mut c_void> = Vec::new();
+
+        // First call to get required size
+        EnumDeviceDrivers(std::ptr::null_mut(), 0, &mut needed_size)
+            .expect("[-] Failed to get required size for drivers");
+
+        // Allocate buffer based on needed size
+        let driver_count = needed_size as usize / std::mem::size_of::<*mut c_void>();
+        drivers.resize(driver_count, std::ptr::null_mut());
+
+        // Second call to get actual driver addresses
+        EnumDeviceDrivers(
+            drivers.as_mut_ptr() as *mut _,
+            needed_size,
+            &mut needed_size,
+        )
+        .expect("[-] Failed to enumerate drivers");
+
+        // ntoskrnl.exe is always the first driver
+        drivers[0]
     }
 }
