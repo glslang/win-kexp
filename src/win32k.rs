@@ -1,5 +1,6 @@
 use core::ffi::c_void;
 use std::usize;
+use thiserror::Error;
 
 use windows_core::PSTR;
 
@@ -142,28 +143,33 @@ pub fn get_function_address(dll_name: &str, function_name: &str) -> *mut c_void 
     }
 }
 
-pub fn get_ntoskrnl_base() -> *mut c_void {
+#[derive(Error, Debug)]
+pub enum KernelError {
+    #[error("Failed to get ntoskrnl.exe base address: null pointer received")]
+    NullNtoskrnlBase,
+}
+
+pub fn get_ntoskrnl_base() -> Result<*mut c_void, KernelError> {
     unsafe {
         let mut needed_size: u32 = 0;
-        let mut drivers: Vec<*mut c_void> = Vec::new();
 
         // First call to get required size
         EnumDeviceDrivers(std::ptr::null_mut(), 0, &mut needed_size)
             .expect("[-] Failed to get required size for drivers");
 
-        // Allocate buffer based on needed size
+        // Allocate buffer with exact size needed
         let driver_count = needed_size as usize / std::mem::size_of::<*mut c_void>();
-        drivers.resize(driver_count, std::ptr::null_mut());
+        let mut drivers = vec![std::ptr::null_mut(); driver_count];
 
         // Second call to get actual driver addresses
-        EnumDeviceDrivers(
-            drivers.as_mut_ptr() as *mut _,
-            needed_size,
-            &mut needed_size,
-        )
-        .expect("[-] Failed to enumerate drivers");
+        EnumDeviceDrivers(drivers.as_mut_ptr(), needed_size, &mut needed_size)
+            .expect("[-] Failed to enumerate drivers");
 
-        // ntoskrnl.exe is always the first driver
-        drivers[0]
+        // Check if the first driver address is non-null
+        if !drivers[0].is_null() {
+            Ok(drivers[0])
+        } else {
+            Err(KernelError::NullNtoskrnlBase)
+        }
     }
 }
