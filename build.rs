@@ -45,8 +45,8 @@ fn compile_asm_files() {
     #[cfg(target_arch = "aarch64")]
     let asm_files = [
         "src/asm/token_stealing_arm64.asm",
-        "src/asm/acl_edit.asm",
-        "src/asm/spawn_cmd.asm",
+        "src/asm/acl_edit_arm64.asm",
+        "src/asm/spawn_cmd_arm64.asm",
     ];
 
     for file in &asm_files {
