@@ -282,6 +282,7 @@ pub fn spawn_cmd_shellcode() -> Vec<u8> {
 }
 
 #[cfg(target_os = "windows")]
+#[cfg(target_arch = "x86_64")]
 #[cfg(test)]
 mod tests {
     use super::*;
