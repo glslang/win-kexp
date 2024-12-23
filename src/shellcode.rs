@@ -248,7 +248,7 @@ fn extract_shellcode_from_obj(shellcode_obj: &[u8]) -> Vec<u8> {
 
 #[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 pub fn token_stealing_shellcode() -> Vec<u8> {
-    let shellcode_obj = include_bytes!("asm/token_stealing.obj");
+    let shellcode_obj = include_bytes!(concat!(env!("OUT_DIR"), "/token_stealing.obj"));
     extract_shellcode_from_obj(shellcode_obj)
 }
 
@@ -272,7 +272,7 @@ pub fn token_stealing_shellcode() -> Vec<u8> {
 
 #[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 pub fn acl_edit_shellcode() -> Vec<u8> {
-    let shellcode_obj = include_bytes!("asm/acl_edit.obj");
+    let shellcode_obj = include_bytes!(concat!(env!("OUT_DIR"), "/acl_edit.obj"));
     extract_shellcode_from_obj(shellcode_obj)
 }
 
@@ -283,7 +283,7 @@ pub fn acl_edit_shellcode() -> Vec<u8> {
 
 #[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 pub fn spawn_cmd_shellcode() -> Vec<u8> {
-    let shellcode_obj = include_bytes!("asm/spawn_cmd.obj");
+    let shellcode_obj = include_bytes!(concat!(env!("OUT_DIR"), "/spawn_cmd.obj"));
     extract_shellcode_from_obj(shellcode_obj)
 }
 

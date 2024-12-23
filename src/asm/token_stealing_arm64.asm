@@ -1,9 +1,21 @@
-; Constants for Windows kernel offsets
+; Version-specific offsets
+    IF WINDOWS_VERSION == "24H2"
+; Windows 10 offsets
 KTHREAD_OFFSET     EQU 0x988    ; Offset to current KTHREAD
 EPROCESS_OFFSET    EQU 0x0B0    ; Offset to EPROCESS
 ACTIVEPROCESSLINKS EQU 0x1C8    ; Offset to ActiveProcessLinks
 PID_OFFSET         EQU 0x1C0    ; Offset to process ID
 TOKEN_OFFSET       EQU 0x238    ; Offset to process token
+    ELIF WINDOWS_VERSION == "23H2"
+; Windows 11 offsets
+KTHREAD_OFFSET     EQU 0x988    ; Offset to current KTHREAD
+EPROCESS_OFFSET    EQU 0x0B0    ; Offset to EPROCESS
+ACTIVEPROCESSLINKS EQU 0x400    ; Offset to ActiveProcessLinks
+PID_OFFSET         EQU 0x3F8    ; Offset to process ID
+TOKEN_OFFSET       EQU 0x470    ; Offset to process token
+    ELSE
+    ERROR "WINDOWS_VERSION not defined or unsupported"
+    ENDIF
 
     AREA |.text|,CODE,READONLY
     ALIGN
