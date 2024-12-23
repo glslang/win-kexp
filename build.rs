@@ -35,6 +35,17 @@ fn main() {
 
 #[cfg(target_os = "windows")]
 fn compile_asm_files() {
+    let windows_version_original = std::env::var("WINDOWS_VERSION").unwrap_or_else(|_| "24H2".to_string());
+    let windows_version = windows_version_original.trim();
+
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
+
+    if cfg!(target_arch = "aarch64") && !["23H2", "24H2"].contains(&windows_version) {
+        eprintln!("[-] Invalid Windows version: {}. Must be either 23H2 or 24H2", windows_version);
+        println!("cargo:rustc-cfg=feature=\"shellcode_fallback\"");
+        return;
+    }
+
     #[cfg(target_arch = "x86_64")]
     let asm_files = [
         "src/asm/token_stealing.asm",
@@ -59,19 +70,37 @@ fn compile_asm_files() {
 
     #[cfg(target_arch = "x86_64")]
     {
-        compile_asm_x64("src/asm/token_stealing.asm", "src/asm/token_stealing.obj");
-        compile_asm_x64("src/asm/acl_edit.asm", "src/asm/acl_edit.obj");
-        compile_asm_x64("src/asm/spawn_cmd.asm", "src/asm/spawn_cmd.obj");
+        compile_asm_x64(
+            "src/asm/token_stealing.asm",
+            &format!("{}/token_stealing.obj", out_dir)
+        );
+        compile_asm_x64(
+            "src/asm/acl_edit.asm",
+            &format!("{}/acl_edit.obj", out_dir)
+        );
+        compile_asm_x64(
+            "src/asm/spawn_cmd.asm",
+            &format!("{}/spawn_cmd.obj", out_dir)
+        );
     }
 
     #[cfg(target_arch = "aarch64")]
     {
         compile_asm_arm64(
             "src/asm/token_stealing_arm64.asm",
-            "src/asm/token_stealing.obj",
+            &format!("{}/token_stealing.obj", out_dir),
+            &windows_version,
         );
-        compile_asm_arm64("src/asm/acl_edit_arm64.asm", "src/asm/acl_edit.obj");
-        compile_asm_arm64("src/asm/spawn_cmd_arm64.asm", "src/asm/spawn_cmd.obj");
+        compile_asm_arm64(
+            "src/asm/acl_edit_arm64.asm",
+            &format!("{}/acl_edit.obj", out_dir),
+            &windows_version,
+        );
+        compile_asm_arm64(
+            "src/asm/spawn_cmd_arm64.asm",
+            &format!("{}/spawn_cmd.obj", out_dir),
+            &windows_version,
+        );
     }
 }
 
@@ -107,12 +136,14 @@ fn compile_asm_x64(asm_file: &str, obj_file: &str) {
 
 #[cfg(target_os = "windows")]
 #[cfg(target_arch = "aarch64")]
-fn compile_asm_arm64(asm_file: &str, obj_file: &str) {
-    println!("[*] Starting to compile ARM64: {}", asm_file);
+fn compile_asm_arm64(asm_file: &str, obj_file: &str, windows_version: &str) {
+    println!("[*] Starting to compile ARM64: {} (Windows {})", asm_file, windows_version);
 
     let status = Command::new("armasm64")
         .arg(asm_file)
         .arg(obj_file)
+        .arg("-pd")
+        .arg(format!("WINDOWS_VERSION SETS \"{}\"", windows_version))
         .env("PATH", std::env::var("PATH").unwrap())
         .output();
 
