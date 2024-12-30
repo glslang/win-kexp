@@ -331,3 +331,23 @@ mod tests {
         );
     }
 }
+
+#[cfg(target_os = "windows")]
+#[cfg(target_arch = "aarch64")]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shellcodes_match_fallback() {
+        // Test token stealing shellcode
+        let token_stealing_shellcode = token_stealing_shellcode();
+        let token_stealing_fallback = token_stealing_shellcode_fallback_arm64();
+
+        assert_eq!(
+            token_stealing_shellcode,
+            token_stealing_fallback.to_vec(),
+            "Token stealing shellcode from COFF file does not match the fallback shellcode"
+        );
+    }
+}
