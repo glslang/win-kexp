@@ -15,7 +15,7 @@ pub use windows::{
             Ioctl::{FILE_ANY_ACCESS, FILE_DEVICE_UNKNOWN, METHOD_NEITHER},
             LibraryLoader::{GetModuleHandleA, GetProcAddress},
             Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE},
-            ProcessStatus::EnumDeviceDrivers,
+            ProcessStatus::{EnumDeviceDrivers, GetDeviceDriverBaseNameA},
             Threading::{
                 CreateProcessA, CREATE_NEW_CONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
                 STARTUPINFOA,
@@ -145,31 +145,54 @@ pub fn get_function_address(dll_name: &str, function_name: &str) -> *mut c_void 
 
 #[derive(Error, Debug)]
 pub enum KernelError {
-    #[error("Failed to get ntoskrnl.exe base address: null pointer received")]
-    NullNtoskrnlBase,
+    #[error("Failed to find driver: {0}")]
+    DriverNotFound(String),
+    #[error("Failed to get driver name: {0}")]
+    DriverNameNotFound(String),
 }
 
-pub fn get_ntoskrnl_base() -> Result<*mut c_void, KernelError> {
+pub fn get_driver_base(driver_name: &str) -> Result<*mut c_void, KernelError> {
     unsafe {
         let mut needed_size: u32 = 0;
 
-        // First call to get required size
+        // First call to get required size for addresses
         EnumDeviceDrivers(std::ptr::null_mut(), 0, &mut needed_size)
             .expect("[-] Failed to get required size for drivers");
 
-        // Allocate buffer with exact size needed
+        // Allocate buffers with exact sizes needed
         let driver_count = needed_size as usize / std::mem::size_of::<*mut c_void>();
         let mut drivers = vec![std::ptr::null_mut(); driver_count];
 
-        // Second call to get actual driver addresses
+        // Get driver addresses and names
         EnumDeviceDrivers(drivers.as_mut_ptr(), needed_size, &mut needed_size)
             .expect("[-] Failed to enumerate drivers");
 
-        // Check if the first driver address is non-null
-        if !drivers[0].is_null() {
-            Ok(drivers[0])
-        } else {
-            Err(KernelError::NullNtoskrnlBase)
+        // Iterate through drivers to find matching name
+        for &driver in drivers.iter() {
+            if driver.is_null() {
+                continue;
+            }
+
+            let mut name_buf = [0u8; 1024];
+            let name_len = GetDeviceDriverBaseNameA(driver, &mut name_buf);
+
+            if name_len == 0 {
+                return Err(KernelError::DriverNameNotFound(driver_name.to_string()));
+            }
+
+            let driver_name_c = std::str::from_utf8(&name_buf[..name_len as usize])
+                .expect("[-] Failed to convert driver name to string")
+                .to_lowercase();
+
+            if driver_name_c.contains(&driver_name.to_lowercase()) {
+                return Ok(driver);
+            }
         }
+
+        Err(KernelError::DriverNotFound(driver_name.to_string()))
     }
+}
+
+pub fn get_ntoskrnl_base() -> Result<*mut c_void, KernelError> {
+    get_driver_base("ntoskrnl.exe")
 }
