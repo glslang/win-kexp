@@ -142,3 +142,40 @@ pub fn find_gadget_offset(
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_gadget_offset() {
+        // Create test sections with known gadget
+        let test_bytes = vec![
+            0x90, 0x90, 0x58, 0xC3, // nop; nop; pop rax; ret
+            0x90, 0x90, // padding
+        ];
+        let sections = vec![(0x1000, test_bytes)];
+
+        // Search for pop rax; ret
+        let gadget = &[0x58, 0xC3];
+        let ntoskrnl_base = 0xfffff80000000000;
+
+        let result = find_gadget_offset(sections, gadget, ntoskrnl_base);
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 0xfffff80000001002); // Base + section offset + gadget offset
+    }
+
+    #[test]
+    fn test_find_gadget_offset_not_found() {
+        let test_bytes = vec![0x90, 0x90]; // Just NOPs
+        let sections = vec![(0x1000, test_bytes)];
+
+        let gadget = &[0x58, 0xC3]; // pop rax; ret
+        let ntoskrnl_base = 0xfffff80000000000;
+
+        let result = find_gadget_offset(sections, gadget, ntoskrnl_base);
+
+        assert!(result.is_none());
+    }
+}
