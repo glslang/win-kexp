@@ -2,18 +2,21 @@ use core::ffi::c_void;
 use std::usize;
 use thiserror::Error;
 
+use windows::Win32::System::LibraryLoader::DONT_RESOLVE_DLL_REFERENCES;
 use windows_core::PSTR;
 
 pub use windows::{
     core::PCSTR,
     Win32::{
-        Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE},
+        Foundation::{
+            CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HMODULE, INVALID_HANDLE_VALUE,
+        },
         Storage::FileSystem::{
             CreateFileA, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, OPEN_EXISTING,
         },
         System::{
             Ioctl::{FILE_ANY_ACCESS, FILE_DEVICE_UNKNOWN, METHOD_NEITHER},
-            LibraryLoader::{GetModuleHandleA, GetProcAddress},
+            LibraryLoader::{GetModuleHandleA, GetProcAddress, LoadLibraryExA},
             Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE},
             ProcessStatus::{EnumDeviceDrivers, GetDeviceDriverBaseNameA},
             Threading::{
@@ -143,6 +146,16 @@ pub fn get_function_address(dll_name: &str, function_name: &str) -> *mut c_void 
     }
 }
 
+pub fn load_library_no_resolve(dll_name: &str) -> Result<HMODULE, windows_core::Error> {
+    unsafe {
+        LoadLibraryExA(
+            PCSTR(format!("{}\0", dll_name).as_ptr()),
+            HANDLE::default(),
+            DONT_RESOLVE_DLL_REFERENCES,
+        )
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum KernelError {
     #[error("Failed to find driver: {0}")]
@@ -193,6 +206,6 @@ pub fn get_driver_base(driver_name: &str) -> Result<*mut c_void, KernelError> {
     }
 }
 
-pub fn get_ntoskrnl_base() -> Result<*mut c_void, KernelError> {
-    get_driver_base("ntoskrnl.exe")
+pub fn get_ntoskrnl_base_address() -> Result<*mut c_void, KernelError> {
+    get_driver_base("ntoskrnl")
 }
