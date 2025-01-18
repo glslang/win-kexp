@@ -29,6 +29,8 @@ jobs:
         run: |
           rustup component add rustfmt
           cargo fmt --all -- --check
+      - name: Cargo update
+        run: cargo update
       - name: Build
         run: cargo build --verbose
       - name: Test

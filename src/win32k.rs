@@ -2,7 +2,10 @@ use core::ffi::c_void;
 use std::usize;
 use thiserror::Error;
 
-use windows::Win32::System::LibraryLoader::DONT_RESOLVE_DLL_REFERENCES;
+use windows::Win32::System::{
+    LibraryLoader::DONT_RESOLVE_DLL_REFERENCES,
+    Memory::{PAGE_PROTECTION_FLAGS, VIRTUAL_ALLOCATION_TYPE},
+};
 use windows_core::PSTR;
 
 pub use windows::{
@@ -57,7 +60,7 @@ pub fn get_device_handle(device_path: &str) -> HANDLE {
             None,
             OPEN_EXISTING,
             FILE_FLAGS_AND_ATTRIBUTES(0),
-            HANDLE::default(),
+            None,
         )
         .expect("[-] Unable to open device handle")
     }
@@ -74,19 +77,24 @@ pub fn io_device_control(
     dwcontrolcode: u32,
     lpinbuffer: *const c_void,
     inbuffersize: u32,
-) {
+    lpooutputbuffer: *mut c_void,
+    outbuffersize: u32,
+) -> u32 {
     unsafe {
+        let mut bytes_returned: u32 = 0;
         DeviceIoControl(
             h_device,
             dwcontrolcode,
             Some(lpinbuffer),
             inbuffersize,
-            None,
-            0,
-            None,
+            Some(lpooutputbuffer),
+            outbuffersize,
+            Some(&mut bytes_returned),
             None,
         )
         .expect("[-] Unable to trigger IOCTL");
+
+        bytes_returned
     }
 }
 
@@ -105,7 +113,7 @@ pub fn create_cmd_process() -> PROCESS_INFORMATION {
     unsafe {
         CreateProcessA(
             None,
-            PSTR(command_line),
+            Some(PSTR(command_line)),
             None,
             None,
             false,
@@ -150,10 +158,18 @@ pub fn load_library_no_resolve(dll_name: &str) -> Result<HMODULE, windows_core::
     unsafe {
         LoadLibraryExA(
             PCSTR(format!("{}\0", dll_name).as_ptr()),
-            HANDLE::default(),
+            None,
             DONT_RESOLVE_DLL_REFERENCES,
         )
     }
+}
+
+pub fn allocate_memory(
+    size: usize,
+    alloc_type: VIRTUAL_ALLOCATION_TYPE,
+    protect: PAGE_PROTECTION_FLAGS,
+) -> *mut c_void {
+    unsafe { VirtualAlloc(None, size, alloc_type, protect) }
 }
 
 #[derive(Error, Debug)]
