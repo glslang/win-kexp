@@ -127,7 +127,7 @@ pub fn get_executable_sections(module: HMODULE) -> Result<Vec<(u64, Vec<u8>)>, P
 }
 
 pub fn find_gadget_offset(
-    sections: Vec<(u64, Vec<u8>)>,
+    sections: &Vec<(u64, Vec<u8>)>,
     opcodes: &[u8],
     ntoskrnl_base: u64,
 ) -> Option<u64> {
@@ -160,7 +160,7 @@ mod tests {
         let gadget = &[0x58, 0xC3];
         let ntoskrnl_base = 0xfffff80000000000;
 
-        let result = find_gadget_offset(sections, gadget, ntoskrnl_base);
+        let result = find_gadget_offset(&sections, gadget, ntoskrnl_base);
 
         assert!(result.is_some());
         assert_eq!(result.unwrap(), 0xfffff80000001002); // Base + section offset + gadget offset
@@ -174,7 +174,7 @@ mod tests {
         let gadget = &[0x58, 0xC3]; // pop rax; ret
         let ntoskrnl_base = 0xfffff80000000000;
 
-        let result = find_gadget_offset(sections, gadget, ntoskrnl_base);
+        let result = find_gadget_offset(&sections, gadget, ntoskrnl_base);
 
         assert!(result.is_none());
     }
