@@ -147,6 +147,12 @@ pub fn get_function_address(dll_name: &str, function_name: &str) -> *mut c_void 
         let h_module = GetModuleHandleA(PCSTR(format!("{}\0", dll_name).as_ptr()))
             .expect("[-] Failed to get module handle");
 
+        get_function_address_from_module(h_module, function_name)
+    }
+}
+
+pub fn get_function_address_from_module(h_module: HMODULE, function_name: &str) -> *mut c_void {
+    unsafe {
         let proc_addr = GetProcAddress(h_module, PCSTR(format!("{}\0", function_name).as_ptr()))
             .expect("[-] Failed to get function address");
 
