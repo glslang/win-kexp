@@ -95,12 +95,15 @@ fn create_remote_thread(process_handle: HANDLE, remote_memory: *mut core::ffi::c
     unsafe {
         let thread_handle = CreateRemoteThread(
             process_handle,
-            None,                                     // Default security descriptor
-            0,                                        // Default stack size
-            Some(std::mem::transmute(remote_memory)), // Thread start address
-            None,                                     // No parameter
-            0,                                        // Run thread immediately
-            None,                                     // Don't receive thread ID
+            None, // Default security descriptor
+            0,    // Default stack size
+            Some(std::mem::transmute::<
+                *mut std::ffi::c_void,
+                unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+            >(remote_memory)), // Thread start address
+            None, // No parameter
+            0,    // Run thread immediately
+            None, // Don't receive thread ID
         )
         .expect("[-] Failed to create remote thread");
 
