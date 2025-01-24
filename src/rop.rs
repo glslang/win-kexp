@@ -17,14 +17,8 @@ macro_rules! create_rop_chain {
 
 #[macro_export]
 macro_rules! create_rop_chain_to_buffer {
-    ($buffer:expr, $base:expr, $($value:expr),+ $(,)?) => {{
+    ($buffer:expr, $($value:expr),+ $(,)?) => {{
         let mut offset = 0;
-        // Fill buffer with padding bytes
-        for i in 0..$base {
-            $buffer[i] = 0x90u8;
-        }
-        offset += $base;
-        // Write each value in little-endian
         $(
             let bytes = $value.to_le_bytes();
             $buffer[offset..offset + bytes.len()].copy_from_slice(&bytes);
