@@ -7,11 +7,30 @@ use windows::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 macro_rules! create_rop_chain {
     ($base:expr, $($value:expr),+ $(,)?) => {{
         let mut chain = Vec::new();
-        chain.extend(iter::repeat(0x41u8).take($base));
+        chain.extend(iter::repeat(0x90u8).take($base));
         $(
             chain.extend($value.to_le_bytes().iter().cloned());
         )*
         chain
+    }};
+}
+
+#[macro_export]
+macro_rules! create_rop_chain_to_buffer {
+    ($buffer:expr, $base:expr, $($value:expr),+ $(,)?) => {{
+        let mut offset = 0;
+        // Fill buffer with padding bytes
+        for i in 0..$base {
+            $buffer[i] = 0x90u8;
+        }
+        offset += $base;
+        // Write each value in little-endian
+        $(
+            let bytes = $value.to_le_bytes();
+            $buffer[offset..offset + bytes.len()].copy_from_slice(&bytes);
+            offset += bytes.len();
+        )*
+        offset // Return total bytes written
     }};
 }
 

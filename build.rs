@@ -56,6 +56,7 @@ fn compile_asm_files() {
         "src/asm/acl_edit.asm",
         "src/asm/spawn_cmd.asm",
         "src/asm/token_stealing_shellcode_smep_no_kvashadow.asm",
+        "src/asm/token_stealing_shellcode_smep_no_kvashadow_pte.asm",
     ];
 
     #[cfg(target_arch = "aarch64")]
@@ -87,6 +88,13 @@ fn compile_asm_files() {
         compile_asm_x64(
             "src/asm/token_stealing_shellcode_smep_no_kvashadow.asm",
             &format!("{}/token_stealing_shellcode_smep_no_kvashadow.obj", out_dir),
+        );
+        compile_asm_x64(
+            "src/asm/token_stealing_shellcode_smep_no_kvashadow_pte.asm",
+            &format!(
+                "{}/token_stealing_shellcode_smep_no_kvashadow_pte.obj",
+                out_dir
+            ),
         );
     }
 
