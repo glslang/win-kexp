@@ -189,7 +189,11 @@ pub fn allocate_memory(
     unsafe { VirtualAlloc(Some(lpaddress as *const c_void), size, alloc_type, protect) }
 }
 
-pub fn lock_memory(lpaddress: *const c_void, size: usize) {
+/// # Safety
+///
+/// This function is unsafe because it uses raw pointers and assumes that the caller has the necessary permissions and knowledge about the memory layout.
+/// It is the responsibility of the caller to ensure that the memory is allocated correctly and that the shellcode is valid.
+pub unsafe fn lock_memory(lpaddress: *const c_void, size: usize) {
     unsafe { VirtualLock(lpaddress, size).expect("[-] Failed to lock memory") }
 }
 
