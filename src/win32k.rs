@@ -19,7 +19,10 @@ pub use windows::{
         System::{
             Ioctl::{FILE_ANY_ACCESS, FILE_DEVICE_UNKNOWN, METHOD_NEITHER},
             LibraryLoader::{GetModuleHandleA, GetProcAddress, LoadLibraryExA},
-            Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE},
+            Memory::{
+                VirtualAlloc, VirtualLock, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ,
+                PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+            },
             ProcessStatus::{EnumDeviceDrivers, GetDeviceDriverBaseNameA},
             Threading::{
                 CreateProcessA, CREATE_NEW_CONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
@@ -178,11 +181,16 @@ pub fn load_library_no_resolve(dll_name: &str) -> Result<HMODULE, windows_core::
 }
 
 pub fn allocate_memory(
+    lpaddress: u64,
     size: usize,
     alloc_type: VIRTUAL_ALLOCATION_TYPE,
     protect: PAGE_PROTECTION_FLAGS,
 ) -> *mut c_void {
-    unsafe { VirtualAlloc(None, size, alloc_type, protect) }
+    unsafe { VirtualAlloc(Some(lpaddress as *const c_void), size, alloc_type, protect) }
+}
+
+pub fn lock_memory(lpaddress: *const c_void, size: usize) {
+    unsafe { VirtualLock(lpaddress, size).expect("[-] Failed to lock memory") }
 }
 
 #[derive(Error, Debug)]
