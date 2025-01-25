@@ -204,4 +204,29 @@ mod tests {
 
         assert!(result.is_none());
     }
+
+    #[test]
+    fn test_concat_rop_chain_to_buffer() {
+        let mut buffer = [0u8; 16];
+        let chain1 = vec![1u8, 2u8, 3u8, 4u8];
+        let chain2 = vec![5u8, 6u8, 7u8, 8u8];
+
+        let written = concat_rop_chain_to_buffer!(&mut buffer, chain1, chain2);
+
+        assert_eq!(written, 8);
+        assert_eq!(&buffer[0..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&buffer[8..], &[0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_concat_rop_chain_to_buffer_single() {
+        let mut buffer = [0u8; 8];
+        let chain = vec![1u8, 2u8, 3u8, 4u8];
+
+        let written = concat_rop_chain_to_buffer!(&mut buffer, chain);
+
+        assert_eq!(written, 4);
+        assert_eq!(&buffer[0..4], &[1, 2, 3, 4]);
+        assert_eq!(&buffer[4..], &[0, 0, 0, 0]);
+    }
 }
