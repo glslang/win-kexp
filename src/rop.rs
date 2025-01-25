@@ -31,7 +31,7 @@ macro_rules! create_rop_chain_to_buffer {
 #[macro_export]
 macro_rules! concat_rop_chain_to_buffer {
     ($buffer:expr, $($chain:expr),+ $(,)?) => {{
-        let mut total_offset = 0;b
+        let mut total_offset = 0;
         $(
             let chain_bytes = $chain;
             $buffer[total_offset..total_offset + chain_bytes.len()].copy_from_slice(&chain_bytes);
