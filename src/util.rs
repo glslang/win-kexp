@@ -1,6 +1,8 @@
 use core::ffi::c_void;
 use std::slice;
 
+use windows::Win32::System::Diagnostics::Debug::DebugBreak;
+
 pub fn pause() {
     dbg!("Pausing! Press enter to continue...");
 
@@ -9,6 +11,12 @@ pub fn pause() {
     std::io::stdin()
         .read_line(&mut buffer)
         .expect("Failed to read line");
+}
+
+pub fn debug_break() {
+    unsafe {
+        DebugBreak();
+    }
 }
 
 pub fn bytes_to_hex_string(ptr: *mut c_void, len: usize) -> String {
