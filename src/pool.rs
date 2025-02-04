@@ -1,5 +1,5 @@
 use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
-use windows::Win32::Storage::FileSystem::WriteFile;
+use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Pipes::CreatePipe;
 
 use crate::win32k::close_handle;
@@ -48,6 +48,16 @@ impl AnonymousPipe {
         }
 
         bytes_written
+    }
+
+    pub fn read(&self, buffer: &mut [u8]) -> u32 {
+        let mut bytes_read: u32 = 0;
+
+        unsafe {
+            ReadFile(self.read_handle, Some(buffer), Some(&mut bytes_read), None)
+                .expect("[-] Failed to read from anonymous pipe");
+        }
+        bytes_read
     }
 }
 
