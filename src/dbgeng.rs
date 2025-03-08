@@ -110,11 +110,15 @@ impl DebugEngine {
 
         // Create a buffer to capture the output
         let mut output_buffer = Vec::<u8>::with_capacity(4096);
-        let output_callbacks = OutputCallbacks::new(&mut output_buffer)?;
+        let output_callbacks = unsafe {
+            OutputCallbacks::new(&mut output_buffer).cast::<windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacks>().expect("[-] Failed to cast output callbacks")
+        };
 
         // Set the output callbacks
         unsafe {
-            self.client.SetOutputCallbacks(Some(&output_callbacks))?;
+            self.client
+                .SetOutputCallbacks(Some(&output_callbacks))
+                .expect("[-] Failed to set output callbacks");
         }
 
         // Execute the command
@@ -163,15 +167,10 @@ pub struct OutputCallbacks {
 }
 
 impl OutputCallbacks {
-    fn new(
-        buffer: &mut Vec<u8>,
-    ) -> windows::core::Result<
-        windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacks,
-    > {
-        let callbacks = Self {
+    fn new(buffer: &mut Vec<u8>) -> Self {
+        Self {
             buffer: buffer as *mut Vec<u8>,
-        };
-        Ok(callbacks.into())
+        }
     }
 }
 
