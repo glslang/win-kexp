@@ -7,12 +7,14 @@ use crate::win32k::close_handle;
 pub struct AnonymousPipe {
     read_handle: HANDLE,
     write_handle: HANDLE,
+    buf_size: u32,
 }
 
 impl AnonymousPipe {
     pub fn new(buffer_size: u32) -> Self {
         let mut read_handle = HANDLE::default();
         let mut write_handle = HANDLE::default();
+        let buf_size = buffer_size;
 
         // Create the anonymous pipe with specified buffer size
         unsafe {
@@ -23,6 +25,7 @@ impl AnonymousPipe {
         Self {
             read_handle,
             write_handle,
+            buf_size,
         }
     }
 
@@ -58,6 +61,11 @@ impl AnonymousPipe {
                 .expect("[-] Failed to read from anonymous pipe");
         }
         bytes_read
+    }
+
+    pub fn drain(&self) {
+        let mut buffer = vec![0; self.buf_size as usize];
+        self.read(&mut buffer);
     }
 }
 
