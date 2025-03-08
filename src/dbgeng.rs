@@ -2,12 +2,11 @@ use thiserror::Error;
 use windows::core::{Interface, PCSTR};
 
 // Import the necessary Windows Debug Engine interfaces
-use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugClient3;
-use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugControl4;
-use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSymbols3;
-use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_ATTACH_KERNEL_CONNECTION;
-use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_ATTACH_LOCAL_KERNEL;
-use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_OUTCTL_THIS_CLIENT;
+use windows::Win32::System::Diagnostics::Debug::Extensions::{
+    IDebugClient3, IDebugControl4, IDebugSymbols3, DEBUG_ATTACH_KERNEL_CONNECTION,
+    DEBUG_ATTACH_LOCAL_KERNEL, DEBUG_END_ACTIVE_DETACH, DEBUG_EXECUTE_ECHO,
+    DEBUG_OUTCTL_THIS_CLIENT,
+};
 
 #[derive(Debug, Error)]
 pub enum DbgEngError {
@@ -124,7 +123,7 @@ impl DebugEngine {
         // Execute the command
         let result = unsafe {
             self.control
-                .Execute(DEBUG_OUTCTL_THIS_CLIENT, cmd, DEBUG_EXECUTE_DEFAULT)
+                .Execute(DEBUG_OUTCTL_THIS_CLIENT, cmd, DEBUG_EXECUTE_ECHO)
         };
 
         // Reset the output callbacks
@@ -153,9 +152,6 @@ impl DebugEngine {
         Ok(())
     }
 }
-
-// Define the DEBUG_EXECUTE_DEFAULT constant
-const DEBUG_EXECUTE_DEFAULT: u32 = 0;
 
 // Output callbacks implementation to capture command output
 #[windows::core::implement(
@@ -199,10 +195,7 @@ impl Drop for DebugEngine {
     fn drop(&mut self) {
         // Detach from any targets
         unsafe {
-            let _ = self.client.EndSession(DEBUG_END_ACTIVE);
+            let _ = self.client.EndSession(DEBUG_END_ACTIVE_DETACH);
         }
     }
 }
-
-// Define the DEBUG_END_ACTIVE constant
-const DEBUG_END_ACTIVE: u32 = 0;
