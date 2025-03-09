@@ -64,43 +64,34 @@ impl DebugEngine {
     }
 
     /// Attaches to the local kernel
-    pub fn attach_local_kernel(&self) -> Result<(), DbgEngError> {
-        let result = unsafe { self.client.AttachKernel(DEBUG_ATTACH_LOCAL_KERNEL, None) };
-
-        if result.is_err() {
-            return Err(DbgEngError::AttachFailed(result.err().unwrap()));
-        }
-
-        Ok(())
+    pub fn attach_local_kernel(&self) {
+        unsafe {
+            self.client
+                .AttachKernel(DEBUG_ATTACH_LOCAL_KERNEL, None)
+                .expect("[-] Failed to attach to local kernel")
+        };
     }
 
     /// Attaches to a kernel using a connection string
-    pub fn attach_kernel(&self, connection_string: &str) -> Result<(), DbgEngError> {
+    pub fn attach_kernel(&self, connection_string: &str) {
         let connection = PCSTR::from_raw(connection_string.as_ptr());
 
-        let result = unsafe {
+        unsafe {
             self.client
                 .AttachKernel(DEBUG_ATTACH_KERNEL_CONNECTION, connection)
-        };
-
-        if result.is_err() {
-            return Err(DbgEngError::AttachFailed(result.err().unwrap()));
+                .expect("[-] Failed to attach to kernel");
         }
-
-        Ok(())
     }
 
     /// Sets the symbol path
-    pub fn set_symbol_path(&self, symbol_path: &str) -> Result<(), DbgEngError> {
+    pub fn set_symbol_path(&self, symbol_path: &str) {
         let path = PCSTR::from_raw(symbol_path.as_ptr());
 
-        let result = unsafe { self.symbols.SetSymbolPath(path) };
-
-        if result.is_err() {
-            return Err(DbgEngError::SymbolPathFailed(result.err().unwrap()));
-        }
-
-        Ok(())
+        unsafe {
+            self.symbols
+                .SetSymbolPath(path)
+                .expect("[-] Failed to set symbol path")
+        };
     }
 
     /// Executes a debug command
@@ -197,5 +188,20 @@ impl Drop for DebugEngine {
         unsafe {
             let _ = self.client.EndSession(DEBUG_END_ACTIVE_DETACH);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_debug_engine() {
+        // Create new debug engine instance
+        DebugEngine::new().expect("Failed to create debug engine");
+
+        println!("Debug engine created successfully");
+
+        // DebugEngine's Drop impl will handle cleanup and detach
     }
 }
