@@ -3,10 +3,11 @@ use windows::core::{Interface, PCSTR};
 
 // Import the necessary Windows Debug Engine interfaces
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
-    IDebugClient3, IDebugControl4, IDebugSymbols3, DEBUG_ATTACH_KERNEL_CONNECTION,
-    DEBUG_ATTACH_LOCAL_KERNEL, DEBUG_END_ACTIVE_DETACH, DEBUG_EXECUTE_ECHO,
-    DEBUG_OUTCTL_THIS_CLIENT,
+    IDebugBreakpoint, IDebugClient3, IDebugControl4, IDebugDataSpaces4, IDebugSymbols3,
+    DEBUG_ANY_ID, DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_ATTACH_LOCAL_KERNEL, DEBUG_BREAKPOINT_CODE,
+    DEBUG_END_ACTIVE_DETACH, DEBUG_EXECUTE_ECHO, DEBUG_OUTCTL_THIS_CLIENT,
 };
+use windows_core::IUnknown;
 
 #[derive(Debug, Error)]
 pub enum DbgEngError {
@@ -30,37 +31,71 @@ pub enum DbgEngError {
 
     #[error("Symbol path operation failed: {0}")]
     SymbolPathFailed(windows::core::Error),
+
+    #[error("Breakpoint failed: {0}")]
+    BreakpointFailed(windows::core::Error),
 }
 
 pub struct DebugEngine {
     client: IDebugClient3,
     control: IDebugControl4,
+    dataspaces: IDebugDataSpaces4,
     symbols: IDebugSymbols3,
+}
+
+impl Default for DebugEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DebugEngine {
     /// Creates a new instance of the Debug Engine client
-    pub fn new() -> Result<Self, DbgEngError> {
+    pub fn new() -> Self {
         // Create the debug client
         let client: IDebugClient3 =
             unsafe { windows::Win32::System::Diagnostics::Debug::Extensions::DebugCreate() }
-                .map_err(DbgEngError::CreateClientFailed)?;
+                .expect("[-] Failed to create debug client");
 
-        // Get the debug control interface
+        Self::from_client_interface(client)
+    }
+
+    pub fn from_windbg_client(client: &IUnknown) -> Self {
+        let client: IDebugClient3 = client.cast().expect("[-] Failed to cast debug client");
+
+        Self::from_client_interface(client)
+    }
+
+    pub fn from_client_interface(client: IDebugClient3) -> Self {
         let control: IDebugControl4 = client
             .cast::<IDebugControl4>()
             .expect("[-] Failed to get debug control interface");
 
-        // Get the debug symbols interface
+        let dataspaces: IDebugDataSpaces4 = client
+            .cast::<IDebugDataSpaces4>()
+            .expect("[-] Failed to get debug data spaces interface");
+
         let symbols: IDebugSymbols3 = client
             .cast::<IDebugSymbols3>()
             .expect("[-] Failed to get debug symbols interface");
 
-        Ok(Self {
+        Self {
             client,
             control,
+            dataspaces,
             symbols,
-        })
+        }
+    }
+
+    pub fn read_memory(&self, address: u64, size: usize) -> Result<Vec<u8>, DbgEngError> {
+        let mut buffer = vec![0; size];
+        unsafe {
+            self.dataspaces
+                .ReadVirtual(address, buffer.as_mut_ptr() as *mut _, size as u32, None)
+                .expect("[-] Failed to read memory")
+        };
+
+        Ok(buffer)
     }
 
     /// Attaches to the local kernel
@@ -100,14 +135,13 @@ impl DebugEngine {
 
         // Create a buffer to capture the output
         let mut output_buffer = Vec::<u8>::with_capacity(4096);
-        let output_callbacks = unsafe {
-            OutputCallbacks::new(&mut output_buffer).cast::<windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacks>().expect("[-] Failed to cast output callbacks")
-        };
+        let output_callbacks = OutputCallbacks::new(&mut output_buffer);
+        let output_interface = output_callbacks.into();
 
         // Set the output callbacks
         unsafe {
             self.client
-                .SetOutputCallbacks(Some(&output_callbacks))
+                .SetOutputCallbacks(Some(&output_interface))
                 .expect("[-] Failed to set output callbacks");
         }
 
@@ -191,6 +225,40 @@ impl Drop for DebugEngine {
     }
 }
 
+pub struct Breakpoint<'a> {
+    control: &'a IDebugControl4,
+    breakpoint: IDebugBreakpoint,
+}
+
+impl<'a> Breakpoint<'a> {
+    pub fn new(engine: &'a DebugEngine) -> Result<Self, DbgEngError> {
+        let breakpoint = unsafe {
+            engine
+                .control
+                .AddBreakpoint(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID)
+        };
+
+        if breakpoint.is_err() {
+            return Err(DbgEngError::BreakpointFailed(breakpoint.err().unwrap()));
+        }
+
+        Ok(Self {
+            breakpoint: breakpoint.unwrap(),
+            control: &engine.control,
+        })
+    }
+}
+
+impl<'a> Drop for Breakpoint<'a> {
+    fn drop(&mut self) {
+        unsafe {
+            self.control
+                .RemoveBreakpoint(&self.breakpoint)
+                .expect("[-] Failed to remove breakpoint");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,7 +266,7 @@ mod tests {
     #[test]
     fn test_create_debug_engine() {
         // Create new debug engine instance
-        DebugEngine::new().expect("Failed to create debug engine");
+        let _ = DebugEngine::new();
 
         println!("Debug engine created successfully");
 
