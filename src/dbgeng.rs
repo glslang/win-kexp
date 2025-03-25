@@ -1,13 +1,14 @@
+use std::ffi::CString;
 use thiserror::Error;
-use windows::core::{Interface, PCSTR};
+use windows::core::{IUnknown, Interface, PCSTR, PCWSTR};
 
 // Import the necessary Windows Debug Engine interfaces
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
-    IDebugBreakpoint, IDebugClient3, IDebugControl4, IDebugDataSpaces4, IDebugSymbols3,
-    DEBUG_ANY_ID, DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_ATTACH_LOCAL_KERNEL, DEBUG_BREAKPOINT_CODE,
-    DEBUG_END_ACTIVE_DETACH, DEBUG_EXECUTE_ECHO, DEBUG_OUTCTL_THIS_CLIENT,
+    IDebugBreakpoint, IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
+    IDebugEventContextCallbacks, IDebugSymbols3, DEBUG_ANY_ID, DEBUG_ATTACH_KERNEL_CONNECTION,
+    DEBUG_ATTACH_LOCAL_KERNEL, DEBUG_BREAKPOINT_CODE, DEBUG_BREAKPOINT_ENABLED,
+    DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL,
 };
-use windows_core::IUnknown;
 
 #[derive(Debug, Error)]
 pub enum DbgEngError {
@@ -37,7 +38,7 @@ pub enum DbgEngError {
 }
 
 pub struct DebugEngine {
-    client: IDebugClient3,
+    client: IDebugClient6,
     control: IDebugControl4,
     dataspaces: IDebugDataSpaces4,
     symbols: IDebugSymbols3,
@@ -49,11 +50,14 @@ impl Default for DebugEngine {
     }
 }
 
+unsafe impl Sync for DebugEngine {}
+unsafe impl Send for DebugEngine {}
+
 impl DebugEngine {
     /// Creates a new instance of the Debug Engine client
     pub fn new() -> Self {
         // Create the debug client
-        let client: IDebugClient3 =
+        let client: IDebugClient6 =
             unsafe { windows::Win32::System::Diagnostics::Debug::Extensions::DebugCreate() }
                 .expect("[-] Failed to create debug client");
 
@@ -61,12 +65,23 @@ impl DebugEngine {
     }
 
     pub fn from_windbg_client(client: &IUnknown) -> Self {
-        let client: IDebugClient3 = client.cast().expect("[-] Failed to cast debug client");
-
+        let client: IDebugClient6 = client.cast().expect("[-] Failed to cast debug client");
         Self::from_client_interface(client)
     }
 
-    pub fn from_client_interface(client: IDebugClient3) -> Self {
+    pub fn create_from_windbg_client(client: &IUnknown) -> Self {
+        let client: IDebugClient6 = client.cast().expect("[-] Failed to cast debug client");
+        let new_client = unsafe {
+            client
+                .CreateClient()
+                .expect("[-] Failed to create debug client")
+        }
+        .cast::<IDebugClient6>()
+        .expect("[-] Failed to cast debug client");
+        Self::from_client_interface(new_client)
+    }
+
+    pub fn from_client_interface(client: IDebugClient6) -> Self {
         let control: IDebugControl4 = client
             .cast::<IDebugControl4>()
             .expect("[-] Failed to get debug control interface");
@@ -176,6 +191,42 @@ impl DebugEngine {
 
         Ok(())
     }
+
+    pub fn create_debug_event_context_callbacks(
+        callback: Option<
+            Box<
+                dyn Fn(
+                    &IDebugBreakpoint2,
+                    *const std::ffi::c_void,
+                    u32,
+                ) -> windows::core::Result<()>,
+            >,
+        >,
+    ) -> IDebugEventContextCallbacks {
+        let callbacks = DebugEventContextCallbacks::new(callback);
+        callbacks.into()
+    }
+
+    pub fn set_breakpoint_event_callbacks(&self, event_callbacks: IDebugEventContextCallbacks) {
+        unsafe {
+            self.client
+                .SetEventContextCallbacks(Some(&event_callbacks))
+                .expect("[-] Failed to set event callbacks");
+        };
+    }
+
+    pub fn log(&self, message: &str) {
+        let message = CString::new(message).expect("Failed to create CString");
+        let message = PCSTR::from_raw(message.as_ptr() as *const u8);
+        unsafe { self.control.Output(DEBUG_OUTPUT_NORMAL, message) }
+            .expect("[-] Failed to log message");
+    }
+
+    pub fn reload_symbols(&self, module: &str) {
+        let module = CString::new(module).expect("Failed to create CString");
+        let module = PCSTR::from_raw(module.as_ptr() as *const u8);
+        unsafe { self.symbols.Reload(module) }.expect("[-] Failed to reload symbols");
+    }
 }
 
 // Output callbacks implementation to capture command output
@@ -208,20 +259,11 @@ impl windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbac
         let c_str = unsafe { std::ffi::CStr::from_ptr(text.0 as *const i8) };
         if let Ok(str_slice) = c_str.to_str() {
             unsafe {
+                (*this.buffer).clear();
                 (*this.buffer).extend_from_slice(str_slice.as_bytes());
             }
         }
         Ok(())
-    }
-}
-
-// Implement Drop for DebugEngine to ensure proper cleanup
-impl Drop for DebugEngine {
-    fn drop(&mut self) {
-        // Detach from any targets
-        unsafe {
-            let _ = self.client.EndSession(DEBUG_END_ACTIVE_DETACH);
-        }
     }
 }
 
@@ -247,10 +289,34 @@ impl<'a> Breakpoint<'a> {
             control: &engine.control,
         })
     }
-}
 
-impl<'a> Drop for Breakpoint<'a> {
-    fn drop(&mut self) {
+    pub fn set_offset_expression(&self, expression: &str) {
+        let expr = PCSTR::from_raw(expression.as_ptr());
+
+        unsafe {
+            self.breakpoint
+                .SetOffsetExpression(expr)
+                .expect("[-] Failed to set breakpoint offset");
+        }
+    }
+
+    pub fn enable(&self) {
+        unsafe {
+            self.breakpoint
+                .AddFlags(DEBUG_BREAKPOINT_ENABLED)
+                .expect("[-] Failed to set breakpoint offset");
+        }
+    }
+
+    pub fn disable(&self) {
+        unsafe {
+            self.breakpoint
+                .RemoveFlags(DEBUG_BREAKPOINT_ENABLED)
+                .expect("[-] Failed to remove breakpoint offset");
+        }
+    }
+
+    pub fn remove(&self) {
         unsafe {
             self.control
                 .RemoveBreakpoint(&self.breakpoint)
@@ -271,5 +337,172 @@ mod tests {
         println!("Debug engine created successfully");
 
         // DebugEngine's Drop impl will handle cleanup and detach
+    }
+}
+
+#[windows::core::implement(
+    windows::Win32::System::Diagnostics::Debug::Extensions::IDebugEventContextCallbacks
+)]
+pub struct DebugEventContextCallbacks {
+    callback: Option<
+        Box<dyn Fn(&IDebugBreakpoint2, *const std::ffi::c_void, u32) -> windows::core::Result<()>>,
+    >,
+}
+
+impl DebugEventContextCallbacks {
+    pub fn new(
+        callback: Option<
+            Box<
+                dyn Fn(
+                    &IDebugBreakpoint2,
+                    *const std::ffi::c_void,
+                    u32,
+                ) -> windows::core::Result<()>,
+            >,
+        >,
+    ) -> Self {
+        Self { callback }
+    }
+}
+
+#[allow(non_snake_case)]
+impl windows::Win32::System::Diagnostics::Debug::Extensions::IDebugEventContextCallbacks_Impl
+    for DebugEventContextCallbacks_Impl
+{
+    fn GetInterestMask(&self) -> windows::core::Result<u32> {
+        Ok(DEBUG_EVENT_BREAKPOINT)
+    }
+
+    fn Breakpoint(
+        &self,
+        bp: windows::core::Ref<'_, IDebugBreakpoint2>,
+        _context: *const std::ffi::c_void,
+        _flags: u32,
+    ) -> windows::core::Result<()> {
+        if let Some(callback) = &self.callback {
+            let _ = callback(bp.as_ref().unwrap(), _context, _flags);
+        }
+        Ok(())
+    }
+
+    fn Exception(
+        &self,
+        _exception: *const windows::Win32::System::Diagnostics::Debug::EXCEPTION_RECORD64,
+        _first_chance: u32,
+        _context: *const std::ffi::c_void,
+        _flags: u32,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn CreateThread(
+        &self,
+        _handle: u64,
+        _data_offset: u64,
+        _start_offset: u64,
+        _context: *const std::ffi::c_void,
+        _flags: u32,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn ExitThread(
+        &self,
+        _exit_code: u32,
+        _context: *const std::ffi::c_void,
+        _flags: u32,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn CreateProcessA(
+        &self,
+        _image_file_handle: u64,
+        _handle: u64,
+        _base_offset: u64,
+        _module_size: u32,
+        _module_name: &PCWSTR,
+        _image_name: &PCWSTR,
+        _checksum: u32,
+        _timestamp: u32,
+        _initial_thread_handle: u64,
+        _thread_data_offset: u64,
+        _start_offset: u64,
+        _context: *const std::ffi::c_void,
+        _flags: u32,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn ExitProcess(
+        &self,
+        _exit_code: u32,
+        _context: *const std::ffi::c_void,
+        _flags: u32,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn LoadModule(
+        &self,
+        _image_file_handle: u64,
+        _base_offset: u64,
+        _module_size: u32,
+        _module_name: &PCWSTR,
+        _image_name: &PCWSTR,
+        _checksum: u32,
+        _timestamp: u32,
+        _context: *const std::ffi::c_void,
+        _flags: u32,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn UnloadModule(
+        &self,
+        _image_base_name: &PCWSTR,
+        _base_offset: u64,
+        _context: *const std::ffi::c_void,
+        _flags: u32,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn SystemError(
+        &self,
+        _error: u32,
+        _level: u32,
+        _context: *const std::ffi::c_void,
+        _flags: u32,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn SessionStatus(&self, _status: u32) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn ChangeDebuggeeState(
+        &self,
+        _flags: u32,
+        _argument: u64,
+        _context: *const std::ffi::c_void,
+        _flags2: u32,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn ChangeEngineState(
+        &self,
+        _flags: u32,
+        _argument: u64,
+        _context: *const std::ffi::c_void,
+        _flags2: u32,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn ChangeSymbolState(&self, _flags: u32, _argument: u64) -> windows::core::Result<()> {
+        Ok(())
     }
 }
