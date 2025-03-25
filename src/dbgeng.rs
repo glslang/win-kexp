@@ -10,6 +10,10 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL,
 };
 
+/// Callback type for breakpoint events that receives the breakpoint, context, and flags
+pub type BreakpointCallback =
+    Box<dyn Fn(&IDebugBreakpoint2, *const std::ffi::c_void, u32) -> windows::core::Result<()>>;
+
 #[derive(Debug, Error)]
 pub enum DbgEngError {
     #[error("Failed to initialize COM: {0}")]
@@ -193,15 +197,7 @@ impl DebugEngine {
     }
 
     pub fn create_debug_event_context_callbacks(
-        callback: Option<
-            Box<
-                dyn Fn(
-                    &IDebugBreakpoint2,
-                    *const std::ffi::c_void,
-                    u32,
-                ) -> windows::core::Result<()>,
-            >,
-        >,
+        callback: Option<BreakpointCallback>,
     ) -> IDebugEventContextCallbacks {
         let callbacks = DebugEventContextCallbacks::new(callback);
         callbacks.into()
@@ -344,23 +340,11 @@ mod tests {
     windows::Win32::System::Diagnostics::Debug::Extensions::IDebugEventContextCallbacks
 )]
 pub struct DebugEventContextCallbacks {
-    callback: Option<
-        Box<dyn Fn(&IDebugBreakpoint2, *const std::ffi::c_void, u32) -> windows::core::Result<()>>,
-    >,
+    callback: Option<BreakpointCallback>,
 }
 
 impl DebugEventContextCallbacks {
-    pub fn new(
-        callback: Option<
-            Box<
-                dyn Fn(
-                    &IDebugBreakpoint2,
-                    *const std::ffi::c_void,
-                    u32,
-                ) -> windows::core::Result<()>,
-            >,
-        >,
-    ) -> Self {
+    pub fn new(callback: Option<BreakpointCallback>) -> Self {
         Self { callback }
     }
 }
