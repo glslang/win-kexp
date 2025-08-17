@@ -60,7 +60,7 @@ pub fn token_stealing_shellcode_fallback_arm64() -> [u8; 76] {
 
 #[cfg(all(target_arch = "x86_64", feature = "shellcode_fallback"))]
 pub fn token_stealing_shellcode_fallback() -> [u8; 84] {
-    return token_stealing_shellcode_fallback_x86_64();
+    token_stealing_shellcode_fallback_x86_64()
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "shellcode_fallback"))]

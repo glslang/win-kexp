@@ -1,4 +1,4 @@
-use goblin::pe::{options::ParseOptions, section_table::IMAGE_SCN_CNT_CODE};
+use goblin::pe::section_table::IMAGE_SCN_CNT_CODE;
 use thiserror::Error;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
@@ -60,13 +60,7 @@ pub fn get_executable_sections(module: HMODULE) -> Result<Vec<(u64, Vec<u8>)>, P
     // Convert module to bytes
     let pe_bytes = unsafe { std::slice::from_raw_parts(module.0 as *const u8, image_size) };
 
-    match goblin::pe::PE::parse_with_opts(
-        pe_bytes,
-        &ParseOptions {
-            resolve_rva: true,
-            parse_attribute_certificates: false,
-        },
-    ) {
+    match goblin::pe::PE::parse(pe_bytes) {
         Ok(pe) => {
             for section in pe.sections {
                 if section.characteristics & IMAGE_SCN_CNT_CODE != 0 {

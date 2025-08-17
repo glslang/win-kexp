@@ -111,7 +111,7 @@ pub fn create_cmd_process() -> PROCESS_INFORMATION {
     };
     let mut pi = PROCESS_INFORMATION::default();
 
-    let command_line = "cmd.exe\0".as_ptr() as *mut u8;
+    let command_line = c"cmd.exe".as_ptr() as *mut u8;
 
     unsafe {
         CreateProcessA(
