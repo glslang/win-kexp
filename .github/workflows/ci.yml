@@ -33,6 +33,11 @@ jobs:
       - name: Cargo update
         run: cargo update
       - name: Build
-        run: cargo build --verbose
+        run: |
+          echo "=== Starting Rust build ==="
+          cargo build --verbose 2>&1 | tee build_output.log
+          echo "=== Build completed ==="
+          echo "=== Build output log ==="
+          cat build_output.log
       - name: Test
         run: cargo test --verbose
