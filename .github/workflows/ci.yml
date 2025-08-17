@@ -39,5 +39,30 @@ jobs:
           echo "=== Build completed ==="
           echo "=== Build output log ==="
           cat build_output.log
+      - name: Check target/debug output
+        run: |
+          Write-Host "=== Checking for stderr and output files in target/debug/build ==="
+          if (Test-Path "target/debug/build") {
+            Write-Host "target/debug/build directory exists"
+
+            # Check for stderr and output files in all subdirectories
+            $outputFiles = Get-ChildItem -Path "target/debug/build" -Recurse -File | Where-Object { $_.Name -eq "stderr" -or $_.Name -eq "output" }
+
+            if ($outputFiles) {
+              Write-Host "=== Found stderr and output files ==="
+              foreach ($file in $outputFiles) {
+                Write-Host "=== Contents of $($file.FullName) ==="
+                try {
+                  Get-Content $file.FullName
+                } catch {
+                  Write-Host "Could not read $($file.FullName)"
+                }
+              }
+            } else {
+              Write-Host "No stderr or output files found in target/debug/build"
+            }
+          } else {
+            Write-Host "target/debug/build directory does not exist"
+          }
       - name: Test
         run: cargo test --verbose
