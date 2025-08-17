@@ -14,9 +14,10 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: [windows-latest, windows-11-arm]
         toolchain:
           - stable
     steps:
