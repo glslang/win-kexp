@@ -250,7 +250,11 @@ pub fn token_stealing_shellcode() -> Vec<u8> {
     extract_shellcode_from_obj(shellcode_obj)
 }
 
-#[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
+#[cfg(all(
+    target_os = "windows",
+    target_arch = "x86_64",
+    not(feature = "shellcode_fallback")
+))]
 pub fn token_stealing_shellcode_smep_no_kvashadow() -> Vec<u8> {
     let shellcode_obj = include_bytes!(concat!(
         env!("OUT_DIR"),
@@ -259,7 +263,11 @@ pub fn token_stealing_shellcode_smep_no_kvashadow() -> Vec<u8> {
     extract_shellcode_from_obj(shellcode_obj)
 }
 
-#[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
+#[cfg(all(
+    target_os = "windows",
+    target_arch = "x86_64",
+    not(feature = "shellcode_fallback")
+))]
 pub fn token_stealing_shellcode_smep_no_kvashadow_pte() -> Vec<u8> {
     let shellcode_obj = include_bytes!(concat!(
         env!("OUT_DIR"),
