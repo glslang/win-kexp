@@ -22,7 +22,7 @@ jobs:
           - stable
     steps:
       - uses: actions/checkout@v5
-      - uses: microsoft/setup-msbuild@v1.3
+      - uses: microsoft/setup-msbuild@v2
       - uses: glslang/setup-masm@v1.2
         with:
           vs-architecture: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
