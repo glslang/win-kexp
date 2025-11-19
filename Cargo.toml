@@ -8,7 +8,7 @@ shellcode_fallback = []
 
 [dependencies]
 byte-strings = "0.3.1"
-goblin = "=0.10.1"
+goblin = "0.10.3"
 hex = "0.4.3"
 thiserror = "2.0.17"
 windows-core = "0.62.2"
