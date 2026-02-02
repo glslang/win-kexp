@@ -8,7 +8,6 @@ use windows::Win32::System::{
 use windows_core::PSTR;
 
 pub use windows::{
-    core::PCSTR,
     Win32::{
         Foundation::{
             CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HMODULE, INVALID_HANDLE_VALUE,
@@ -17,20 +16,21 @@ pub use windows::{
             CreateFileA, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, OPEN_EXISTING,
         },
         System::{
+            IO::DeviceIoControl,
             Ioctl::{FILE_ANY_ACCESS, FILE_DEVICE_UNKNOWN, METHOD_NEITHER},
             LibraryLoader::{GetModuleHandleA, GetProcAddress, LoadLibraryExA},
             Memory::{
-                VirtualAlloc, VirtualLock, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ,
-                PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+                MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+                VirtualAlloc, VirtualLock,
             },
             ProcessStatus::{EnumDeviceDrivers, GetDeviceDriverBaseNameA},
             Threading::{
-                CreateProcessA, CREATE_NEW_CONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+                CREATE_NEW_CONSOLE, CreateProcessA, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
                 STARTUPINFOA,
             },
-            IO::DeviceIoControl,
         },
     },
+    core::PCSTR,
 };
 
 #[macro_export]

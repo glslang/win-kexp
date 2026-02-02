@@ -34,6 +34,8 @@ jobs:
           cargo fmt --all -- --check
       - name: Cargo update
         run: cargo update
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked
       - name: Build
         run: |
           echo "=== Starting Rust build ==="
@@ -67,4 +69,8 @@ jobs:
             Write-Host "target/debug/build directory does not exist"
           }
       - name: Test
-        run: cargo test --verbose
+        run: |
+          cargo nextest run --verbose 2>&1 | tee test_output.log
+          echo "=== Test completed ==="
+          echo "=== Test output log ==="
+          cat test_output.log
