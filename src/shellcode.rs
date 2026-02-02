@@ -1,8 +1,8 @@
 use byte_strings::concat_bytes;
 #[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
-use goblin::pe::section_table::IMAGE_SCN_CNT_CODE;
-#[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 use goblin::Object;
+#[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
+use goblin::pe::section_table::IMAGE_SCN_CNT_CODE;
 
 #[allow(dead_code)]
 #[cfg(target_arch = "x86_64")]

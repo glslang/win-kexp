@@ -4,10 +4,10 @@ use windows::core::{IUnknown, Interface, PCSTR, PCWSTR};
 
 // Import the necessary Windows Debug Engine interfaces
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
-    IDebugBreakpoint, IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
-    IDebugEventContextCallbacks, IDebugSymbols3, DEBUG_ANY_ID, DEBUG_ATTACH_KERNEL_CONNECTION,
-    DEBUG_ATTACH_LOCAL_KERNEL, DEBUG_BREAKPOINT_CODE, DEBUG_BREAKPOINT_ENABLED,
-    DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL,
+    DEBUG_ANY_ID, DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_ATTACH_LOCAL_KERNEL, DEBUG_BREAKPOINT_CODE,
+    DEBUG_BREAKPOINT_ENABLED, DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_OUTCTL_THIS_CLIENT,
+    DEBUG_OUTPUT_NORMAL, IDebugBreakpoint, IDebugBreakpoint2, IDebugClient6, IDebugControl4,
+    IDebugDataSpaces4, IDebugEventContextCallbacks, IDebugSymbols3,
 };
 
 /// Callback type for breakpoint events that receives the breakpoint, context, and flags
