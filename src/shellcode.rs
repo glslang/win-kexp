@@ -218,135 +218,27 @@ pub fn spawn_cmd_shellcode_fallback() -> [u8; 387] {
 
 #[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
 fn extract_shellcode_from_obj(shellcode_obj: &[u8]) -> Vec<u8> {
-    // Try parsing with goblin first
-    let obj_result = Object::parse(shellcode_obj);
+    let obj = Object::parse(shellcode_obj).expect("[-] Failed to parse object file");
 
     let mut instructions = Vec::new();
 
-    match obj_result {
-        Ok(obj) => {
-            if let Object::COFF(coff) = obj {
-                for section in coff.sections.iter() {
-                    if section.characteristics & IMAGE_SCN_CNT_CODE != 0 {
-                        let start = section.pointer_to_raw_data as usize;
-                        let size = section.size_of_raw_data as usize;
-                        if start + size <= shellcode_obj.len() {
-                            instructions.extend_from_slice(&shellcode_obj[start..start + size]);
-                        }
-                    }
-                }
-            } else {
-                eprintln!("[-] The object file is not a COFF file");
-            }
-        }
-        Err(e) => {
-            // If goblin fails (e.g., due to string table validation), try manual parsing
-            let err_str = e.to_string();
-            if err_str.contains("String table offset") && err_str.contains("beyond file boundary") {
-                eprintln!(
-                    "[*] Goblin parsing failed due to string table validation, using manual COFF parser"
+    if let Object::COFF(coff) = obj {
+        for section in coff.sections.iter() {
+            if section.characteristics & IMAGE_SCN_CNT_CODE != 0 {
+                instructions.extend_from_slice(
+                    &shellcode_obj[section.pointer_to_raw_data as usize..]
+                        [..section.size_of_raw_data as usize],
                 );
-                instructions = extract_shellcode_manual_coff(shellcode_obj);
-            } else {
-                panic!("[-] Failed to parse object file: {}", e);
             }
         }
+    } else {
+        eprintln!("[-] The object file is not a COFF file");
     }
 
     if instructions.is_empty() {
         eprintln!("[-] No executable sections found in the object file");
     } else {
         println!("[+] Extracted {} bytes of shellcode", instructions.len());
-    }
-
-    instructions
-}
-
-#[cfg(all(target_os = "windows", not(feature = "shellcode_fallback")))]
-fn extract_shellcode_manual_coff(shellcode_obj: &[u8]) -> Vec<u8> {
-    use std::io::{Cursor, Read};
-
-    let mut instructions = Vec::new();
-
-    if shellcode_obj.len() < 20 {
-        eprintln!("[-] COFF file too small");
-        return instructions;
-    }
-
-    let mut cursor = Cursor::new(shellcode_obj);
-
-    // Read COFF header
-    let mut machine = [0u8; 2];
-    let mut num_sections = [0u8; 2];
-    let mut _timestamp = [0u8; 4];
-    let mut _symtab_ptr = [0u8; 4];
-    let mut _num_symbols = [0u8; 4];
-    let mut _opt_header_size = [0u8; 2];
-    let mut _characteristics = [0u8; 2];
-
-    if cursor.read_exact(&mut machine).is_err()
-        || cursor.read_exact(&mut num_sections).is_err()
-        || cursor.read_exact(&mut _timestamp).is_err()
-        || cursor.read_exact(&mut _symtab_ptr).is_err()
-        || cursor.read_exact(&mut _num_symbols).is_err()
-        || cursor.read_exact(&mut _opt_header_size).is_err()
-        || cursor.read_exact(&mut _characteristics).is_err()
-    {
-        eprintln!("[-] Failed to read COFF header");
-        return instructions;
-    }
-
-    let num_sections = u16::from_le_bytes(num_sections) as usize;
-    let opt_header_size = u16::from_le_bytes(_opt_header_size) as u64;
-
-    // COFF header is 20 bytes, then optional header (if present), then section headers
-    let section_headers_offset = 20 + opt_header_size;
-    if section_headers_offset > shellcode_obj.len() as u64 {
-        eprintln!("[-] Invalid COFF file structure");
-        return instructions;
-    }
-    cursor.set_position(section_headers_offset);
-
-    // Read section headers
-    for _ in 0..num_sections {
-        let mut name = [0u8; 8];
-        let mut virtual_size = [0u8; 4];
-        let mut _virtual_addr = [0u8; 4];
-        let mut size_of_raw_data = [0u8; 4];
-        let mut pointer_to_raw_data = [0u8; 4];
-        let mut _reloc_ptr = [0u8; 4];
-        let mut _line_ptr = [0u8; 4];
-        let mut _num_relocs = [0u8; 2];
-        let mut _num_lines = [0u8; 2];
-        let mut characteristics = [0u8; 4];
-
-        if cursor.read_exact(&mut name).is_err()
-            || cursor.read_exact(&mut virtual_size).is_err()
-            || cursor.read_exact(&mut _virtual_addr).is_err()
-            || cursor.read_exact(&mut size_of_raw_data).is_err()
-            || cursor.read_exact(&mut pointer_to_raw_data).is_err()
-            || cursor.read_exact(&mut _reloc_ptr).is_err()
-            || cursor.read_exact(&mut _line_ptr).is_err()
-            || cursor.read_exact(&mut _num_relocs).is_err()
-            || cursor.read_exact(&mut _num_lines).is_err()
-            || cursor.read_exact(&mut characteristics).is_err()
-        {
-            eprintln!("[-] Failed to read section header");
-            break;
-        }
-
-        let characteristics = u32::from_le_bytes(characteristics);
-        let pointer_to_raw_data = u32::from_le_bytes(pointer_to_raw_data) as usize;
-        let size_of_raw_data = u32::from_le_bytes(size_of_raw_data) as usize;
-
-        // Check if this is a code section
-        if characteristics & IMAGE_SCN_CNT_CODE != 0 && size_of_raw_data > 0 {
-            if pointer_to_raw_data + size_of_raw_data <= shellcode_obj.len() {
-                instructions.extend_from_slice(
-                    &shellcode_obj[pointer_to_raw_data..pointer_to_raw_data + size_of_raw_data],
-                );
-            }
-        }
     }
 
     instructions
