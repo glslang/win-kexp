@@ -1,0 +1,34 @@
+# Miri: Rust undefined behavior detector
+# Runs tests under the Miri interpreter to catch UB, invalid memory access,
+# and unsafe code issues that normal test runs cannot detect.
+
+name: Miri
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+  workflow_dispatch:
+
+jobs:
+  miri:
+    name: Miri
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: microsoft/setup-msbuild@v3
+      - uses: glslang/setup-masm@v1.2
+        with:
+          vs-architecture: x64
+      - name: Install nightly Rust with Miri
+        run: |
+          rustup toolchain install nightly --component miri,rust-src
+          rustup override set nightly
+      - name: Setup Miri sysroot
+        run: cargo miri setup
+      - name: Run Miri
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks"
+        run: cargo miri test --verbose
