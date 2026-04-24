@@ -325,6 +325,7 @@ impl<'a> Breakpoint<'a> {
 mod tests {
     use super::*;
 
+    #[cfg(not(miri))]
     #[test]
     fn test_create_debug_engine() {
         // Create new debug engine instance
