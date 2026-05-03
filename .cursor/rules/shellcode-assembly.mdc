@@ -1,0 +1,19 @@
+---
+description: Assembly and shellcode pipeline — MASM/ARMASM, dual-path, CI contract
+globs: src/asm/**/*.asm,src/shellcode.rs,build.rs
+alwaysApply: false
+---
+
+# Assembly and shellcode
+
+## Syntax
+
+- **x86_64:** MASM (`ml64`).
+- **ARM64:** ARMASM (`armasm64`); preprocessor symbol **`WINDOWS_VERSION`** (`23H2` or `24H2` from `build.rs`). Invalid version forces `shellcode_fallback`.
+
+## Dual-path shellcode (`build.rs` + `src/shellcode.rs`)
+
+1. **Assembler path:** `ml64` / `armasm64` compiles `src/asm/*.asm` → COFF `.obj` in `OUT_DIR`; `goblin` extracts sections at runtime.
+2. **Fallback:** if no assembler, `cargo:rustc-cfg=feature="shellcode_fallback"` — `shellcode.rs` returns fixed byte arrays.
+
+`#[cfg(feature = "shellcode_fallback")]` gates must stay consistent. **`test_shellcodes_match_fallback`** asserts both paths emit **identical** bytes — preserve that when changing `.asm` or fallback bytes.

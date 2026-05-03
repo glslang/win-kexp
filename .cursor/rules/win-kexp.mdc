@@ -1,0 +1,28 @@
+---
+description: Core win-kexp context — Rust, Windows crate, errors, commits
+alwaysApply: true
+---
+
+# win-kexp
+
+Rust utilities for Windows kernel exploitation: shellcode, process injection, ROP, pool/win32k helpers, debug engine integration. Targets **x86_64** and **ARM64**.
+
+For build commands, CI expectations, and module map, see `CLAUDE.md`.
+
+## Rust
+
+- Idiomatic Rust: clear names (`is_ready`, `has_data`), modules over duplication.
+- **Naming:** `snake_case` functions/variables, `PascalCase` types/structs.
+- **`Result` / `Option`** for control flow; custom errors with **`thiserror`**. Prefer returning errors over panics in library code.
+- **`unsafe`:** expected at Windows FFI; keep blocks small and localized.
+
+## Windows API
+
+- Use the **`windows`** crate; add needed APIs under `[dependencies.windows]` in `Cargo.toml`.
+- Reference: [windows-docs-rs](https://microsoft.github.io/windows-docs-rs/doc/windows/).
+
+## Git commits
+
+Prefixes (lowercase summary line): `fix:`, `feat:`, `perf:`, `docs:`, `style:`, `refactor:`, `test:`, `chore:`.
+
+Expand in the body for non-obvious changes; reference issues when applicable.
