@@ -71,6 +71,10 @@ pub struct DebugEngine {
     control: IDebugControl4,
     dataspaces: IDebugDataSpaces4,
     symbols: IDebugSymbols3,
+    /// Whether this engine opened its own session (via `DebugCreate`) and is thus
+    /// responsible for ending it on `Drop`. False when wrapping a borrowed WinDbg
+    /// client, so going out of scope can't stop the host's active session.
+    owns_session: bool,
 }
 
 impl Default for DebugEngine {
@@ -90,7 +94,10 @@ impl DebugEngine {
             unsafe { windows::Win32::System::Diagnostics::Debug::Extensions::DebugCreate() }
                 .expect("[-] Failed to create debug client");
 
-        Self::from_client_interface(client)
+        // We opened this session, so we own its teardown.
+        let mut engine = Self::from_client_interface(client);
+        engine.owns_session = true;
+        engine
     }
 
     pub fn from_windbg_client(client: &IUnknown) -> Self {
@@ -128,6 +135,9 @@ impl DebugEngine {
             control,
             dataspaces,
             symbols,
+            // Default to "borrowed": constructors that wrap an existing WinDbg client
+            // go through here, and only `new()` (which calls `DebugCreate`) sets this.
+            owns_session: false,
         }
     }
 
@@ -342,8 +352,11 @@ impl DebugEngine {
     /// Call [`Self::wait_for_event`] afterward to finish loading the target.
     pub fn open_dump(&self, path: &str) -> Result<(), DbgEngError> {
         let wide = to_wide(path);
-        unsafe { self.client.OpenDumpFileWide(PCWSTR::from_raw(wide.as_ptr()), 0) }
-            .map_err(DbgEngError::OperationFailed)
+        unsafe {
+            self.client
+                .OpenDumpFileWide(PCWSTR::from_raw(wide.as_ptr()), 0)
+        }
+        .map_err(DbgEngError::OperationFailed)
     }
 
     /// Opens a TTD trace (`.run`); alias for [`Self::open_dump`].
@@ -360,9 +373,13 @@ impl DebugEngine {
 
 impl Drop for DebugEngine {
     fn drop(&mut self) {
-        // Best-effort teardown; ignore errors (e.g. when no session is active).
-        unsafe {
-            let _ = self.client.EndSession(DEBUG_END_PASSIVE);
+        // Only tear down sessions we opened ourselves. Wrapping a borrowed WinDbg
+        // client must not end the host's active session when the wrapper drops.
+        if self.owns_session {
+            // Best-effort teardown; ignore errors (e.g. when no session is active).
+            unsafe {
+                let _ = self.client.EndSession(DEBUG_END_PASSIVE);
+            }
         }
     }
 }
@@ -431,14 +448,16 @@ impl<'a> Breakpoint<'a> {
         })
     }
 
-    pub fn set_offset_expression(&self, expression: &str) {
-        let expr = CString::new(expression).expect("[-] Invalid breakpoint expression");
+    pub fn set_offset_expression(&self, expression: &str) -> Result<(), DbgEngError> {
+        // Mirror execute_command: return an error on malformed input rather than panic.
+        let expr = CString::new(expression).map_err(|_| DbgEngError::InvalidCommand)?;
 
         unsafe {
             self.breakpoint
                 .SetOffsetExpression(PCSTR::from_raw(expr.as_ptr() as *const u8))
-                .expect("[-] Failed to set breakpoint offset");
+                .map_err(DbgEngError::BreakpointFailed)?;
         }
+        Ok(())
     }
 
     pub fn enable(&self) {
