@@ -1,13 +1,13 @@
 use std::ffi::CString;
 use thiserror::Error;
-use windows::core::{IUnknown, Interface, PCSTR, PCWSTR};
+use windows::core::{IUnknown, Interface, PCSTR, PCWSTR, PWSTR};
 
 // Import the necessary Windows Debug Engine interfaces
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_ANY_ID, DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_ATTACH_LOCAL_KERNEL, DEBUG_BREAKPOINT_CODE,
     DEBUG_BREAKPOINT_ENABLED, DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_OUTCTL_THIS_CLIENT,
     DEBUG_OUTPUT_NORMAL, IDebugBreakpoint, IDebugBreakpoint2, IDebugClient6, IDebugControl4,
-    IDebugDataSpaces4, IDebugEventContextCallbacks, IDebugSymbols3,
+    IDebugDataSpaces4, IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugSymbols3,
 };
 
 /// Callback type for breakpoint events that receives the breakpoint, context, and flags
@@ -39,6 +39,31 @@ pub enum DbgEngError {
 
     #[error("Breakpoint failed: {0}")]
     BreakpointFailed(windows::core::Error),
+
+    #[error("Invalid command string (contains interior NUL)")]
+    InvalidCommand,
+
+    #[error("Operation failed: {0}")]
+    OperationFailed(windows::core::Error),
+}
+
+/// `CreateProcess` flag: debug only the launched process, not its children.
+const DEBUG_ONLY_THIS_PROCESS: u32 = 0x0000_0002;
+/// `CreateProcess` flag: give the launched target its own console. Without this a
+/// console target inherits the host's stdout — fatal when the host's stdout is an
+/// MCP/JSON-RPC channel, as the target's prints corrupt the stream.
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+/// `AttachProcess` default attach flags.
+const DEBUG_ATTACH_DEFAULT: u32 = 0x0000_0000;
+/// `EndSession` flag used on teardown: detach passively without resuming.
+const DEBUG_END_PASSIVE: u32 = 0x0000_0000;
+/// How long to wait for a freshly launched/attached target to reach its initial
+/// break before giving up (ms).
+const LIVE_WAIT_MS: u32 = 30_000;
+
+/// Encodes a `&str` as a NUL-terminated UTF-16 buffer for the `*Wide` DbgEng APIs.
+fn to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 pub struct DebugEngine {
@@ -128,40 +153,47 @@ impl DebugEngine {
 
     /// Attaches to a kernel using a connection string
     pub fn attach_kernel(&self, connection_string: &str) {
-        let connection = PCSTR::from_raw(connection_string.as_ptr());
+        let connection = CString::new(connection_string).expect("[-] Invalid connection string");
 
         unsafe {
             self.client
-                .AttachKernel(DEBUG_ATTACH_KERNEL_CONNECTION, connection)
+                .AttachKernel(
+                    DEBUG_ATTACH_KERNEL_CONNECTION,
+                    PCSTR::from_raw(connection.as_ptr() as *const u8),
+                )
                 .expect("[-] Failed to attach to kernel");
         }
     }
 
     /// Sets the symbol path
     pub fn set_symbol_path(&self, symbol_path: &str) {
-        let path = PCSTR::from_raw(symbol_path.as_ptr());
+        let path = CString::new(symbol_path).expect("[-] Invalid symbol path");
 
         unsafe {
             self.symbols
-                .SetSymbolPath(path)
+                .SetSymbolPath(PCSTR::from_raw(path.as_ptr() as *const u8))
                 .expect("[-] Failed to set symbol path")
         };
     }
 
-    /// Executes a debug command
+    /// Executes a debug command and returns its full textual output.
     pub fn execute_command(&self, command: &str) -> Result<String, DbgEngError> {
-        let cmd = PCSTR::from_raw(command.as_ptr());
+        // DbgEng reads a NUL-terminated C string; a `&str` is not NUL-terminated,
+        // so build a `CString` and keep it alive for the duration of `Execute`.
+        let cmd_c = CString::new(command).map_err(|_| DbgEngError::InvalidCommand)?;
+        let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
 
-        // Create a buffer to capture the output
+        // Buffer accumulates output across the many Output() callbacks DbgEng emits
+        // (one per chunk/line) — it must append, not overwrite.
         let mut output_buffer = Vec::<u8>::with_capacity(4096);
         let output_callbacks = OutputCallbacks::new(&mut output_buffer);
-        let output_interface = output_callbacks.into();
+        let output_interface: IDebugOutputCallbacks = output_callbacks.into();
 
         // Set the output callbacks
         unsafe {
             self.client
                 .SetOutputCallbacks(Some(&output_interface))
-                .expect("[-] Failed to set output callbacks");
+                .map_err(DbgEngError::CommandFailed)?;
         }
 
         // Execute the command
@@ -170,19 +202,14 @@ impl DebugEngine {
                 .Execute(DEBUG_OUTCTL_THIS_CLIENT, cmd, DEBUG_EXECUTE_ECHO)
         };
 
-        // Reset the output callbacks
+        // Always detach the callbacks before `output_interface`/`output_buffer` drop.
         unsafe {
-            self.client.SetOutputCallbacks(None)?;
+            let _ = self.client.SetOutputCallbacks(None);
         }
 
-        if result.is_err() {
-            return Err(DbgEngError::CommandFailed(result.err().unwrap()));
-        }
+        result.map_err(DbgEngError::CommandFailed)?;
 
-        // Convert the output to a string
-        let output = String::from_utf8_lossy(&output_buffer).to_string();
-
-        Ok(output)
+        Ok(String::from_utf8_lossy(&output_buffer).to_string())
     }
 
     /// Waits for the target to break
@@ -194,6 +221,49 @@ impl DebugEngine {
         }
 
         Ok(())
+    }
+
+    /// Issues an execution-control command (`g`, `t`, `p`, `g-`, `t-`, `p-`, …) and
+    /// drives it to the next stop.
+    ///
+    /// Unlike [`Self::execute_command`], commands that *resume* the target only set the
+    /// engine running when `Execute` returns — the target doesn't actually move until
+    /// `WaitForEvent` pumps it. This captures output across both the command and the
+    /// resulting execution (so e.g. a "Breakpoint N hit" message is included), which is
+    /// what makes go/step (and TTD forward/reverse navigation) actually advance.
+    pub fn execute_and_wait(&self, command: &str, timeout_ms: u32) -> Result<String, DbgEngError> {
+        let cmd_c = CString::new(command).map_err(|_| DbgEngError::InvalidCommand)?;
+        let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
+
+        let mut output_buffer = Vec::<u8>::with_capacity(4096);
+        let output_callbacks = OutputCallbacks::new(&mut output_buffer);
+        let output_interface: IDebugOutputCallbacks = output_callbacks.into();
+
+        unsafe {
+            self.client
+                .SetOutputCallbacks(Some(&output_interface))
+                .map_err(DbgEngError::CommandFailed)?;
+        }
+
+        // Initiate execution, then pump events until the target stops again.
+        let exec = unsafe {
+            self.control
+                .Execute(DEBUG_OUTCTL_THIS_CLIENT, cmd, DEBUG_EXECUTE_ECHO)
+        };
+        let waited = if exec.is_ok() {
+            unsafe { self.control.WaitForEvent(0, timeout_ms) }
+        } else {
+            Ok(())
+        };
+
+        unsafe {
+            let _ = self.client.SetOutputCallbacks(None);
+        }
+
+        exec.map_err(DbgEngError::CommandFailed)?;
+        waited.map_err(DbgEngError::CommandFailed)?;
+
+        Ok(String::from_utf8_lossy(&output_buffer).to_string())
     }
 
     pub fn create_debug_event_context_callbacks(
@@ -223,6 +293,78 @@ impl DebugEngine {
         let module = PCSTR::from_raw(module.as_ptr() as *const u8);
         unsafe { self.symbols.Reload(module) }.expect("[-] Failed to reload symbols");
     }
+
+    /// Returns the current register set as formatted text (`r`).
+    pub fn registers(&self) -> Result<String, DbgEngError> {
+        self.execute_command("r")
+    }
+
+    /// Ensures the engine breaks at the initial (loader) breakpoint. A bare
+    /// `DebugCreate` host defaults this event filter to "ignore", so a freshly
+    /// launched/attached target would run free and the engine would never establish a
+    /// current process/thread (register/stack commands then fail with `0x80040205`).
+    fn enable_initial_break(&self) -> Result<(), DbgEngError> {
+        self.execute_command("sxe ibp").map(|_| ())
+    }
+
+    /// Launches a new user-mode process under the debugger and waits for it to stop at
+    /// its initial breakpoint, leaving a current process/thread ready to inspect.
+    pub fn launch_process(&self, command_line: &str) -> Result<(), DbgEngError> {
+        self.enable_initial_break()?;
+        let mut wide = to_wide(command_line);
+        unsafe {
+            self.client.CreateProcessWide(
+                0,
+                PWSTR::from_raw(wide.as_mut_ptr()),
+                DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE,
+            )
+        }
+        .map_err(DbgEngError::OperationFailed)?;
+
+        // `CreateProcessWide` is deferred: the engine doesn't actually spawn the process
+        // until the next `WaitForEvent`, and it reads the command-line buffer (`wide`)
+        // at that point — so drive the wait here, while `wide` is still alive. With the
+        // initial-breakpoint filter enabled above, this stops at the loader breakpoint.
+        self.wait_for_event(LIVE_WAIT_MS)
+    }
+
+    /// Attaches to an existing user-mode process by PID and waits for the break-in,
+    /// leaving a current process/thread ready to inspect.
+    pub fn attach_process(&self, pid: u32) -> Result<(), DbgEngError> {
+        self.enable_initial_break()?;
+        unsafe { self.client.AttachProcess(0, pid, DEBUG_ATTACH_DEFAULT) }
+            .map_err(DbgEngError::OperationFailed)?;
+        // The attach completes during `WaitForEvent`, which breaks the target in.
+        self.wait_for_event(LIVE_WAIT_MS)
+    }
+
+    /// Opens a crash dump (`.dmp`) or a Time Travel Debugging trace (`.run`).
+    /// Call [`Self::wait_for_event`] afterward to finish loading the target.
+    pub fn open_dump(&self, path: &str) -> Result<(), DbgEngError> {
+        let wide = to_wide(path);
+        unsafe { self.client.OpenDumpFileWide(PCWSTR::from_raw(wide.as_ptr()), 0) }
+            .map_err(DbgEngError::OperationFailed)
+    }
+
+    /// Opens a TTD trace (`.run`); alias for [`Self::open_dump`].
+    pub fn open_trace(&self, path: &str) -> Result<(), DbgEngError> {
+        self.open_dump(path)
+    }
+
+    /// Ends the current debug session without destroying the client, so it can be
+    /// reused for another target.
+    pub fn end_session(&self) -> Result<(), DbgEngError> {
+        unsafe { self.client.EndSession(DEBUG_END_PASSIVE) }.map_err(DbgEngError::OperationFailed)
+    }
+}
+
+impl Drop for DebugEngine {
+    fn drop(&mut self) {
+        // Best-effort teardown; ignore errors (e.g. when no session is active).
+        unsafe {
+            let _ = self.client.EndSession(DEBUG_END_PASSIVE);
+        }
+    }
 }
 
 // Output callbacks implementation to capture command output
@@ -247,16 +389,19 @@ impl windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbac
     for OutputCallbacks_Impl
 {
     fn Output(&self, _mask: u32, text: &PCSTR) -> windows::core::Result<()> {
-        let this = unsafe {
-            (self as *const _ as *const OutputCallbacks)
-                .as_ref()
-                .unwrap()
-        };
+        // `self` (the generated `_Impl` wrapper) derefs to the inner `OutputCallbacks`,
+        // so access the field directly. The previous `self as *const OutputCallbacks`
+        // cast reinterpreted the COM wrapper's header as our struct (UB) — it read a
+        // vtable pointer as `buffer` and corrupted memory.
+        if text.is_null() {
+            return Ok(());
+        }
         let c_str = unsafe { std::ffi::CStr::from_ptr(text.0 as *const i8) };
         if let Ok(str_slice) = c_str.to_str() {
+            // Append: DbgEng calls Output() once per chunk, so clearing here would
+            // discard everything but the final chunk.
             unsafe {
-                (*this.buffer).clear();
-                (*this.buffer).extend_from_slice(str_slice.as_bytes());
+                (*self.buffer).extend_from_slice(str_slice.as_bytes());
             }
         }
         Ok(())
@@ -287,11 +432,11 @@ impl<'a> Breakpoint<'a> {
     }
 
     pub fn set_offset_expression(&self, expression: &str) {
-        let expr = PCSTR::from_raw(expression.as_ptr());
+        let expr = CString::new(expression).expect("[-] Invalid breakpoint expression");
 
         unsafe {
             self.breakpoint
-                .SetOffsetExpression(expr)
+                .SetOffsetExpression(PCSTR::from_raw(expr.as_ptr() as *const u8))
                 .expect("[-] Failed to set breakpoint offset");
         }
     }
