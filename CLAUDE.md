@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `win-kexp` is a Rust library (edition 2024) of utilities for Windows kernel exploitation research. It provides shellcode (token stealing, ACL editing, command spawning), process injection, ROP chain construction, kernel pool/win32k helpers, and Windows Debug Engine integration targeting Windows **x86_64** and **ARM64**.
 
-The library is Windows-only: nearly all public API is gated behind `#[cfg(target_os = "windows")]`. On non-Windows hosts it compiles to an essentially empty crate (useful only for `cargo fmt`/`cargo check` of platform-independent code).
+The library is Windows-only by design: `src/lib.rs` exports every module (`dbgeng`, `pool`, `process`, `rop`, `shellcode`, `util`, `win32k`) unconditionally, and most modules call the `windows` crate APIs directly without `#[cfg]` gating. The crate is meant to be built for Windows targets; it is not designed to compile on other platforms. The only significant `#[cfg(target_os = "windows")]`/`target_arch` gating lives in `src/shellcode.rs`, where it selects between the assembled-object and hardcoded-fallback shellcode paths.
 
 ## Commands
 
