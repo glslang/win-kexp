@@ -39,7 +39,7 @@ WINDOWS_VERSION=23H2 cargo build --target aarch64-pc-windows-msvc
 
 The most important architectural detail is the **dual-path shellcode system** controlled by `build.rs`:
 
-1. **Primary path**: `build.rs` detects `ml64` (x86_64) or `armasm64` (ARM64) at build time and compiles the `.asm` files in `src/asm/` into `.obj` COFF files placed in `OUT_DIR`. At runtime `goblin` parses those COFF objects and `extract_shellcode_from_obj` pulls out the executable section bytes.
+1. **Primary path**: `build.rs` detects `ml64` (x86_64) or `armasm64` (ARM64) at build time and compiles the `.asm` files in `src/asm/` into `.obj` COFF files placed in `OUT_DIR`. At runtime, `goblin` parses those COFF objects and `extract_shellcode_from_obj` pulls out the executable section bytes.
 2. **Fallback path**: If no assembler is found (or assembly fails, a source file is missing, or an invalid `WINDOWS_VERSION` is requested on ARM64), `build.rs` emits `cargo:rustc-cfg=feature="shellcode_fallback"`, activating the `shellcode_fallback` feature flag. Hardcoded byte arrays are then returned directly.
 
 `src/shellcode.rs` uses `#[cfg]` gates on `feature = "shellcode_fallback"` (and on `target_arch`) throughout. Each public `*_shellcode()` function has a primary and a fallback variant selected by these gates.
@@ -84,18 +84,21 @@ When touching this module, mind the `owns_session` invariant and the stdout-isol
 ## Conventions
 
 ### Assembly
+
 - x86_64: MASM syntax (`ml64`)
 - ARM64: ARMASM syntax (`armasm64`) with the `WINDOWS_VERSION` preprocessor variable
 - Changing an `.asm` file requires updating the matching fallback array in `src/shellcode.rs` (see the contract test above)
 
 ### Rust
+
 - `snake_case` for functions/variables, `PascalCase` for types/structs
 - Custom error types use `thiserror`; prefer `Result`/`Option` over panics in library code
-- Windows API via the `windows` crate (currently `0.62`); add required feature flags in `Cargo.toml` under `[dependencies.windows]`
+- Windows API via the `windows` crate (currently `0.62.2`); add required feature flags in `Cargo.toml` under `[dependencies.windows]`
 - `unsafe` is expected at Windows FFI boundaries; keep unsafe blocks minimal and localized
 - Key dependencies: `windows`/`windows-core`/`windows-strings` (FFI), `goblin` (COFF/PE parsing), `thiserror` (errors), `byte-strings` (NUL-terminated literals), `hex`
 
 ### Git Commit Prefixes
+
 `fix:`, `feat:`, `perf:`, `docs:`, `style:`, `refactor:`, `test:`, `chore:` — lowercase, concise summary line.
 
 ## CI
@@ -105,7 +108,7 @@ Three workflows run on **Windows runners only**:
 - **coverage.yml**: grcov + LLVM instrumentation → Codecov upload
 - **miri.yml**: `cargo miri test` on nightly with `MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"`
 
-CI uses `glslang/setup-masm@v1.2` to install MASM/ARMASM tooling, so assemblers are always available there. Local builds without assemblers silently activate `shellcode_fallback`.
+CI installs MASM/ARMASM tooling via `glslang/setup-masm` (`ci.yml` uses `@v1.4`, `coverage.yml` uses `@v1`, `miri.yml` uses `@v1.2`), so assemblers are always available there. Local builds without assemblers silently activate `shellcode_fallback`.
 
 ## Related Docs
 
