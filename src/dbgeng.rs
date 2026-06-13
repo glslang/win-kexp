@@ -6,8 +6,9 @@ use windows::core::{IUnknown, Interface, PCSTR, PCWSTR, PWSTR};
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_ANY_ID, DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_ATTACH_LOCAL_KERNEL, DEBUG_BREAKPOINT_CODE,
     DEBUG_BREAKPOINT_ENABLED, DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_OUTCTL_THIS_CLIENT,
-    DEBUG_OUTPUT_NORMAL, IDebugBreakpoint, IDebugBreakpoint2, IDebugClient6, IDebugControl4,
-    IDebugDataSpaces4, IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugSymbols3,
+    DEBUG_OUTPUT_NORMAL, DEBUG_STATUS_NO_DEBUGGEE, IDebugBreakpoint, IDebugBreakpoint2,
+    IDebugClient6, IDebugControl4, IDebugDataSpaces4, IDebugEventContextCallbacks,
+    IDebugOutputCallbacks, IDebugSymbols3,
 };
 
 /// Callback type for breakpoint events that receives the breakpoint, context, and flags
@@ -42,6 +43,9 @@ pub enum DbgEngError {
 
     #[error("Invalid command string (contains interior NUL)")]
     InvalidCommand,
+
+    #[error("No active debuggee — attach to a target, launch a process, or open a dump/trace first")]
+    NoDebuggee,
 
     #[error("Operation failed: {0}")]
     OperationFailed(windows::core::Error),
@@ -152,18 +156,25 @@ impl DebugEngine {
         Ok(buffer)
     }
 
-    /// Attaches to the local kernel
-    pub fn attach_local_kernel(&self) {
+    /// Attaches to the local kernel.
+    ///
+    /// Returns an error rather than panicking when the attach fails (e.g. the host
+    /// was not booted with local kernel debugging enabled), so callers driving the
+    /// engine on a worker thread can surface a clean message instead of unwinding.
+    pub fn attach_local_kernel(&self) -> Result<(), DbgEngError> {
         unsafe {
             self.client
                 .AttachKernel(DEBUG_ATTACH_LOCAL_KERNEL, None)
-                .expect("[-] Failed to attach to local kernel")
-        };
+                .map_err(DbgEngError::AttachFailed)
+        }
     }
 
-    /// Attaches to a kernel using a connection string
-    pub fn attach_kernel(&self, connection_string: &str) {
-        let connection = CString::new(connection_string).expect("[-] Invalid connection string");
+    /// Attaches to a kernel using a connection string (e.g. `net:port=50000,key=...`).
+    ///
+    /// Returns an error rather than panicking when the connection string is invalid or
+    /// the attach fails (e.g. the transport/port is already owned by another debugger).
+    pub fn attach_kernel(&self, connection_string: &str) -> Result<(), DbgEngError> {
+        let connection = CString::new(connection_string).map_err(|_| DbgEngError::InvalidCommand)?;
 
         unsafe {
             self.client
@@ -171,7 +182,7 @@ impl DebugEngine {
                     DEBUG_ATTACH_KERNEL_CONNECTION,
                     PCSTR::from_raw(connection.as_ptr() as *const u8),
                 )
-                .expect("[-] Failed to attach to kernel");
+                .map_err(DbgEngError::AttachFailed)
         }
     }
 
@@ -242,6 +253,15 @@ impl DebugEngine {
     /// resulting execution (so e.g. a "Breakpoint N hit" message is included), which is
     /// what makes go/step (and TTD forward/reverse navigation) actually advance.
     pub fn execute_and_wait(&self, command: &str, timeout_ms: u32) -> Result<String, DbgEngError> {
+        // Driving execution control (`g`/`t`/`p`/…) into an engine with no live
+        // debuggee can push DbgEng into an access violation — a structured exception
+        // that Rust's `catch_unwind` cannot trap, which tears down the whole process.
+        // Refuse up front when there is nothing to run, returning a clean error.
+        let status = unsafe { self.control.GetExecutionStatus() }.map_err(DbgEngError::CommandFailed)?;
+        if status == DEBUG_STATUS_NO_DEBUGGEE {
+            return Err(DbgEngError::NoDebuggee);
+        }
+
         let cmd_c = CString::new(command).map_err(|_| DbgEngError::InvalidCommand)?;
         let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
 
