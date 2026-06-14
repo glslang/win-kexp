@@ -1,4 +1,9 @@
 use std::ffi::CString;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
 use thiserror::Error;
 use windows::core::{IUnknown, Interface, PCSTR, PCWSTR, PWSTR};
 
@@ -6,10 +11,10 @@ use windows::core::{IUnknown, Interface, PCSTR, PCWSTR, PWSTR};
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_ANY_ID, DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_ATTACH_LOCAL_KERNEL, DEBUG_BREAKPOINT_CODE,
     DEBUG_BREAKPOINT_ENABLED, DEBUG_CLASS_KERNEL, DEBUG_ENGOPT_INITIAL_BREAK,
-    DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_KERNEL_SMALL_DUMP, DEBUG_OUTCTL_THIS_CLIENT,
-    DEBUG_OUTPUT_NORMAL, DEBUG_STATUS_NO_DEBUGGEE, IDebugBreakpoint, IDebugBreakpoint2,
-    IDebugClient6, IDebugControl4, IDebugDataSpaces4, IDebugEventContextCallbacks,
-    IDebugOutputCallbacks, IDebugSymbols3,
+    DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_INTERRUPT_ACTIVE, DEBUG_KERNEL_SMALL_DUMP,
+    DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL, DEBUG_STATUS_NO_DEBUGGEE, IDebugBreakpoint,
+    IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
+    IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugSymbols3,
 };
 
 /// Callback type for breakpoint events that receives the breakpoint, context, and flags
@@ -50,6 +55,11 @@ pub enum DbgEngError {
     )]
     NoDebuggee,
 
+    #[error(
+        "kernel target did not break in within the attach timeout — is it reachable and in debug mode?"
+    )]
+    KernelBreakTimeout,
+
     #[error("Operation failed: {0}")]
     OperationFailed(windows::core::Error),
 }
@@ -71,6 +81,18 @@ const LIVE_WAIT_MS: u32 = 30_000;
 /// a finite timeout on a live kernel connection returns `E_NOTIMPL` (the engine never
 /// drives the connection). See [`DebugEngine::is_live_kernel`].
 const WAIT_INFINITE: u32 = u32::MAX;
+/// Upper bound (ms) on a live-kernel break-in wait. The wait itself must be INFINITE
+/// (a finite `WaitForEvent` returns `E_NOTIMPL` on a live kernel), so a watchdog forces
+/// it to return after this long — the single engine thread must not hang forever on an
+/// unreachable/unresponsive target. Generous, to allow a KDNET resync (~25s observed).
+const KERNEL_ATTACH_WAIT_MS: u32 = 60_000;
+
+/// Carries a raw `IDebugControl` pointer to a watchdog thread solely to call
+/// `SetInterrupt`, which DbgEng documents as safe to call from any thread (the rest of
+/// the engine is single-thread-affine). Not otherwise dereferenced off-thread.
+struct InterruptHandle(*mut core::ffi::c_void);
+// SAFETY: only used to invoke SetInterrupt, the one cross-thread-safe DbgEng call.
+unsafe impl Send for InterruptHandle {}
 
 /// Encodes a `&str` as a NUL-terminated UTF-16 buffer for the `*Wide` DbgEng APIs.
 fn to_wide(s: &str) -> Vec<u16> {
@@ -185,7 +207,9 @@ impl DebugEngine {
     /// here — resume once and let it re-break — so the target is left cleanly halted and
     /// the caller's first real `go`/step runs to an actual breakpoint. Best-effort.
     fn absorb_initial_break_artifact(&self) {
-        let _ = self.execute_and_wait("g", WAIT_INFINITE);
+        // The spurious re-break fires immediately on resume; a short bound keeps this
+        // from hanging if (unexpectedly) it doesn't.
+        let _ = self.execute_and_wait("g", 5_000);
     }
 
     /// Whether the current target is a *live* kernel connection (net/1394/serial/local/
@@ -213,14 +237,10 @@ impl DebugEngine {
                 .AttachKernel(DEBUG_ATTACH_LOCAL_KERNEL, None)
                 .map_err(DbgEngError::AttachFailed)?;
         }
-        // A live kernel target requires an INFINITE WaitForEvent (a finite timeout
-        // returns E_NOTIMPL); INITIAL_BREAK makes this stop at the first event.
-        let waited = self.wait_for_event(WAIT_INFINITE);
-        self.clear_initial_break();
-        if waited.is_ok() {
-            self.absorb_initial_break_artifact();
-        }
-        waited
+        // A live kernel needs an INFINITE WaitForEvent (a finite timeout returns
+        // E_NOTIMPL); INITIAL_BREAK makes it stop at the first event. Bound it so an
+        // unresponsive target can't hang the engine thread forever.
+        self.wait_for_kernel_break_in()
     }
 
     /// Attaches to a kernel over a connection string (e.g. `net:port=50000,key=...`)
@@ -242,13 +262,28 @@ impl DebugEngine {
                 .map_err(DbgEngError::AttachFailed)?;
         }
         // Live kernel: INFINITE wait is mandatory (finite → E_NOTIMPL). INITIAL_BREAK
-        // above makes the engine stop once the KDNET link establishes.
-        let waited = self.wait_for_event(WAIT_INFINITE);
+        // above makes the engine stop once the KDNET link establishes. Bound it so an
+        // unreachable target can't hang the engine thread forever.
+        self.wait_for_kernel_break_in()
+    }
+
+    /// Shared tail of the kernel attach paths: wait (bounded) for the INITIAL_BREAK stop,
+    /// clear the option, and absorb the one spurious re-break it leaves. Returns
+    /// [`DbgEngError::KernelBreakTimeout`] if the target never broke in within the bound
+    /// (e.g. unreachable or not in debug mode), rather than reporting a false success.
+    fn wait_for_kernel_break_in(&self) -> Result<(), DbgEngError> {
+        let waited = self.wait_for_event_bounded(KERNEL_ATTACH_WAIT_MS);
         self.clear_initial_break();
-        if waited.is_ok() {
-            self.absorb_initial_break_artifact();
+        waited.map_err(DbgEngError::CommandFailed)?;
+        // The watchdog may have forced the wait to return without an actual break (no
+        // current process/thread); detect that instead of leaving a half-attached engine.
+        let status =
+            unsafe { self.control.GetExecutionStatus() }.map_err(DbgEngError::CommandFailed)?;
+        if status == DEBUG_STATUS_NO_DEBUGGEE {
+            return Err(DbgEngError::KernelBreakTimeout);
         }
-        waited
+        self.absorb_initial_break_artifact();
+        Ok(())
     }
 
     /// Sets the symbol path
@@ -309,6 +344,44 @@ impl DebugEngine {
         Ok(())
     }
 
+    /// `WaitForEvent` with the INFINITE timeout a live kernel requires, but **bounded**:
+    /// after `timeout_ms` a watchdog thread Ctrl+Breaks the target via `SetInterrupt`
+    /// (the one DbgEng call safe from another thread) so the wait returns instead of
+    /// hanging the single engine thread forever — e.g. a `go`/step that never hits a
+    /// breakpoint, or an attach whose target is reachable but won't break in. Returns the
+    /// raw `WaitForEvent` result so callers can tell a real stop from a forced one.
+    ///
+    /// Limitation: `SetInterrupt` can only unblock a wait once the target is *connected*.
+    /// A wait still establishing the KDNET link (e.g. an unreachable target) cannot be
+    /// cancelled this way and will block like `kd` itself does on a dead connection.
+    fn wait_for_event_bounded(&self, timeout_ms: u32) -> windows::core::Result<()> {
+        let done = Arc::new(AtomicBool::new(false));
+        let done_watch = Arc::clone(&done);
+        let handle = InterruptHandle(self.control.as_raw());
+        let deadline = Duration::from_millis(timeout_ms as u64);
+        let watchdog = thread::spawn(move || {
+            let handle = handle; // capture the whole (Send) handle, not just the raw field
+            let start = Instant::now();
+            loop {
+                if done_watch.load(Ordering::SeqCst) {
+                    return;
+                }
+                if start.elapsed() >= deadline
+                    && let Some(ctl) = unsafe { IDebugControl4::from_raw_borrowed(&handle.0) }
+                {
+                    // Ctrl+Break a connected target so the engine thread's WaitForEvent
+                    // returns with a stop. Repeat in case a busy target ignores one.
+                    let _ = unsafe { ctl.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) };
+                }
+                thread::sleep(Duration::from_millis(300));
+            }
+        });
+        let result = unsafe { self.control.WaitForEvent(0, WAIT_INFINITE) };
+        done.store(true, Ordering::SeqCst);
+        let _ = watchdog.join();
+        result
+    }
+
     /// Issues an execution-control command (`g`, `t`, `p`, `g-`, `t-`, `p-`, …) and
     /// drives it to the next stop.
     ///
@@ -329,13 +402,10 @@ impl DebugEngine {
         }
 
         // A live kernel target requires an INFINITE WaitForEvent timeout; a finite one
-        // returns E_NOTIMPL, so go/step would never advance. Dumps/TTD/user-mode keep
-        // the caller's timeout.
-        let timeout_ms = if self.is_live_kernel() {
-            WAIT_INFINITE
-        } else {
-            timeout_ms
-        };
+        // returns E_NOTIMPL, so go/step would never advance. We instead wait INFINITE but
+        // bound it with a watchdog (below), so `timeout_ms` still caps the wait without
+        // hanging the engine thread. Dumps/TTD/user-mode use the timeout directly.
+        let live_kernel = self.is_live_kernel();
 
         let cmd_c = CString::new(command).map_err(|_| DbgEngError::InvalidCommand)?;
         let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
@@ -356,7 +426,11 @@ impl DebugEngine {
                 .Execute(DEBUG_OUTCTL_THIS_CLIENT, cmd, DEBUG_EXECUTE_ECHO)
         };
         let waited = if exec.is_ok() {
-            unsafe { self.control.WaitForEvent(0, timeout_ms) }
+            if live_kernel {
+                self.wait_for_event_bounded(timeout_ms)
+            } else {
+                unsafe { self.control.WaitForEvent(0, timeout_ms) }
+            }
         } else {
             Ok(())
         };
