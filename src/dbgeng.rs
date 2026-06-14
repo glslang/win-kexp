@@ -12,8 +12,8 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_ANY_ID, DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_ATTACH_LOCAL_KERNEL, DEBUG_BREAKPOINT_CODE,
     DEBUG_BREAKPOINT_ENABLED, DEBUG_CLASS_KERNEL, DEBUG_ENGOPT_INITIAL_BREAK,
     DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_INTERRUPT_ACTIVE, DEBUG_KERNEL_SMALL_DUMP,
-    DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL, DEBUG_STATUS_NO_DEBUGGEE, IDebugBreakpoint,
-    IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
+    DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL, DEBUG_STATUS_GO, DEBUG_STATUS_NO_DEBUGGEE,
+    IDebugBreakpoint, IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
     IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugSymbols3,
 };
 
@@ -74,6 +74,9 @@ const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 const DEBUG_ATTACH_DEFAULT: u32 = 0x0000_0000;
 /// `EndSession` flag used on teardown: detach passively without resuming.
 const DEBUG_END_PASSIVE: u32 = 0x0000_0000;
+/// `EndSession` flag: actively detach — the engine talks to the target to resume it
+/// before disconnecting, so a live kernel is left running instead of frozen at a break.
+const DEBUG_END_ACTIVE_DETACH: u32 = 0x0000_0002;
 /// How long to wait for a freshly launched/attached target to reach its initial
 /// break before giving up (ms).
 const LIVE_WAIT_MS: u32 = 30_000;
@@ -548,7 +551,26 @@ impl DebugEngine {
     /// Ends the current debug session without destroying the client, so it can be
     /// reused for another target.
     pub fn end_session(&self) -> Result<(), DbgEngError> {
+        // A live kernel left halted (at a break) and detached *passively* stays FROZEN —
+        // one CPU halted, the rest spinning — because a passive detach never tells the
+        // target to run. Resume it and actively detach instead, leaving it running.
+        if self.is_live_kernel() {
+            return self.resume_and_detach_live_kernel();
+        }
         unsafe { self.client.EndSession(DEBUG_END_PASSIVE) }.map_err(DbgEngError::OperationFailed)
+    }
+
+    /// Detaches from a live kernel leaving it **running**, not frozen at the last break.
+    /// Clears breakpoints (restoring their patched `int3` bytes), sets the target to run,
+    /// then does an *active* detach — which, unlike a passive one, communicates with the
+    /// target to resume it before disconnecting.
+    fn resume_and_detach_live_kernel(&self) -> Result<(), DbgEngError> {
+        let _ = self.execute_command("bc *");
+        unsafe {
+            let _ = self.control.SetExecutionStatus(DEBUG_STATUS_GO);
+            self.client.EndSession(DEBUG_END_ACTIVE_DETACH)
+        }
+        .map_err(DbgEngError::OperationFailed)
     }
 }
 
@@ -556,11 +578,18 @@ impl Drop for DebugEngine {
     fn drop(&mut self) {
         // Only tear down sessions we opened ourselves. Wrapping a borrowed WinDbg
         // client must not end the host's active session when the wrapper drops.
-        if self.owns_session {
-            // Best-effort teardown; ignore errors (e.g. when no session is active).
-            unsafe {
-                let _ = self.client.EndSession(DEBUG_END_PASSIVE);
-            }
+        if !self.owns_session {
+            return;
+        }
+        // Don't leave a live kernel frozen at a break if we're torn down without an
+        // explicit end_session (e.g. the process exits): resume + actively detach.
+        if self.is_live_kernel() {
+            let _ = self.resume_and_detach_live_kernel();
+            return;
+        }
+        // Best-effort teardown; ignore errors (e.g. when no session is active).
+        unsafe {
+            let _ = self.client.EndSession(DEBUG_END_PASSIVE);
         }
     }
 }
