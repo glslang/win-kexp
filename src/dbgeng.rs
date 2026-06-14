@@ -272,14 +272,17 @@ impl DebugEngine {
     /// [`DbgEngError::KernelBreakTimeout`] if the target never broke in within the bound
     /// (e.g. unreachable or not in debug mode), rather than reporting a false success.
     fn wait_for_kernel_break_in(&self) -> Result<(), DbgEngError> {
-        let waited = self.wait_for_event_bounded(KERNEL_ATTACH_WAIT_MS);
+        let (waited, timed_out) = self.wait_for_event_bounded(KERNEL_ATTACH_WAIT_MS);
         self.clear_initial_break();
         waited.map_err(DbgEngError::CommandFailed)?;
-        // The watchdog may have forced the wait to return without an actual break (no
-        // current process/thread); detect that instead of leaving a half-attached engine.
+        // If the watchdog forced the wait to return, the target never reached its
+        // INITIAL_BREAK on its own within the bound — the stop (if any) is a forced
+        // Ctrl+Break, not the clean break-in. Report a timeout and skip the absorb (there
+        // is no INITIAL_BREAK artifact to consume). Also treat a wait that returned with
+        // no debuggee as a timeout, defensively.
         let status =
             unsafe { self.control.GetExecutionStatus() }.map_err(DbgEngError::CommandFailed)?;
-        if status == DEBUG_STATUS_NO_DEBUGGEE {
+        if timed_out || status == DEBUG_STATUS_NO_DEBUGGEE {
             return Err(DbgEngError::KernelBreakTimeout);
         }
         self.absorb_initial_break_artifact();
@@ -348,15 +351,21 @@ impl DebugEngine {
     /// after `timeout_ms` a watchdog thread Ctrl+Breaks the target via `SetInterrupt`
     /// (the one DbgEng call safe from another thread) so the wait returns instead of
     /// hanging the single engine thread forever — e.g. a `go`/step that never hits a
-    /// breakpoint, or an attach whose target is reachable but won't break in. Returns the
-    /// raw `WaitForEvent` result so callers can tell a real stop from a forced one.
+    /// breakpoint, or an attach whose target is reachable but won't break in.
+    ///
+    /// Returns the raw `WaitForEvent` result **and** a `bool` that is `true` when the
+    /// watchdog had to force the return — in that case the stop is a forced Ctrl+Break,
+    /// not the event the caller was waiting for, so callers must not treat it as a normal
+    /// completion (e.g. an attach should report a timeout rather than a clean break-in).
     ///
     /// Limitation: `SetInterrupt` can only unblock a wait once the target is *connected*.
     /// A wait still establishing the KDNET link (e.g. an unreachable target) cannot be
     /// cancelled this way and will block like `kd` itself does on a dead connection.
-    fn wait_for_event_bounded(&self, timeout_ms: u32) -> windows::core::Result<()> {
+    fn wait_for_event_bounded(&self, timeout_ms: u32) -> (windows::core::Result<()>, bool) {
         let done = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
         let done_watch = Arc::clone(&done);
+        let fired_watch = Arc::clone(&fired);
         let handle = InterruptHandle(self.control.as_raw());
         let deadline = Duration::from_millis(timeout_ms as u64);
         let watchdog = thread::spawn(move || {
@@ -372,6 +381,7 @@ impl DebugEngine {
                     // Ctrl+Break a connected target so the engine thread's WaitForEvent
                     // returns with a stop. Repeat in case a busy target ignores one.
                     let _ = unsafe { ctl.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) };
+                    fired_watch.store(true, Ordering::SeqCst);
                 }
                 thread::sleep(Duration::from_millis(300));
             }
@@ -379,7 +389,7 @@ impl DebugEngine {
         let result = unsafe { self.control.WaitForEvent(0, WAIT_INFINITE) };
         done.store(true, Ordering::SeqCst);
         let _ = watchdog.join();
-        result
+        (result, fired.load(Ordering::SeqCst))
     }
 
     /// Issues an execution-control command (`g`, `t`, `p`, `g-`, `t-`, `p-`, …) and
@@ -427,7 +437,9 @@ impl DebugEngine {
         };
         let waited = if exec.is_ok() {
             if live_kernel {
-                self.wait_for_event_bounded(timeout_ms)
+                // A forced break at the bound is a fine outcome for go/step (the target
+                // simply hadn't stopped yet), so ignore the watchdog-fired flag here.
+                self.wait_for_event_bounded(timeout_ms).0
             } else {
                 unsafe { self.control.WaitForEvent(0, timeout_ms) }
             }
