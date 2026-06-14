@@ -8,13 +8,22 @@ use std::time::Instant;
 
 use win_kexp::dbgeng::DebugEngine;
 
-fn run(e: &DebugEngine, cmd: &str) {
+/// Runs a command, prints its output, and reports whether it succeeded so callers can
+/// stop early instead of validating bounded-wait behaviour from a broken state.
+fn run(e: &DebugEngine, cmd: &str) -> bool {
     println!("--- {cmd} ---");
-    match e.execute_command(cmd) {
-        Ok(out) => print!("{out}"),
-        Err(err) => println!("ERR: {err}"),
-    }
+    let ok = match e.execute_command(cmd) {
+        Ok(out) => {
+            print!("{out}");
+            true
+        }
+        Err(err) => {
+            println!("ERR: {err}");
+            false
+        }
+    };
     println!();
+    ok
 }
 
 fn main() {
@@ -30,8 +39,10 @@ fn main() {
         }
     }
 
-    run(&e, "bp nt!NtCreateFile");
-    run(&e, "bl");
+    if !run(&e, "bp nt!NtCreateFile") || !run(&e, "bl") {
+        eprintln!("failed to set/list the breakpoint; aborting");
+        return;
+    }
 
     println!("=== g (expect Breakpoint 0 hit at nt!NtCreateFile) ===");
     let t = Instant::now();
@@ -44,7 +55,10 @@ fn main() {
 
     // Now clear the bp and `go` with NO breakpoint: the bounded wait must force a return
     // around the 5s timeout instead of hanging the engine thread forever.
-    run(&e, "bc *");
+    if !run(&e, "bc *") {
+        eprintln!("failed to clear breakpoints; aborting");
+        return;
+    }
     println!("=== g with no breakpoint (expect a bounded return ~5s, NOT a hang) ===");
     let t = Instant::now();
     match e.execute_and_wait("g", 5_000) {
@@ -54,7 +68,11 @@ fn main() {
     println!("[bounded g returned in {:.1}s]", t.elapsed().as_secs_f32());
 
     // Leave the target running; detach.
-    let _ = e.execute_command("g");
-    let _ = e.end_session();
-    println!("done");
+    if let Err(err) = e.execute_command("g") {
+        eprintln!("resume before detach failed: {err}");
+    }
+    match e.end_session() {
+        Ok(()) => println!("done"),
+        Err(err) => eprintln!("end_session failed: {err}"),
+    }
 }
