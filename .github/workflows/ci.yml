@@ -24,7 +24,7 @@ jobs:
         toolchain:
           - stable
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: microsoft/setup-msbuild@v3
       - uses: glslang/setup-masm@v1.4
         with:
