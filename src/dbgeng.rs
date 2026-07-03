@@ -14,7 +14,7 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_INTERRUPT_ACTIVE, DEBUG_KERNEL_SMALL_DUMP,
     DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL, DEBUG_STATUS_GO, DEBUG_STATUS_NO_DEBUGGEE,
     IDebugBreakpoint, IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
-    IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugSymbols3,
+    IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugRegisters, IDebugSymbols3,
 };
 
 /// Callback type for breakpoint events that receives the breakpoint, context, and flags
@@ -100,6 +100,27 @@ unsafe impl Send for InterruptHandle {}
 /// Encodes a `&str` as a NUL-terminated UTF-16 buffer for the `*Wide` DbgEng APIs.
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Where execution stopped after a [`DebugEngine::run_to_address`] request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunToOutcome {
+    /// The target reached the requested address.
+    Hit,
+    /// The target stopped at a different address (another breakpoint or an exception)
+    /// before reaching the requested one.
+    StoppedElsewhere { stopped_at: u64 },
+    /// The target did not stop within the timeout — the address was not reached with the
+    /// current input/state.
+    Timeout,
+}
+
+/// Result of [`DebugEngine::run_to_address`]: the structured [`RunToOutcome`] plus the
+/// debugger text captured across the run (the stop banner, for context/logging).
+#[derive(Debug, Clone)]
+pub struct RunToResult {
+    pub outcome: RunToOutcome,
+    pub output: String,
 }
 
 pub struct DebugEngine {
@@ -458,6 +479,115 @@ impl DebugEngine {
         waited.map_err(DbgEngError::CommandFailed)?;
 
         Ok(String::from_utf8_lossy(&output_buffer).to_string())
+    }
+
+    /// Runs the target until it reaches `address`, using a one-shot `g <addr>` (a
+    /// temporary breakpoint DbgEng auto-clears, so the caller's own breakpoints are
+    /// untouched) and reports a **structured** stop reason instead of raw text. A
+    /// [`RunToOutcome::Hit`] confirms empirically that the current input/state actually
+    /// drives execution to that block.
+    ///
+    /// Live-kernel targets require an INFINITE `WaitForEvent`; this bounds it with the same
+    /// watchdog as [`Self::execute_and_wait`], so `timeout_ms` caps the wait. Classification
+    /// is by the actual stop, not the watchdog: a hit at `address` landing in the same window
+    /// the watchdog fires still reports [`RunToOutcome::Hit`]; only a break *elsewhere* (or a
+    /// still-running target) is a [`RunToOutcome::Timeout`]. For non-live targets a finite
+    /// `WaitForEvent` timeout returns S_FALSE (an `Ok`) leaving the target running, so it is
+    /// detected via the post-wait `DEBUG_STATUS_GO` and then broken in (so the caller isn't
+    /// left with a running target).
+    pub fn run_to_address(
+        &self,
+        address: u64,
+        timeout_ms: u32,
+    ) -> Result<RunToResult, DbgEngError> {
+        // Refuse when there's nothing to run (driving `g` with no debuggee can fault
+        // DbgEng in a way `catch_unwind` can't trap — see `execute_and_wait`).
+        let status =
+            unsafe { self.control.GetExecutionStatus() }.map_err(DbgEngError::CommandFailed)?;
+        if status == DEBUG_STATUS_NO_DEBUGGEE {
+            return Err(DbgEngError::NoDebuggee);
+        }
+        let live_kernel = self.is_live_kernel();
+
+        let cmd_c =
+            CString::new(format!("g 0x{address:x}")).map_err(|_| DbgEngError::InvalidCommand)?;
+        let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
+
+        let mut output_buffer = Vec::<u8>::with_capacity(4096);
+        let output_callbacks = OutputCallbacks::new(&mut output_buffer);
+        let output_interface: IDebugOutputCallbacks = output_callbacks.into();
+        unsafe {
+            self.client
+                .SetOutputCallbacks(Some(&output_interface))
+                .map_err(DbgEngError::CommandFailed)?;
+        }
+
+        let exec = unsafe {
+            self.control
+                .Execute(DEBUG_OUTCTL_THIS_CLIENT, cmd, DEBUG_EXECUTE_ECHO)
+        };
+        let (waited, forced) = if exec.is_ok() {
+            if live_kernel {
+                self.wait_for_event_bounded(timeout_ms)
+            } else {
+                (unsafe { self.control.WaitForEvent(0, timeout_ms) }, false)
+            }
+        } else {
+            (Ok(()), false)
+        };
+
+        unsafe {
+            let _ = self.client.SetOutputCallbacks(None);
+        }
+        exec.map_err(DbgEngError::CommandFailed)?;
+
+        let output = String::from_utf8_lossy(&output_buffer).to_string();
+
+        // Propagate a genuine `WaitForEvent` failure first (target unavailable/interrupted/
+        // unable to generate events). DbgEng reports an expired *finite* wait as S_FALSE —
+        // an `Ok` — so this only trips on real errors, not timeouts. The live-kernel
+        // watchdog path returns `Ok` when it forces a break, so a forced timeout skips this.
+        if !forced {
+            waited.map_err(DbgEngError::CommandFailed)?;
+        }
+
+        let after =
+            unsafe { self.control.GetExecutionStatus() }.map_err(DbgEngError::CommandFailed)?;
+        if after == DEBUG_STATUS_GO {
+            // A finite wait timed out (S_FALSE): the target is still running and the one-shot
+            // `g <addr>` breakpoint is still armed. Break in so we don't leak a running
+            // target into the next engine call. (The breakpoint only auto-clears when hit; a
+            // later run_to/go arms its own, and a stale one at `address` is harmless here.)
+            unsafe {
+                let _ = self.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE);
+                let _ = self.control.WaitForEvent(0, timeout_ms);
+            }
+            return Ok(RunToResult {
+                outcome: RunToOutcome::Timeout,
+                output,
+            });
+        }
+
+        // The target halted. A hit at `address` is authoritative even when the live-kernel
+        // watchdog also fired in the same window, so check the IP before concluding a forced
+        // timeout — otherwise a hit landing right at the deadline is misreported as Timeout.
+        let rip = self.instruction_pointer()?;
+        let outcome = if rip == address {
+            RunToOutcome::Hit
+        } else if forced {
+            // The watchdog Ctrl+Break'd the target somewhere other than `address` — a timeout.
+            RunToOutcome::Timeout
+        } else {
+            RunToOutcome::StoppedElsewhere { stopped_at: rip }
+        };
+        Ok(RunToResult { outcome, output })
+    }
+
+    /// The current instruction pointer, read typed via `IDebugRegisters` (no text parse).
+    fn instruction_pointer(&self) -> Result<u64, DbgEngError> {
+        let registers: IDebugRegisters =
+            self.client.cast().map_err(DbgEngError::OperationFailed)?;
+        unsafe { registers.GetInstructionOffset() }.map_err(DbgEngError::OperationFailed)
     }
 
     pub fn create_debug_event_context_callbacks(
