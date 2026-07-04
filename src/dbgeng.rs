@@ -313,15 +313,27 @@ impl DebugEngine {
         Ok(())
     }
 
-    /// Sets the symbol path
-    pub fn set_symbol_path(&self, symbol_path: &str) {
-        let path = CString::new(symbol_path).expect("[-] Invalid symbol path");
-
+    /// Sets (replaces) the symbol search path.
+    pub fn set_symbol_path(&self, symbol_path: &str) -> Result<(), DbgEngError> {
+        let path = CString::new(symbol_path).map_err(|_| DbgEngError::InvalidCommand)?;
         unsafe {
             self.symbols
                 .SetSymbolPath(PCSTR::from_raw(path.as_ptr() as *const u8))
-                .expect("[-] Failed to set symbol path")
-        };
+                .map_err(DbgEngError::SymbolPathFailed)
+        }
+    }
+
+    /// Appends a directory (or `srv*` spec) to the symbol search path, preserving the
+    /// existing entries (e.g. the OS symbol server). Goes through the DbgEng API, so
+    /// unlike the `.sympath+` command it takes only a path and cannot swallow trailing
+    /// `;`-separated commands.
+    pub fn append_symbol_path(&self, symbol_path: &str) -> Result<(), DbgEngError> {
+        let path = CString::new(symbol_path).map_err(|_| DbgEngError::InvalidCommand)?;
+        unsafe {
+            self.symbols
+                .AppendSymbolPath(PCSTR::from_raw(path.as_ptr() as *const u8))
+                .map_err(DbgEngError::SymbolPathFailed)
+        }
     }
 
     /// Executes a debug command and returns its full textual output.
@@ -612,10 +624,15 @@ impl DebugEngine {
             .expect("[-] Failed to log message");
     }
 
-    pub fn reload_symbols(&self, module: &str) {
-        let module = CString::new(module).expect("Failed to create CString");
-        let module = PCSTR::from_raw(module.as_ptr() as *const u8);
-        unsafe { self.symbols.Reload(module) }.expect("[-] Failed to reload symbols");
+    /// Reloads symbols. `args` mirrors `.reload` arguments — e.g. "/f HEVD.sys" to
+    /// force-load one module's symbols, or "" to reload all deferred modules.
+    pub fn reload_symbols(&self, args: &str) -> Result<(), DbgEngError> {
+        let args = CString::new(args).map_err(|_| DbgEngError::InvalidCommand)?;
+        unsafe {
+            self.symbols
+                .Reload(PCSTR::from_raw(args.as_ptr() as *const u8))
+                .map_err(DbgEngError::OperationFailed)
+        }
     }
 
     /// Returns the current register set as formatted text (`r`).
