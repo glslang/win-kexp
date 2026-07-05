@@ -2,21 +2,22 @@
 
 ## Project Structure & Module Organization
 
-This is a Rust 2024 library for Windows kernel exploitation research. Public modules live in `src/`: `shellcode.rs`, `process.rs`, `rop.rs`, `pool.rs`, `win32k.rs`, `dbgeng.rs`, and `util.rs`, all exported by `src/lib.rs`. Assembly payloads are in `src/asm/` and are compiled conditionally by `build.rs`. Repository docs include `README.md`, `CLAUDE.md`, and `TOKEN_STEALING_ARM64.md`.
+This Rust 2024 library targets Windows kernel exploitation research. Public modules live in `src/`: `shellcode.rs`, `process.rs`, `rop.rs`, `pool.rs`, `win32k.rs`, `dbgeng.rs`, and `util.rs`. Assembly payloads live in `src/asm/` and are compiled conditionally by `build.rs`. `examples/kdtest.rs` is a scratch Debug Engine smoke test, not public API. Docs include `README.md`, `CLAUDE.md`, and `TOKEN_STEALING_ARM64.md`.
 
-The crate is Windows-only in practice: most modules use the `windows` crate directly and are not broadly `cfg`-gated for non-Windows hosts.
+The crate is Windows-only in practice: most modules use the `windows` crate directly and are not broadly `cfg`-gated.
 
 ## Build, Test, and Development Commands
 
 - `cargo build --verbose`: build the library for the active Windows target.
-- `WINDOWS_VERSION=23H2 cargo build --target aarch64-pc-windows-msvc`: build ARM64 shellcode for Windows 23H2. Supported values are `23H2` and `24H2`; default is `24H2`.
+- `WINDOWS_VERSION=23H2 cargo build --target aarch64-pc-windows-msvc`: build ARM64 shellcode. Supported values are `23H2` and `24H2`; default is `24H2`.
 - `cargo fmt --all -- --check`: verify formatting, matching CI.
 - `cargo fmt --all`: apply Rust formatting.
 - `cargo nextest run --verbose`: preferred test runner and CI path.
 - `cargo test`: standard fallback test runner.
 - `cargo miri test --verbose`: nightly/Miri check used by CI for unsafe-code issues.
+- `cargo run --example kdtest -- "<kd connection>"`: run the kernel-debugging smoke test.
 
-Local builds use `ml64` for x86_64 or `armasm64` for ARM64 when available. Without assemblers, `build.rs` silently enables the shellcode fallback path.
+Local builds use `ml64` for x86_64 or `armasm64` for ARM64 when available. Without assemblers, `build.rs` enables the shellcode fallback path.
 
 ## Coding Style & Naming Conventions
 
@@ -26,7 +27,7 @@ Assembly uses MASM syntax for x86_64 and ARMASM syntax for ARM64.
 
 ## Testing Guidelines
 
-Place focused unit tests in the module being tested under `#[cfg(test)]`. Existing test names use `test_*`, for example `test_find_gadget_offset`. If you change any file in `src/asm/`, update the matching fallback byte array in `src/shellcode.rs`; `test_shellcodes_match_fallback` enforces byte-for-byte equivalence.
+Place focused unit tests in the module being tested under `#[cfg(test)]`. Test names use `test_*`, for example `test_find_gadget_offset`. If you change `src/asm/`, update the matching fallback byte array in `src/shellcode.rs`; `test_shellcodes_match_fallback` enforces byte-for-byte equivalence.
 
 ## Commit & Pull Request Guidelines
 

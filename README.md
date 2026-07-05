@@ -1,108 +1,119 @@
 # win-kexp ![Build Status](https://github.com/glslang/win-kexp/actions/workflows/ci.yml/badge.svg) [![codecov](https://codecov.io/gh/glslang/win-kexp/branch/main/graph/badge.svg)](https://codecov.io/gh/glslang/win-kexp) [![Dependency status](https://deps.rs/repo/github/glslang/win-kexp/status.svg)](https://deps.rs/repo/github/glslang/win-kexp)
 
-A Rust library of utilities for Windows kernel exploitation research. Provides ready-to-use shellcode, process injection, ROP chain construction, and kernel debug engine integration targeting Windows x86\_64 and ARM64.
+`win-kexp` is a Rust 2024 library for Windows kernel exploitation research. It collects shellcode helpers, process injection utilities, ROP-chain tooling, kernel pool helpers, Win32k wrappers, and Windows Debug Engine integration for controlled x86_64 and ARM64 lab environments.
+
+## Safety Scope
+
+This repository is intended for exploit research in isolated Windows test systems. Do not run the examples or payloads against systems you do not own or have explicit permission to test.
 
 ## Features
 
-- **Shellcode**: Token stealing, ACL editing, and `cmd.exe` spawning — available as compiled MASM/ARMASM or hardcoded fallback byte arrays
-- **Process injection**: Remote memory allocation and shellcode injection via `CreateRemoteThread`
-- **ROP chains**: Macros for building and writing ROP chains, plus PE section parsing for gadget search
-- **Kernel pool**: Kernel pool/heap manipulation helpers
-- **Win32k**: Win32k kernel API wrappers
-- **Debug engine**: Windows Debug Engine (`dbgeng`) integration
+- **Shellcode**: token stealing, ACL editing, and `cmd.exe` spawning payloads.
+- **Assembly fallback**: MASM/ARMASM-built shellcode when assemblers are available, hardcoded byte arrays otherwise.
+- **Process utilities**: process lookup, remote allocation, shellcode writes, and `CreateRemoteThread` launch.
+- **ROP helpers**: chain-writing macros and executable PE section scanning for gadget lookup.
+- **Kernel tooling**: pool helpers, Win32k/device I/O wrappers, and driver base discovery.
+- **Debug engine**: `dbgeng` wrappers for local/kernel attach, command execution, breakpoints, symbols, dumps, traces, and session cleanup.
 
 ## Requirements
 
-- Windows (x86\_64 or ARM64)
-- Rust stable toolchain
-- `ml64` (x86\_64) or `armasm64` (ARM64) for compiling assembly — without them the library automatically falls back to hardcoded byte arrays
+- Windows x86_64 or Windows ARM64.
+- Rust stable for normal builds and nightly for Miri.
+- MSVC build tools.
+- Optional assembler: `ml64` for x86_64 or `armasm64` for ARM64.
+- Optional local test runner: `cargo nextest`.
 
-CI installs assemblers via [`glslang/setup-masm`](https://github.com/glslang/setup-masm). For local builds without assemblers, `shellcode_fallback` is activated silently.
+The crate is Windows-only in practice because public modules call Windows APIs directly. CI installs assemblers with [`glslang/setup-masm`](https://github.com/glslang/setup-masm). Local builds without an assembler silently enable the `shellcode_fallback` cfg path.
 
-## Building
+## Build and Test
 
 ```bash
-# Standard build
+# Build for the active Windows target.
 cargo build --verbose
 
-# ARM64 targeting Windows 23H2 (default is 24H2)
+# Build ARM64 shellcode for Windows 23H2. Default is 24H2.
 WINDOWS_VERSION=23H2 cargo build --target aarch64-pc-windows-msvc
 
-# Check formatting (required by CI)
+# Match the CI formatter gate.
 cargo fmt --all -- --check
 
-# Run tests
+# Preferred test runner.
 cargo nextest run --verbose
+
+# Fallback test runner.
+cargo test
+
+# Nightly unsafe-code check used by CI.
+cargo miri test --verbose
 ```
+
+Supported ARM64 shellcode versions are `23H2` and `24H2`; unset `WINDOWS_VERSION` defaults to `24H2`.
 
 ## Modules
 
-| Module | Description |
+| Module | Purpose |
 |---|---|
-| `shellcode` | Shellcode loading and extraction; fallback byte arrays for assembler-free builds |
-| `process` | Process enumeration, remote memory allocation, shellcode injection via `CreateRemoteThread` |
-| `rop` | `create_rop_chain!`, `create_rop_chain_to_buffer!`, `concat_rop_chain_to_buffer!` macros; PE section parsing for gadget search |
-| `pool` | Kernel pool/heap manipulation |
-| `win32k` | Win32k kernel API wrappers |
-| `dbgeng` | Windows Debug Engine integration |
-| `util` | Miscellaneous helpers (pause, debug break, hex utilities) |
+| `shellcode` | Payload loaders and fallback byte arrays. |
+| `process` | Target process discovery and remote shellcode execution. |
+| `rop` | ROP macros plus PE executable-section and gadget search helpers. |
+| `pool` | Anonymous pipe helpers for kernel pool shaping experiments. |
+| `win32k` | Device handles, IOCTL helpers, allocation helpers, and kernel driver lookup. |
+| `dbgeng` | Windows Debug Engine sessions, commands, breakpoints, symbols, dumps, and traces. |
+| `util` | Pause, debug break, and byte-formatting helpers. |
 
-## Shellcode
+## Shellcode Pipeline
 
-Three shellcodes are provided for x86\_64 and ARM64:
+Assembly sources live in `src/asm/`. On Windows, `build.rs` checks for the target assembler:
 
-| Shellcode | Description |
-|---|---|
-| `token_stealing_shellcode()` | Walks the EPROCESS list and copies the SYSTEM token to the current process |
-| `acl_edit_shellcode()` | Edits the ACL of the current process to grant full access |
-| `spawn_cmd_shellcode()` | Locates `kernel32` in the PEB and calls `CreateProcessA` to spawn `cmd.exe` |
+- If found, `.asm` files are compiled into COFF `.obj` files and `goblin` extracts executable bytes.
+- If missing, `cargo:rustc-cfg=feature="shellcode_fallback"` is emitted and the matching byte arrays in `src/shellcode.rs` are used.
 
-x86\_64 also includes SMEP bypass variants:
+`test_shellcodes_match_fallback` verifies that assembled payloads and fallback bytes match. When changing `src/asm/`, update the corresponding fallback byte array in `src/shellcode.rs`.
 
-| Shellcode | Description |
-|---|---|
-| `token_stealing_shellcode_smep_no_kvashadow()` | Token steal with SMEP bypass (no KVAS) |
-| `token_stealing_shellcode_smep_no_kvashadow_pte()` | Token steal with SMEP bypass via PTE manipulation |
+Available payloads:
 
-### Dual-path shellcode system
+| Function | Architectures | Description |
+|---|---:|---|
+| `token_stealing_shellcode()` | x86_64, ARM64 | Copies the SYSTEM token to the current process. |
+| `acl_edit_shellcode()` | x86_64, ARM64 | Edits the current process ACL. |
+| `spawn_cmd_shellcode()` | x86_64, ARM64 | Resolves `CreateProcessA` and spawns `cmd.exe`. |
+| `token_stealing_shellcode_smep_no_kvashadow()` | x86_64 | Token stealing with SMEP bypass. |
+| `token_stealing_shellcode_smep_no_kvashadow_pte()` | x86_64 | Token stealing with PTE-based SMEP bypass. |
 
-`build.rs` detects `ml64` (x86\_64) or `armasm64` (ARM64) at build time:
-
-- **Assembler present**: `.asm` files in `src/asm/` are compiled to COFF `.obj` files; at runtime `goblin` extracts the executable section bytes.
-- **No assembler**: `cargo:rustc-cfg=feature="shellcode_fallback"` is emitted and hardcoded byte arrays are returned directly.
-
-The CI test `test_shellcodes_match_fallback` enforces that both paths produce identical bytes.
-
-### ARM64 version targeting
-
-ARM64 shellcode is Windows-version-specific. Set `WINDOWS_VERSION` to `23H2` or `24H2` (default `24H2`) before building:
-
-```bash
-WINDOWS_VERSION=23H2 cargo build --target aarch64-pc-windows-msvc
-```
-
-## Usage
+## Usage Sketches
 
 ```rust
-use win_kexp::shellcode::token_stealing_shellcode;
 use win_kexp::process::inject_shellcode_to_target_process;
-use win_kexp::rop::{find_gadget_offset, get_executable_sections};
+use win_kexp::shellcode::token_stealing_shellcode;
 
-// Inject token-stealing shellcode into a target process
 let shellcode = token_stealing_shellcode();
 let pid = inject_shellcode_to_target_process("target.exe", &shellcode);
+println!("started remote thread in pid {pid}");
+```
 
-// Find a ROP gadget (pop rax; ret) in ntoskrnl
+```rust
+use win_kexp::rop::{find_gadget_offset, get_executable_sections};
+
 let sections = get_executable_sections(ntoskrnl_module)?;
-let gadget = find_gadget_offset(&sections, &[0x58, 0xC3], ntoskrnl_base);
+let pop_rax_ret = find_gadget_offset(&sections, &[0x58, 0xC3], ntoskrnl_base);
+```
+
+For a debugger smoke test, see `examples/kdtest.rs`:
+
+```bash
+cargo run --example kdtest -- "net:port=50000,key=w.x.y.z"
 ```
 
 ## CI
 
-Three workflows run on Windows runners only:
+The repository uses Windows-only GitHub Actions workflows:
 
-| Workflow | Steps |
+| Workflow | What it does |
 |---|---|
-| `ci.yml` | fmt check → build → `cargo nextest run` on `windows-latest` (x64) and `windows-11-arm` (ARM64) |
-| `coverage.yml` | grcov + llvm instrumentation → Codecov upload |
-| `miri.yml` | `cargo miri test` on nightly (`MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"`) |
+| `ci.yml` | Runs `cargo fmt --all -- --check`, `cargo build --verbose`, and `cargo nextest run --verbose` on `windows-latest` and `windows-11-arm`. |
+| `coverage.yml` | Runs instrumented `cargo test`, generates LCOV with `grcov`, and uploads to Codecov. |
+| `miri.yml` | Runs `cargo miri test --verbose` on nightly with `-Zmiri-disable-isolation -Zmiri-ignore-leaks`. |
+
+## Contributing
+
+Use `rustfmt` defaults and keep unsafe Windows FFI blocks small. Add focused unit tests next to the code under `#[cfg(test)]`; existing test names use `test_*`. Commit subjects use lowercase prefixes such as `fix:`, `feat:`, `docs:`, `style:`, `refactor:`, `test:`, `perf:`, and `chore:`.
