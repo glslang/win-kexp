@@ -80,25 +80,29 @@ fn cell(span: &PoolSpan, selected: bool, dml: bool) -> String {
     )
 }
 
-fn push_chunked(chunks: &mut Vec<String>, text: &str) {
+fn push_chunked(chunks: &mut Vec<String>, text: &str, dml: bool) {
     for fragment in text.split_inclusive('\n') {
-        push_atomic(chunks, fragment);
+        push_atomic(chunks, fragment, dml);
     }
 }
 
-fn push_atomic(chunks: &mut Vec<String>, fragment: &str) {
+fn push_atomic(chunks: &mut Vec<String>, fragment: &str, dml: bool) {
     if fragment.is_empty() {
         return;
     }
     if fragment.len() > OUTPUT_CHUNK {
         let mut remaining = fragment;
         while !remaining.is_empty() {
-            let take = safe_dml_boundary(remaining, OUTPUT_CHUNK);
+            let take = if dml {
+                safe_dml_boundary(remaining, OUTPUT_CHUNK)
+            } else {
+                safe_text_boundary(remaining, OUTPUT_CHUNK)
+            };
             debug_assert!(take != 0, "a single DML element exceeds the output limit");
             if take == 0 {
                 return;
             }
-            push_atomic(chunks, &remaining[..take]);
+            push_atomic(chunks, &remaining[..take], dml);
             remaining = &remaining[take..];
         }
         return;
@@ -109,23 +113,46 @@ fn push_atomic(chunks: &mut Vec<String>, fragment: &str) {
     chunks.last_mut().unwrap().push_str(fragment);
 }
 
+fn safe_text_boundary(text: &str, limit: usize) -> usize {
+    text.char_indices()
+        .map(|(offset, character)| offset + character.len_utf8())
+        .take_while(|end| *end <= limit)
+        .last()
+        .unwrap_or(0)
+}
+
 fn safe_dml_boundary(text: &str, limit: usize) -> usize {
-    let mut in_tag = false;
+    let mut tag_start = None;
     let mut in_entity = false;
+    let mut depth = 0usize;
     let mut boundary = 0;
     for (offset, character) in text.char_indices() {
         let end = offset + character.len_utf8();
         if end > limit {
             break;
         }
-        match character {
-            '<' if !in_entity => in_tag = true,
-            '>' if in_tag => in_tag = false,
-            '&' if !in_tag => in_entity = true,
-            ';' if in_entity => in_entity = false,
-            _ => {}
+        if let Some(start) = tag_start {
+            if character == '>' {
+                let tag = &text[start..end];
+                if tag.starts_with("</") {
+                    depth = depth.saturating_sub(1);
+                } else if !tag.ends_with("/>") && !tag.starts_with("<!") && !tag.starts_with("<?") {
+                    depth += 1;
+                }
+                tag_start = None;
+            }
+        } else if in_entity {
+            if character == ';' {
+                in_entity = false;
+            }
+        } else {
+            match character {
+                '<' => tag_start = Some(offset),
+                '&' => in_entity = true,
+                _ => {}
+            }
         }
-        if !in_tag && !in_entity {
+        if tag_start.is_none() && !in_entity && depth == 0 {
             boundary = end;
         }
     }
@@ -159,12 +186,17 @@ pub(crate) fn render_pool_map(index: &PoolIndex, options: RenderOptions) -> Vec<
         } else {
             diagnostic.clone()
         };
-        push_chunked(&mut chunks, &format!("Diagnostic: {diagnostic}\n"));
+        push_chunked(
+            &mut chunks,
+            &format!("Diagnostic: {diagnostic}\n"),
+            options.dml,
+        );
     }
     if rows.is_empty() {
         push_chunked(
             &mut chunks,
             "No matching pool allocations in the stopped-target snapshot.\n",
+            options.dml,
         );
         return chunks;
     }
@@ -181,12 +213,13 @@ pub(crate) fn render_pool_map(index: &PoolIndex, options: RenderOptions) -> Vec<
                 first.usable_address,
                 key.size_class
             ),
+            options.dml,
         );
         let mut previous_index = None;
         for index_value in indices {
             let span = &index.spans[index_value];
             if previous_index.is_some_and(|index| index + 1 != index_value) {
-                push_atomic(&mut chunks, "|");
+                push_atomic(&mut chunks, "|", options.dml);
             }
             push_atomic(
                 &mut chunks,
@@ -195,17 +228,23 @@ pub(crate) fn render_pool_map(index: &PoolIndex, options: RenderOptions) -> Vec<
                     options.tag == Some(span.raw_tag) && span.state == PoolState::Allocated,
                     options.dml,
                 ),
+                options.dml,
             );
             previous_index = Some(index_value);
         }
-        push_atomic(&mut chunks, "\n");
+        push_atomic(&mut chunks, "\n", options.dml);
     }
     push_chunked(
         &mut chunks,
         "Legend: S selected tag, A unrelated allocation, . reusable hole, c cached/delay-free, ? unreadable\n",
+        options.dml,
     );
     if let Some(tag) = options.tag {
-        push_chunked(&mut chunks, &render_advice(index, tag, options.dml));
+        push_chunked(
+            &mut chunks,
+            &render_advice(index, tag, options.dml),
+            options.dml,
+        );
     }
     chunks
 }
@@ -394,6 +433,30 @@ mod tests {
         assert!(dml.contains("<link cmd="));
         assert!(dml.contains("A&lt;&amp;&quot;"));
         assert!(escape_dml("<&\"").contains("&lt;&amp;&quot;"));
+
+        let complete_cell = cell(&index.spans[0], true, true);
+        let two_cells = complete_cell.repeat(2);
+        assert_eq!(
+            safe_dml_boundary(&two_cells, complete_cell.len() + complete_cell.len() / 2),
+            complete_cell.len()
+        );
+        let mut atomic_chunks = Vec::new();
+        let oversized_cells = complete_cell.repeat(200);
+        push_atomic(&mut atomic_chunks, &oversized_cells, true);
+        assert!(atomic_chunks.len() > 1);
+        assert_eq!(atomic_chunks.concat(), oversized_cells);
+        for chunk in &atomic_chunks {
+            assert_eq!(
+                chunk.matches("<link ").count(),
+                chunk.matches("</link>").count()
+            );
+            assert_eq!(
+                chunk.matches("<col ").count(),
+                chunk.matches("</col>").count()
+            );
+            assert!(chunk.len() <= OUTPUT_CHUNK);
+        }
+
         assert!(
             render_pool_map(
                 &index,

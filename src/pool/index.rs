@@ -187,6 +187,11 @@ impl SnapshotCache {
     where
         F: FnOnce() -> Result<PoolSnapshot, String>,
     {
+        // A forced refresh supersedes the cached view even if rebuilding fails or
+        // is interrupted. Never fall back to geometry the user explicitly replaced.
+        if refresh {
+            self.invalidate();
+        }
         if !refresh
             && let Some(cached) = self.entry.lock().unwrap().as_ref()
             && cached.session == session
@@ -201,6 +206,8 @@ impl SnapshotCache {
                 session,
                 index: index.clone(),
             });
+        } else {
+            self.invalidate();
         }
         Ok(index)
     }
@@ -301,5 +308,17 @@ mod tests {
         cache.get_or_refresh(9, false, make_incomplete).unwrap();
         cache.get_or_refresh(9, false, make_incomplete).unwrap();
         assert_eq!(incomplete_builds.load(Ordering::SeqCst), 2);
+
+        cache.invalidate();
+        cache.get_or_refresh(10, false, make).unwrap();
+        cache.get_or_refresh(10, true, make_incomplete).unwrap();
+        cache.get_or_refresh(10, false, make).unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 6);
+        assert_eq!(incomplete_builds.load(Ordering::SeqCst), 3);
+
+        let failed_refresh = cache.get_or_refresh(10, true, || Err("interrupted".into()));
+        assert_eq!(failed_refresh.unwrap_err(), "interrupted");
+        cache.get_or_refresh(10, false, make).unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 7);
     }
 }
