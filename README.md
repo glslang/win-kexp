@@ -49,6 +49,64 @@ cargo miri test --verbose
 
 Supported ARM64 shellcode versions are `23H2` and `24H2`; unset `WINDOWS_VERSION` defaults to `24H2`.
 
+## WinDbg Pool Map Extension
+
+Building the library for the native x64 MSVC target produces both the normal Rust
+library and `target\debug\win_kexp.dll`:
+
+```powershell
+rustup target add x86_64-pc-windows-msvc
+cargo build --lib
+```
+
+Run that command from an x64 MSVC Rust host. If an explicit
+`--target x86_64-pc-windows-msvc` is supplied instead, the DLL is written to
+`target\x86_64-pc-windows-msvc\debug\win_kexp.dll` and the `.load` path must use
+that target-qualified directory.
+
+The pool walker assumes Windows 10 19H1 or later allocator algorithms and requires
+full private/public type information for `nt`. Configure a Microsoft symbol-server
+path, break into the kernel target, and force-load kernel symbols before using it:
+
+```text
+.symfix
+.reload /f nt
+.load C:\path\to\win-kexp\target\debug\win_kexp.dll
+!win_kexp.help
+```
+
+The primary command is:
+
+```text
+!win_kexp.poolmap -tag Pipe
+!win_kexp.poolmap -tag ABC -paged
+!win_kexp.poolmap -tag Test -nonpaged -refresh
+!win_kexp.poolmap ffff800012345678
+```
+
+`-tag` accepts one through four ASCII bytes. Internally the tag remains the exact
+four-byte raw little-endian value; printable display text is only a rendering. The
+tag map retains nearby unrelated allocations and holes. `-paged` and `-nonpaged`
+filter exact pool identities and cannot be combined. An address query prints detail
+for the allocation or hole containing that address. `-refresh` discards a complete
+cached snapshot and walks again.
+
+“Snapshot” is literal: the extension examines current allocations, reusable frees,
+and cached/delay-free spans while the target is stopped. It does not install
+allocation breakpoints or reconstruct allocation history. The cache is invalidated
+when execution resumes or the debugger session changes, and incomplete or
+Ctrl+C-interrupted walks are never cached.
+
+When WinDbg accepts DML, map cells have colors and clickable address-detail links.
+The same rows use meaningful ASCII glyphs and include a legend when DML is stripped
+or plain-text output is captured.
+
+Pool walking is x64-only because the allocator encodings consulted here are specific
+to x64. The rest of the crate, including ARM64 shellcode support, remains buildable
+for ARM64. Per-session paged heaps are excluded from the initial pool-map scope and
+the command reports that limitation. Corrupt or unreadable allocator metadata is
+shown conservatively rather than treated as an exploitable condition.
+
 ## Modules
 
 | Module | Purpose |

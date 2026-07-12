@@ -5,7 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use windows::core::{IUnknown, Interface, PCSTR, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{S_FALSE, S_OK};
+use windows::core::{HRESULT, IUnknown, Interface, PCSTR, PCWSTR, PWSTR};
 
 // Import the necessary Windows Debug Engine interfaces
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
@@ -62,6 +63,26 @@ pub enum DbgEngError {
 
     #[error("Operation failed: {0}")]
     OperationFailed(windows::core::Error),
+
+    #[error("{operation} failed: {source}")]
+    Context {
+        operation: String,
+        #[source]
+        source: windows::core::Error,
+    },
+
+    #[error("short virtual read at {address:#x}: requested {requested} bytes, read {actual}")]
+    ShortRead {
+        address: u64,
+        requested: usize,
+        actual: usize,
+    },
+
+    #[error("requested debugger buffer is too large: {0} bytes")]
+    BufferTooLarge(usize),
+
+    #[error("debugger text contains an interior NUL")]
+    InvalidOutput,
 }
 
 /// `CreateProcess` flag: debug only the launched process, not its children.
@@ -162,6 +183,16 @@ impl DebugEngine {
         Self::from_client_interface(client)
     }
 
+    /// Fallible counterpart used by native extension callbacks.  Extension entry
+    /// points must translate bad client interfaces to HRESULTs instead of panicking.
+    pub fn try_from_windbg_client(client: &IUnknown) -> Result<Self, DbgEngError> {
+        let client: IDebugClient6 = client.cast().map_err(|source| DbgEngError::Context {
+            operation: "querying IDebugClient6".into(),
+            source,
+        })?;
+        Self::try_from_client_interface(client)
+    }
+
     pub fn create_from_windbg_client(client: &IUnknown) -> Self {
         let client: IDebugClient6 = client.cast().expect("[-] Failed to cast debug client");
         let new_client = unsafe {
@@ -198,15 +229,216 @@ impl DebugEngine {
         }
     }
 
+    pub fn try_from_client_interface(client: IDebugClient6) -> Result<Self, DbgEngError> {
+        let control = client
+            .cast::<IDebugControl4>()
+            .map_err(|source| DbgEngError::Context {
+                operation: "querying IDebugControl4".into(),
+                source,
+            })?;
+        let dataspaces =
+            client
+                .cast::<IDebugDataSpaces4>()
+                .map_err(|source| DbgEngError::Context {
+                    operation: "querying IDebugDataSpaces4".into(),
+                    source,
+                })?;
+        let symbols = client
+            .cast::<IDebugSymbols3>()
+            .map_err(|source| DbgEngError::Context {
+                operation: "querying IDebugSymbols3".into(),
+                source,
+            })?;
+        Ok(Self {
+            client,
+            control,
+            dataspaces,
+            symbols,
+            owns_session: false,
+        })
+    }
+
     pub fn read_memory(&self, address: u64, size: usize) -> Result<Vec<u8>, DbgEngError> {
+        let size_u32 = u32::try_from(size).map_err(|_| DbgEngError::BufferTooLarge(size))?;
         let mut buffer = vec![0; size];
+        let mut read = 0u32;
         unsafe {
-            self.dataspaces
-                .ReadVirtual(address, buffer.as_mut_ptr() as *mut _, size as u32, None)
-                .expect("[-] Failed to read memory")
-        };
+            self.dataspaces.ReadVirtual(
+                address,
+                buffer.as_mut_ptr().cast(),
+                size_u32,
+                Some(&mut read),
+            )
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: format!("reading {size} bytes of virtual memory at {address:#x}"),
+            source,
+        })?;
+        if read as usize != size {
+            return Err(DbgEngError::ShortRead {
+                address,
+                requested: size,
+                actual: read as usize,
+            });
+        }
 
         Ok(buffer)
+    }
+
+    pub fn kernel_base(&self) -> Result<u64, DbgEngError> {
+        let name = CString::new("nt").unwrap();
+        let mut base = 0u64;
+        unsafe {
+            self.symbols.GetModuleByModuleName(
+                PCSTR::from_raw(name.as_ptr().cast()),
+                0,
+                None,
+                Some(&mut base),
+            )
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: "discovering the nt kernel base".into(),
+            source,
+        })?;
+        Ok(base)
+    }
+
+    pub fn symbol_offset(&self, name: &str) -> Result<u64, DbgEngError> {
+        let name = CString::new(name).map_err(|_| DbgEngError::InvalidCommand)?;
+        unsafe {
+            self.symbols
+                .GetOffsetByName(PCSTR::from_raw(name.as_ptr().cast()))
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: format!("resolving symbol {}", name.to_string_lossy()),
+            source,
+        })
+    }
+
+    pub fn type_id(&self, module: u64, name: &str) -> Result<u32, DbgEngError> {
+        let name = CString::new(name).map_err(|_| DbgEngError::InvalidCommand)?;
+        unsafe {
+            self.symbols
+                .GetTypeId(module, PCSTR::from_raw(name.as_ptr().cast()))
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: format!("resolving type {}", name.to_string_lossy()),
+            source,
+        })
+    }
+
+    pub fn type_size(&self, module: u64, type_id: u32) -> Result<u32, DbgEngError> {
+        unsafe { self.symbols.GetTypeSize(module, type_id) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: format!("resolving size of type id {type_id}"),
+                source,
+            }
+        })
+    }
+
+    pub fn field_offset(&self, module: u64, type_id: u32, field: &str) -> Result<u32, DbgEngError> {
+        let field = CString::new(field).map_err(|_| DbgEngError::InvalidCommand)?;
+        unsafe {
+            self.symbols
+                .GetFieldOffset(module, type_id, PCSTR::from_raw(field.as_ptr().cast()))
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: format!("resolving field {}", field.to_string_lossy()),
+            source,
+        })
+    }
+
+    pub fn valid_virtual_region(
+        &self,
+        base: u64,
+        size: usize,
+    ) -> Result<(u64, usize), DbgEngError> {
+        let size_u32 = u32::try_from(size).map_err(|_| DbgEngError::BufferTooLarge(size))?;
+        let mut valid_base = 0;
+        let mut valid_size = 0;
+        unsafe {
+            self.dataspaces
+                .GetValidRegionVirtual(base, size_u32, &mut valid_base, &mut valid_size)
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: format!("querying valid virtual region at {base:#x}"),
+            source,
+        })?;
+        Ok((valid_base, valid_size as usize))
+    }
+
+    pub fn interrupted(&self) -> Result<bool, DbgEngError> {
+        // The generated windows wrapper calls HRESULT::ok(), which deliberately
+        // maps both S_OK and S_FALSE to Ok(()). GetInterrupt uses that distinction:
+        // S_OK means Ctrl+C was requested and S_FALSE means it was not.
+        let result = unsafe {
+            (Interface::vtable(&self.control).GetInterrupt)(Interface::as_raw(&self.control))
+        };
+        match result {
+            S_OK => Ok(true),
+            S_FALSE => Ok(false),
+            result => Err(DbgEngError::Context {
+                operation: "polling debugger interrupt".into(),
+                source: windows::core::Error::from_hresult(HRESULT(result.0)),
+            }),
+        }
+    }
+
+    fn output_inner(&self, text: &str, dml: bool) -> Result<(), DbgEngError> {
+        // DbgEng's output parameter is printf-style. Doubling percent signs makes
+        // user-controlled tags and diagnostics data rather than format directives.
+        let escaped = text.replace('%', "%%");
+        let message = CString::new(escaped).map_err(|_| DbgEngError::InvalidOutput)?;
+        let outctl = if dml {
+            DEBUG_OUTCTL_THIS_CLIENT | 0x20
+        } else {
+            DEBUG_OUTCTL_THIS_CLIENT
+        };
+        unsafe {
+            self.control.ControlledOutput(
+                outctl,
+                DEBUG_OUTPUT_NORMAL,
+                PCSTR::from_raw(message.as_ptr().cast()),
+            )
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: "writing debugger output".into(),
+            source,
+        })
+    }
+
+    pub fn output(&self, text: &str) -> Result<(), DbgEngError> {
+        self.output_inner(text, false)
+    }
+
+    pub fn output_dml(&self, text: &str) -> Result<(), DbgEngError> {
+        self.output_inner(text, true)
+    }
+
+    pub fn execution_status(&self) -> Result<u32, DbgEngError> {
+        unsafe { self.control.GetExecutionStatus() }.map_err(|source| DbgEngError::Context {
+            operation: "querying target execution status".into(),
+            source,
+        })
+    }
+
+    pub fn processor_type(&self) -> Result<u32, DbgEngError> {
+        unsafe { self.control.GetActualProcessorType() }.map_err(|source| DbgEngError::Context {
+            operation: "querying target processor type".into(),
+            source,
+        })
+    }
+
+    pub fn is_kernel_target(&self) -> Result<bool, DbgEngError> {
+        let mut class = 0;
+        let mut qualifier = 0;
+        unsafe { self.control.GetDebuggeeType(&mut class, &mut qualifier) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: "querying target type".into(),
+                source,
+            }
+        })?;
+        Ok(class == DEBUG_CLASS_KERNEL)
     }
 
     /// Asks the engine to break in as soon as a freshly attached target initializes
