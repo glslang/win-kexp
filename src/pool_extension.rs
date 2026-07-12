@@ -56,6 +56,12 @@ fn parse_address(text: &str) -> Option<u64> {
         .flatten()
 }
 
+fn validate_pool_target(processor: u32) -> Result<(), String> {
+    (processor == IMAGE_FILE_MACHINE_AMD64)
+        .then_some(())
+        .ok_or_else(|| format!("pool walking supports x64 targets only (machine {processor:#x})"))
+}
+
 fn parse_args(args: &str) -> Result<PoolCommand, String> {
     let mut tag = None;
     let mut filter = None;
@@ -153,11 +159,7 @@ fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
         return Err("target is running; break in before taking a pool snapshot".into());
     }
     let processor = engine.processor_type().map_err(|error| error.to_string())?;
-    if processor != IMAGE_FILE_MACHINE_AMD64 {
-        return Err(format!(
-            "pool walking supports x64 targets only (machine {processor:#x})"
-        ));
-    }
+    validate_pool_target(processor)?;
     let kernel_base = engine.kernel_base().map_err(|error| error.to_string())?;
     let generation = SESSION_GENERATION.load(Ordering::Acquire);
     let key = SessionKey {
@@ -348,6 +350,11 @@ mod tests {
         );
         assert!(parse_args("-tag ABCDE").is_err());
         assert!(parse_args("-tag Test -paged -nonpaged").is_err());
+        assert_eq!(validate_pool_target(IMAGE_FILE_MACHINE_AMD64), Ok(()));
+        assert_eq!(
+            validate_pool_target(0xaa64),
+            Err("pool walking supports x64 targets only (machine 0xaa64)".into())
+        );
 
         let before = SESSION_GENERATION.load(Ordering::Acquire);
         unsafe { DebugExtensionNotify(DEBUG_NOTIFY_SESSION_INACTIVE, 0) };
