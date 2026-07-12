@@ -3,6 +3,9 @@ name = "win-kexp"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [features]
 shellcode_fallback = []
 
