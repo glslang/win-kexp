@@ -1002,9 +1002,6 @@ pub(crate) struct SnapshotWalker<'a, M> {
 
 impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
     pub(crate) fn walk(&self) -> Result<PoolSnapshot, String> {
-        if !cfg!(target_arch = "x86_64") {
-            return Err("pool walking is supported only for x64 targets".into());
-        }
         let mut snapshot = PoolSnapshot {
             diagnostics: vec!["per-session paged heaps are not included".into()],
             complete: true,
