@@ -220,9 +220,32 @@ pub(crate) fn big_page_hash(address: u64, table_size: usize) -> Option<usize> {
     }
 }
 
-pub(crate) fn big_page_candidates(address: u64, table_size: usize) -> Option<[usize; 2]> {
-    let first = big_page_hash(address, table_size)?;
-    Some([first, (first + 1) % table_size])
+pub(crate) struct BigPageProbe {
+    next: usize,
+    remaining: usize,
+    mask: usize,
+}
+
+impl Iterator for BigPageProbe {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let current = self.next;
+        self.next = (self.next + 1) & self.mask;
+        self.remaining -= 1;
+        Some(current)
+    }
+}
+
+pub(crate) fn big_page_probe(address: u64, table_size: usize) -> Option<BigPageProbe> {
+    Some(BigPageProbe {
+        next: big_page_hash(address, table_size)?,
+        remaining: table_size,
+        mask: table_size - 1,
+    })
 }
 
 pub(crate) fn display_tag(tag: u32) -> String {
@@ -347,12 +370,14 @@ mod tests {
         assert!(valid_descriptor_tree_signature(DESCRIPTOR_TREE_SIGNATURE));
         let first = big_page_hash(0x9000, 8).unwrap();
         assert_eq!(
-            big_page_candidates(0x9000, 8),
-            Some([first, (first + 1) % 8])
+            big_page_probe(0x9000, 8).unwrap().collect::<Vec<_>>(),
+            (0..8)
+                .map(|offset| (first + offset) % 8)
+                .collect::<Vec<_>>()
         );
         assert_eq!(big_page_hash(0, 0), None);
         assert_eq!(big_page_hash(0x9000, 3), None);
-        assert_eq!(big_page_candidates(0x9000, 3), None);
+        assert!(big_page_probe(0x9000, 3).is_none());
         let high_address = 0xffff_8000_1234_5000;
         let mut expected = u64::from((high_address >> 12) as u32) * 0x9e5f;
         expected ^= expected >> 32;
