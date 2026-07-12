@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use super::decode::{
-    PAGE_SIZE, PoolHeaderLayout, adjust_page_end_header, big_page_candidates, decode_descriptor_at,
+    PAGE_SIZE, PoolHeaderLayout, adjust_page_end_header, big_page_probe, decode_descriptor_at,
     decode_large_allocation, decode_lfh_offsets, decode_pool_header, decode_rb_root,
     decode_vs_sizes, lfh_bitmap_state, read_u16, read_u32, read_u64,
     valid_descriptor_tree_signature, valid_page_segment_signature, valid_vs_signature,
@@ -963,7 +963,7 @@ fn lookup_big_page_target(
     let size_offset = layout
         .field("_POOL_TRACKER_BIG_PAGES", "NumberOfBytes")
         .ok()?;
-    for index in big_page_candidates(address, count)? {
+    for index in big_page_probe(address, count)? {
         let entry_address = table + index as u64 * entry.size as u64;
         let bytes = match guarded_read(memory, entry_address, entry.size as usize) {
             Ok(bytes) => bytes,
@@ -974,7 +974,11 @@ fn lookup_big_page_target(
                 continue;
             }
         };
-        if read_u64(&bytes, va_offset)? & !1 == address {
+        let candidate = read_u64(&bytes, va_offset)?;
+        if candidate == 0 {
+            break;
+        }
+        if candidate & !1 == address {
             return Some((
                 read_u32(&bytes, tag_offset)?,
                 read_u64(&bytes, size_offset)?,
@@ -1328,10 +1332,13 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             return None;
         }
         let count = table.len() / entry_size;
-        for index in big_page_candidates(address, count)? {
+        for index in big_page_probe(address, count)? {
             let offset = index * entry_size;
-            let candidate = read_u64(table, offset)? & !1;
-            if candidate == address {
+            let candidate = read_u64(table, offset)?;
+            if candidate == 0 {
+                break;
+            }
+            if candidate & !1 == address {
                 return Some((read_u32(table, offset + 8)?, read_u64(table, offset + 12)?));
             }
         }
@@ -1729,6 +1736,8 @@ mod tests {
         fill(&mut bytes, BIG_TABLE, 4 * 0x20);
         let first = super::super::decode::big_page_hash(LARGE_VA, 4).unwrap();
         let adjacent = (first + 1) % 4;
+        let collision = BIG_TABLE + first as u64 * 0x20;
+        put_u64(&mut bytes, collision, LARGE_VA + 0x10_0000);
         let entry = BIG_TABLE + adjacent as u64 * 0x20;
         put_u64(&mut bytes, entry, LARGE_VA);
         put(&mut bytes, entry + 8, b"BIG!");
@@ -1805,13 +1814,18 @@ mod tests {
                 .any(|message| message.contains("only committed through"))
         );
 
-        let mut table = vec![0u8; 4 * 24];
+        let mut table = vec![0u8; 8 * 24];
         let address = K + 0xb0_0000;
-        let first = super::super::decode::big_page_hash(address, 4).unwrap();
-        let second = ((first + 1) % 4) * 24;
-        table[second..second + 8].copy_from_slice(&address.to_le_bytes());
-        table[second + 8..second + 12].copy_from_slice(b"NEXT");
-        table[second + 12..second + 20].copy_from_slice(&0x7000u64.to_le_bytes());
+        let first = super::super::decode::big_page_hash(address, 8).unwrap();
+        for distance in 0..2 {
+            let collision = ((first + distance) % 8) * 24;
+            table[collision..collision + 8]
+                .copy_from_slice(&(address + (distance as u64 + 1) * 0x10_0000).to_le_bytes());
+        }
+        let third = ((first + 2) % 8) * 24;
+        table[third..third + 8].copy_from_slice(&address.to_le_bytes());
+        table[third + 8..third + 12].copy_from_slice(b"NEXT");
+        table[third + 12..third + 20].copy_from_slice(&0x7000u64.to_le_bytes());
         assert_eq!(
             walker.lookup_big_page(&table, 24, address),
             Some((u32::from_le_bytes(*b"NEXT"), 0x7000))

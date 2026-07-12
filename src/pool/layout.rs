@@ -43,10 +43,10 @@ impl Symbols for DebugEngine {
         self.symbol_offset(name)
     }
     fn type_id(&self, module: u64, name: &str) -> Result<u32, DbgEngError> {
-        self.type_id(module, name)
+        DebugEngine::type_id(self, module, name)
     }
     fn type_size(&self, module: u64, type_id: u32) -> Result<u32, DbgEngError> {
-        self.type_size(module, type_id)
+        DebugEngine::type_size(self, module, type_id)
     }
     fn field(&self, module: u64, type_id: u32, name: &str) -> Result<u32, DbgEngError> {
         self.field_offset(module, type_id, name)
@@ -355,5 +355,185 @@ impl LayoutCache {
 
     pub(crate) fn invalidate(&self) {
         self.entries.lock().unwrap().clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct FakeSymbols {
+        fallback_aliases: bool,
+        optional_fields: bool,
+        missing_global: Option<&'static str>,
+        missing_type: Option<&'static str>,
+        missing_field: Option<(&'static str, &'static str)>,
+    }
+
+    impl FakeSymbols {
+        fn error<T>() -> Result<T, DbgEngError> {
+            Err(DbgEngError::InvalidCommand)
+        }
+
+        fn field_value(name: &str) -> u32 {
+            name.bytes().map(u32::from).sum()
+        }
+
+        fn type_spec(type_id: u32) -> Option<&'static TypeSpec> {
+            type_id
+                .checked_sub(1)
+                .and_then(|index| TYPES.get(index as usize))
+        }
+
+        fn resolve_field(&self, spec: &TypeSpec, name: &str) -> Result<u32, DbgEngError> {
+            if let Some(&(canonical, aliases)) = spec
+                .fields
+                .iter()
+                .find(|(_, aliases)| aliases.contains(&name))
+            {
+                if self.missing_field == Some((spec.name, canonical))
+                    || (self.fallback_aliases && aliases.len() > 1 && name == aliases[0])
+                {
+                    return Self::error();
+                }
+                return Ok(Self::field_value(name));
+            }
+
+            if self.optional_fields
+                && let Some(&(_, _, aliases)) =
+                    OPTIONAL_FIELDS.iter().find(|(type_name, _, aliases)| {
+                        *type_name == spec.name && aliases.contains(&name)
+                    })
+            {
+                if self.fallback_aliases && aliases.len() > 1 && name == aliases[0] {
+                    return Self::error();
+                }
+                return Ok(Self::field_value(name));
+            }
+
+            Self::error()
+        }
+    }
+
+    impl Symbols for FakeSymbols {
+        fn symbol(&self, name: &str) -> Result<u64, DbgEngError> {
+            if self.missing_global == Some(name) {
+                return Self::error();
+            }
+            GLOBALS
+                .iter()
+                .position(|(_, aliases)| aliases.contains(&name))
+                .map(|index| 0xffff_8000_0000_0000 + (index as u64 + 1) * 0x1000)
+                .ok_or(DbgEngError::InvalidCommand)
+        }
+
+        fn type_id(&self, _module: u64, name: &str) -> Result<u32, DbgEngError> {
+            if self.missing_type == Some(name) {
+                return Self::error();
+            }
+            TYPES
+                .iter()
+                .position(|spec| spec.name == name)
+                .map(|index| index as u32 + 1)
+                .ok_or(DbgEngError::InvalidCommand)
+        }
+
+        fn type_size(&self, _module: u64, type_id: u32) -> Result<u32, DbgEngError> {
+            Self::type_spec(type_id)
+                .map(|_| 0x20 + type_id)
+                .ok_or(DbgEngError::InvalidCommand)
+        }
+
+        fn field(&self, _module: u64, type_id: u32, name: &str) -> Result<u32, DbgEngError> {
+            let Some(spec) = Self::type_spec(type_id) else {
+                return Self::error();
+            };
+            self.resolve_field(spec, name)
+        }
+    }
+
+    fn key() -> SessionKey {
+        SessionKey {
+            kernel_base: 0xffff_f800_0000_0000,
+            session: 7,
+        }
+    }
+
+    fn missing_item(result: Result<PoolLayout, LayoutError>) -> String {
+        match result.unwrap_err() {
+            LayoutError::Missing { item } => item,
+        }
+    }
+
+    #[test]
+    fn test_resolve_required_layout_and_optional_absence() {
+        let layout = PoolLayout::resolve(&FakeSymbols::default(), key()).unwrap();
+
+        assert_eq!(layout.key, key());
+        assert_eq!(layout.globals.len(), GLOBALS.len());
+        assert_eq!(layout.types.len(), TYPES.len());
+        assert_eq!(
+            layout.field("_POOL_HEADER", "PoolTag"),
+            Ok(FakeSymbols::field_value("PoolTag") as usize)
+        );
+        assert!(layout.field("_RTL_LOOKASIDE", "Size").is_err());
+    }
+
+    #[test]
+    fn test_resolve_alias_fallback_and_optional_fields() {
+        let symbols = FakeSymbols {
+            fallback_aliases: true,
+            optional_fields: true,
+            ..FakeSymbols::default()
+        };
+        let layout = PoolLayout::resolve(&symbols, key()).unwrap();
+
+        assert_eq!(
+            layout.field("_EX_POOL_HEAP_MANAGER_STATE", "PoolNode"),
+            Ok(FakeSymbols::field_value("PoolNodes") as usize)
+        );
+        assert_eq!(
+            layout.field("_RTL_LOOKASIDE", "Size"),
+            Ok(FakeSymbols::field_value("SizeClass") as usize)
+        );
+        assert_eq!(
+            layout.field("_RTL_DYNAMIC_LOOKASIDE", "ListHead"),
+            Ok(FakeSymbols::field_value("ListHead") as usize)
+        );
+    }
+
+    #[test]
+    fn test_resolve_reports_missing_required_items() {
+        assert_eq!(
+            missing_item(PoolLayout::resolve(
+                &FakeSymbols {
+                    missing_global: Some("nt!ExPoolState"),
+                    ..FakeSymbols::default()
+                },
+                key(),
+            )),
+            "ExPoolState"
+        );
+        assert_eq!(
+            missing_item(PoolLayout::resolve(
+                &FakeSymbols {
+                    missing_type: Some("_POOL_HEADER"),
+                    ..FakeSymbols::default()
+                },
+                key(),
+            )),
+            "_POOL_HEADER"
+        );
+        assert_eq!(
+            missing_item(PoolLayout::resolve(
+                &FakeSymbols {
+                    missing_field: Some(("_POOL_HEADER", "PoolTag")),
+                    ..FakeSymbols::default()
+                },
+                key(),
+            )),
+            "_POOL_HEADER.PoolTag"
+        );
     }
 }
