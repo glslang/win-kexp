@@ -1512,12 +1512,17 @@ mod tests {
     struct SyntheticMemory {
         bytes: BTreeMap<u64, u8>,
         holes: Vec<(u64, u64)>,
+    }
+
+    struct ShortMemory;
+
+    struct BigPageMemory {
+        table: Vec<u8>,
+        count: usize,
         read_calls: Cell<usize>,
         interrupt_checks: Cell<usize>,
         interrupt_after_checks: Option<usize>,
     }
-
-    struct ShortMemory;
 
     impl PoolMemory for ShortMemory {
         fn read_exact(&self, _address: u64, _size: usize) -> Result<Vec<u8>, SnapshotError> {
@@ -1533,9 +1538,46 @@ mod tests {
         }
     }
 
-    impl PoolMemory for SyntheticMemory {
+    impl PoolMemory for BigPageMemory {
         fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
             self.read_calls.set(self.read_calls.get() + 1);
+            if address == BIG_TABLE_POINTER && size == 8 {
+                return Ok(BIG_TABLE.to_le_bytes().to_vec());
+            }
+            if address == BIG_TABLE_COUNT && size == 8 {
+                return Ok((self.count as u64).to_le_bytes().to_vec());
+            }
+            let offset = address
+                .checked_sub(BIG_TABLE)
+                .and_then(|value| usize::try_from(value).ok());
+            if let Some(bytes) = offset
+                .and_then(|offset| offset.checked_add(size).map(|end| (offset, end)))
+                .and_then(|(offset, end)| self.table.get(offset..end))
+            {
+                return Ok(bytes.to_vec());
+            }
+            Err(SnapshotError::Read {
+                address,
+                size,
+                source: Box::new(std::io::Error::other("sparse big-page memory")),
+            })
+        }
+
+        fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError> {
+            Ok((address, size))
+        }
+
+        fn interrupted(&self) -> Result<bool, SnapshotError> {
+            let checks = self.interrupt_checks.get();
+            self.interrupt_checks.set(checks + 1);
+            Ok(self
+                .interrupt_after_checks
+                .is_some_and(|limit| checks >= limit))
+        }
+    }
+
+    impl PoolMemory for SyntheticMemory {
+        fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
             (0..size)
                 .map(|offset| {
                     self.bytes
@@ -1564,11 +1606,7 @@ mod tests {
         }
 
         fn interrupted(&self) -> Result<bool, SnapshotError> {
-            let checks = self.interrupt_checks.get();
-            self.interrupt_checks.set(checks + 1);
-            Ok(self
-                .interrupt_after_checks
-                .is_some_and(|limit| checks >= limit))
+            Ok(false)
         }
     }
 
@@ -1918,34 +1956,30 @@ mod tests {
         SyntheticMemory {
             bytes,
             holes: vec![(SEGMENT + 0x7800, SEGMENT + 0x8000)],
+        }
+    }
+
+    fn big_page_memory(address: u64, count: usize, collision_distance: usize) -> BigPageMemory {
+        let mut table = vec![0; count * 0x20];
+        let first = super::super::decode::big_page_hash(address, count).unwrap();
+        for distance in 0..collision_distance {
+            let index = (first + distance) % count;
+            let offset = index * 0x20;
+            table[offset..offset + 8]
+                .copy_from_slice(&(address + (distance as u64 + 1) * 0x10_0000).to_le_bytes());
+        }
+        let index = (first + collision_distance) % count;
+        let offset = index * 0x20;
+        table[offset..offset + 8].copy_from_slice(&address.to_le_bytes());
+        table[offset + 8..offset + 12].copy_from_slice(b"BTCH");
+        table[offset + 0x10..offset + 0x18].copy_from_slice(&0x9000u64.to_le_bytes());
+        BigPageMemory {
+            table,
+            count,
             read_calls: Cell::new(0),
             interrupt_checks: Cell::new(0),
             interrupt_after_checks: None,
         }
-    }
-
-    fn configure_big_page_probe(
-        memory: &mut SyntheticMemory,
-        address: u64,
-        count: usize,
-        collision_distance: usize,
-    ) {
-        put_u64(&mut memory.bytes, BIG_TABLE_COUNT, count as u64);
-        fill(&mut memory.bytes, BIG_TABLE, count * 0x20);
-        let first = super::super::decode::big_page_hash(address, count).unwrap();
-        for distance in 0..collision_distance {
-            let index = (first + distance) % count;
-            put_u64(
-                &mut memory.bytes,
-                BIG_TABLE + index as u64 * 0x20,
-                address + (distance as u64 + 1) * 0x10_0000,
-            );
-        }
-        let index = (first + collision_distance) % count;
-        let entry = BIG_TABLE + index as u64 * 0x20;
-        put_u64(&mut memory.bytes, entry, address);
-        put(&mut memory.bytes, entry + 8, b"BTCH");
-        put_u64(&mut memory.bytes, entry + 0x10, 0x9000);
     }
 
     #[test]
@@ -2033,9 +2067,8 @@ mod tests {
 
     #[test]
     fn test_big_page_lookup_batches_collision_chain() {
-        let mut memory = synthetic_memory();
+        let memory = big_page_memory(LARGE_VA, 512, 300);
         let layout = synthetic_layout();
-        configure_big_page_probe(&mut memory, LARGE_VA, 512, 300);
         let reads_before = memory.read_calls.get();
         let mut diagnostics = Vec::new();
 
@@ -2049,9 +2082,8 @@ mod tests {
 
     #[test]
     fn test_big_page_lookup_honors_interrupt_between_batches() {
-        let mut memory = synthetic_memory();
+        let mut memory = big_page_memory(LARGE_VA, 512, 300);
         let layout = synthetic_layout();
-        configure_big_page_probe(&mut memory, LARGE_VA, 512, 300);
         memory.interrupt_after_checks = Some(1);
 
         assert!(matches!(
