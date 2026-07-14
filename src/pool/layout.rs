@@ -25,7 +25,7 @@ pub(crate) struct PoolLayout {
     pub types: HashMap<&'static str, TypeLayout>,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum LayoutError {
     #[error("missing kernel pool symbols ({item}); run `.reload /f nt` and retry")]
     Missing { item: String },
@@ -213,22 +213,24 @@ const GLOBALS: &[(&str, &[&str])] = &[
 ];
 
 impl PoolLayout {
-    pub(crate) fn type_layout(&self, name: &str) -> Result<&TypeLayout, String> {
+    pub(crate) fn type_layout(&self, name: &str) -> Result<&TypeLayout, LayoutError> {
         self.types
             .get(name)
-            .ok_or_else(|| format!("resolved layout is missing type {name}"))
+            .ok_or_else(|| LayoutError::Missing { item: name.into() })
     }
 
-    pub(crate) fn field(&self, type_name: &str, field: &str) -> Result<usize, String> {
+    pub(crate) fn field(&self, type_name: &str, field: &str) -> Result<usize, LayoutError> {
         self.type_layout(type_name)?
             .fields
             .get(field)
             .copied()
             .map(|value| value as usize)
-            .ok_or_else(|| format!("resolved layout is missing {type_name}.{field}"))
+            .ok_or_else(|| LayoutError::Missing {
+                item: format!("{type_name}.{field}"),
+            })
     }
 
-    pub(crate) fn pool_header_layout(&self) -> Result<PoolHeaderLayout, String> {
+    pub(crate) fn pool_header_layout(&self) -> Result<PoolHeaderLayout, LayoutError> {
         Ok(PoolHeaderLayout {
             size: self.type_layout("_POOL_HEADER")?.size as usize,
             previous_size: self.field("_POOL_HEADER", "PreviousSize")?,
@@ -499,6 +501,32 @@ mod tests {
                 key(),
             )),
             "_POOL_HEADER.PoolTag"
+        );
+    }
+
+    #[test]
+    fn test_layout_accessors_report_typed_missing_items() {
+        let mut layout = PoolLayout::resolve(&FakeSymbols::default(), key()).unwrap();
+
+        assert_eq!(
+            layout.type_layout("_MISSING").unwrap_err(),
+            LayoutError::Missing {
+                item: "_MISSING".into()
+            }
+        );
+        assert_eq!(
+            layout.field("_POOL_HEADER", "Missing").unwrap_err(),
+            LayoutError::Missing {
+                item: "_POOL_HEADER.Missing".into()
+            }
+        );
+
+        layout.types.remove("_POOL_HEADER");
+        assert_eq!(
+            layout.pool_header_layout().unwrap_err(),
+            LayoutError::Missing {
+                item: "_POOL_HEADER".into()
+            }
         );
     }
 

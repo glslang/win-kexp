@@ -8,7 +8,10 @@ use super::decode::{
     decode_vs_sizes, lfh_bitmap_state, read_u16, read_u32, read_u64,
     valid_descriptor_tree_signature, valid_page_segment_signature, valid_vs_signature,
 };
-use super::{HeapIdentity, PoolBackend, PoolKind, PoolSpan, PoolState, layout::PoolLayout};
+use super::{
+    HeapIdentity, PoolBackend, PoolKind, PoolSpan, PoolState,
+    layout::{LayoutError, PoolLayout},
+};
 
 type SnapshotSource = Box<dyn std::error::Error + Send + Sync>;
 
@@ -37,8 +40,11 @@ pub(crate) enum SnapshotError {
         valid_base: u64,
         valid_size: usize,
     },
-    #[error("snapshot layout lookup failed: {detail}")]
-    Layout { detail: String },
+    #[error("snapshot layout lookup failed: {source}")]
+    Layout {
+        #[source]
+        source: LayoutError,
+    },
     #[error("pool snapshot interrupted by Ctrl+C")]
     Interrupted,
     #[error("interrupt-status query failed: {source}")]
@@ -50,10 +56,14 @@ pub(crate) enum SnapshotError {
     InvalidData { detail: String },
 }
 
-impl From<String> for SnapshotError {
-    fn from(detail: String) -> Self {
-        Self::Layout { detail }
+impl From<LayoutError> for SnapshotError {
+    fn from(source: LayoutError) -> Self {
+        Self::Layout { source }
     }
+}
+
+fn missing_layout(item: impl Into<String>) -> SnapshotError {
+    LayoutError::Missing { item: item.into() }.into()
 }
 
 #[derive(Debug, Clone)]
@@ -145,7 +155,12 @@ fn guarded_read(
 fn scalar(memory: &impl PoolMemory, address: u64, size: usize) -> Result<u64, SnapshotError> {
     let bytes = guarded_read(memory, address, size)?;
     match size {
-        1 => Ok(bytes[0] as u64),
+        1 => bytes
+            .first()
+            .map(|&byte| byte as u64)
+            .ok_or_else(|| SnapshotError::InvalidData {
+                detail: "short u8".into(),
+            }),
         2 => Ok(
             u16::from_le_bytes(bytes.try_into().map_err(|_| SnapshotError::InvalidData {
                 detail: "short u16".into(),
@@ -329,13 +344,10 @@ fn discover_pool_regions(
     layout: &PoolLayout,
     traversal_limit: usize,
 ) -> Result<Discovery, SnapshotError> {
-    let state_address =
-        *layout
-            .globals
-            .get("ExPoolState")
-            .ok_or_else(|| SnapshotError::Layout {
-                detail: "missing ExPoolState".into(),
-            })?;
+    let state_address = *layout
+        .globals
+        .get("ExPoolState")
+        .ok_or_else(|| missing_layout("ExPoolState"))?;
     let state = layout.type_layout("_EX_POOL_HEAP_MANAGER_STATE")?;
     let node = layout.type_layout("_EX_HEAP_POOL_NODE")?;
     let number_offset = layout.field("_EX_POOL_HEAP_MANAGER_STATE", "NumberOfPools")?;
@@ -406,13 +418,10 @@ fn discover_pool_regions(
         }
     }
 
-    let globals_address =
-        *layout
-            .globals
-            .get("RtlpHpHeapGlobals")
-            .ok_or_else(|| SnapshotError::Layout {
-                detail: "missing RtlpHpHeapGlobals".into(),
-            })?;
+    let globals_address = *layout
+        .globals
+        .get("RtlpHpHeapGlobals")
+        .ok_or_else(|| missing_layout("RtlpHpHeapGlobals"))?;
     let heap_key = scalar(
         memory,
         globals_address + layout.field("_RTLP_HP_HEAP_GLOBALS", "HeapKey")? as u64,
@@ -747,13 +756,10 @@ fn discover_segment_context(
         let signature = read_u64(&segment_header, signature_offset)
             .or_else(|| read_u32(&segment_header, signature_offset).map(u64::from))
             .unwrap_or(0);
-        let heap_globals =
-            *layout
-                .globals
-                .get("RtlpHpHeapGlobals")
-                .ok_or_else(|| SnapshotError::Layout {
-                    detail: "missing RtlpHpHeapGlobals".into(),
-                })?;
+        let heap_globals = *layout
+            .globals
+            .get("RtlpHpHeapGlobals")
+            .ok_or_else(|| missing_layout("RtlpHpHeapGlobals"))?;
         if !valid_page_segment_signature(signature, segment_address, context_address, heap_globals)
         {
             discovery.diagnostics.push(format!(
@@ -1036,13 +1042,10 @@ fn lookup_big_page_target(
     address: u64,
     diagnostics: &mut Vec<String>,
 ) -> Result<Option<(u32, u64)>, SnapshotError> {
-    let table_pointer_address =
-        *layout
-            .globals
-            .get("PoolBigPageTable")
-            .ok_or_else(|| SnapshotError::Layout {
-                detail: "missing PoolBigPageTable".into(),
-            })?;
+    let table_pointer_address = *layout
+        .globals
+        .get("PoolBigPageTable")
+        .ok_or_else(|| missing_layout("PoolBigPageTable"))?;
     let table = match scalar(memory, table_pointer_address, 8) {
         Ok(value) => value,
         Err(error) => {
@@ -1050,13 +1053,10 @@ fn lookup_big_page_target(
             return Ok(None);
         }
     };
-    let size_address =
-        *layout
-            .globals
-            .get("PoolBigPageTableSize")
-            .ok_or_else(|| SnapshotError::Layout {
-                detail: "missing PoolBigPageTableSize".into(),
-            })?;
+    let size_address = *layout
+        .globals
+        .get("PoolBigPageTableSize")
+        .ok_or_else(|| missing_layout("PoolBigPageTableSize"))?;
     let count = match scalar(memory, size_address, 8).or_else(|_| scalar(memory, size_address, 4)) {
         Ok(value) => value as usize,
         Err(error) => {
@@ -1515,6 +1515,22 @@ mod tests {
         read_calls: Cell<usize>,
         interrupt_checks: Cell<usize>,
         interrupt_after_checks: Option<usize>,
+    }
+
+    struct ShortMemory;
+
+    impl PoolMemory for ShortMemory {
+        fn read_exact(&self, _address: u64, _size: usize) -> Result<Vec<u8>, SnapshotError> {
+            Ok(Vec::new())
+        }
+
+        fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError> {
+            Ok((address, size))
+        }
+
+        fn interrupted(&self) -> Result<bool, SnapshotError> {
+            Ok(false)
+        }
     }
 
     impl PoolMemory for SyntheticMemory {
@@ -2054,5 +2070,11 @@ mod tests {
 
         let error = guarded_read(&memory, SEGMENT + 0x7800, 0x10).unwrap_err();
         assert!(matches!(error, SnapshotError::RegionValidation { .. }));
+
+        let error = scalar(&ShortMemory, 0x1000, 1).unwrap_err();
+        assert!(matches!(
+            error,
+            SnapshotError::InvalidData { detail } if detail == "short u8"
+        ));
     }
 }

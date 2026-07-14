@@ -141,6 +141,10 @@ fn args_string(args: PCSTR) -> Result<String, String> {
         .into_owned())
 }
 
+fn span_contains_address(span: &crate::pool::PoolSpan, address: u64) -> bool {
+    address >= span.header_address && address < span.end()
+}
+
 fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
     let command = parse_args(args)?;
     if !engine
@@ -183,7 +187,7 @@ fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
         let detail = index
             .spans
             .iter()
-            .find(|span| address >= span.usable_address && address < span.end())
+            .find(|span| span_contains_address(span, address))
             .map(|span| {
                 format!(
                     "{address:#x}: {} {:#x}+{:#x} tag `{}` {:?} {:?}\n",
@@ -356,6 +360,26 @@ mod tests {
             validate_pool_target(0xaa64),
             Err("pool walking supports x64 targets only (machine 0xaa64)".into())
         );
+
+        let mut span = crate::pool::PoolSpan::allocation(
+            0x1010,
+            0x20,
+            0,
+            crate::pool::PoolKind::Paged,
+            crate::pool::HeapIdentity {
+                pool_state: 1,
+                heap: 2,
+                special: false,
+            },
+            crate::pool::PoolBackend::Vs,
+        );
+        span.header_address = 0x1000;
+        assert!(span_contains_address(&span, 0x1000));
+        assert!(span_contains_address(&span, 0x100f));
+        assert!(span_contains_address(&span, 0x1010));
+        assert!(span_contains_address(&span, 0x102f));
+        assert!(!span_contains_address(&span, 0x0fff));
+        assert!(!span_contains_address(&span, 0x1030));
 
         let before = SESSION_GENERATION.load(Ordering::Acquire);
         unsafe { DebugExtensionNotify(DEBUG_NOTIFY_SESSION_INACTIVE, 0) };
