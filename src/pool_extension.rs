@@ -176,6 +176,7 @@ fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
             traversal_limit: 1_000_000,
         }
         .walk()
+        .map_err(|error| error.to_string())
     })?;
 
     if let Some(address) = command.address {
