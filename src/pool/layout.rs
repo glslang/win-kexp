@@ -62,7 +62,6 @@ const TYPES: &[TypeSpec] = &[
     TypeSpec {
         name: "_EX_POOL_HEAP_MANAGER_STATE",
         fields: &[
-            ("HeapManager", &["HeapManager"]),
             ("PoolNode", &["PoolNode", "PoolNodes"]),
             ("NumberOfPools", &["NumberOfPools"]),
             ("SpecialHeaps", &["SpecialHeaps"]),
@@ -71,21 +70,6 @@ const TYPES: &[TypeSpec] = &[
     TypeSpec {
         name: "_EX_HEAP_POOL_NODE",
         fields: &[("Heaps", &["Heaps"])],
-    },
-    TypeSpec {
-        name: "_RTLP_HP_HEAP_MANAGER",
-        fields: &[("AllocTracker", &["AllocTracker"])],
-    },
-    TypeSpec {
-        name: "_RTLP_HP_ALLOC_TRACKER",
-        fields: &[("Tracker", &["Tracker", "AllocationTracker"])],
-    },
-    TypeSpec {
-        name: "_RTL_CSPARSE_BITMAP",
-        fields: &[
-            ("CommitDirectory", &["CommitDirectory"]),
-            ("UserData", &["UserData"]),
-        ],
     },
     TypeSpec {
         name: "_SEGMENT_HEAP",
@@ -105,7 +89,6 @@ const TYPES: &[TypeSpec] = &[
             ("UnitShift", &["UnitShift"]),
             ("FirstDescriptorIndex", &["FirstDescriptorIndex"]),
             ("SegmentMask", &["SegmentMask"]),
-            ("PagesPerUnitShift", &["PagesPerUnitShift"]),
         ],
     },
     TypeSpec {
@@ -128,7 +111,6 @@ const TYPES: &[TypeSpec] = &[
     TypeSpec {
         name: "_HEAP_VS_CONTEXT",
         fields: &[
-            ("SubsegmentList", &["SubsegmentList"]),
             ("FreeChunkTree", &["FreeChunkTree"]),
             ("DelayFreeContext", &["DelayFreeContext"]),
         ],
@@ -139,18 +121,11 @@ const TYPES: &[TypeSpec] = &[
     },
     TypeSpec {
         name: "_HEAP_VS_SUBSEGMENT",
-        fields: &[
-            ("ListEntry", &["ListEntry"]),
-            ("Size", &["Size"]),
-            ("Signature", &["Signature"]),
-        ],
+        fields: &[("Size", &["Size"]), ("Signature", &["Signature"])],
     },
     TypeSpec {
         name: "_HEAP_VS_CHUNK_HEADER",
-        fields: &[
-            ("Sizes", &["Sizes", "HeaderBits"]),
-            ("EncodedSegmentPageOffset", &["EncodedSegmentPageOffset"]),
-        ],
+        fields: &[("Sizes", &["Sizes", "HeaderBits"])],
     },
     TypeSpec {
         name: "_HEAP_VS_CHUNK_FREE_HEADER",
@@ -166,7 +141,6 @@ const TYPES: &[TypeSpec] = &[
     TypeSpec {
         name: "_HEAP_LFH_SUBSEGMENT",
         fields: &[
-            ("ListEntry", &["ListEntry", "AffinityListEntry"]),
             ("BlockOffsets", &["BlockOffsets"]),
             ("BlockBitmap", &["BlockBitmap"]),
             ("BlockCount", &["BlockCount"]),
@@ -182,7 +156,7 @@ const TYPES: &[TypeSpec] = &[
     },
     TypeSpec {
         name: "_RTL_RB_TREE",
-        fields: &[("Root", &["Root", "EncodedRoot"]), ("Min", &["Min"])],
+        fields: &[("Root", &["Root", "EncodedRoot"])],
     },
     TypeSpec {
         name: "_RTL_BALANCED_NODE",
@@ -228,19 +202,14 @@ const TYPES: &[TypeSpec] = &[
     },
 ];
 
-const OPTIONAL_FIELDS: &[(&str, &str, &[&str])] = &[
-    ("_RTL_LOOKASIDE", "Size", &["Size", "SizeClass"]),
-    ("_RTL_DYNAMIC_LOOKASIDE", "ListHead", &["ListHead"]),
-    ("_RTL_DYNAMIC_LOOKASIDE", "Size", &["Size", "SizeClass"]),
-];
+const OPTIONAL_FIELDS: &[(&str, &str, &[&str])] =
+    &[("_RTL_LOOKASIDE", "Size", &["Size", "SizeClass"])];
 
 const GLOBALS: &[(&str, &[&str])] = &[
     ("ExPoolState", &["nt!ExPoolState"]),
     ("RtlpHpHeapGlobals", &["nt!RtlpHpHeapGlobals"]),
     ("PoolBigPageTable", &["nt!PoolBigPageTable"]),
     ("PoolBigPageTableSize", &["nt!PoolBigPageTableSize"]),
-    ("RtlpLfhBucketIndexMap", &["nt!RtlpLfhBucketIndexMap"]),
-    ("RtlpBucketBlockSizes", &["nt!RtlpBucketBlockSizes"]),
 ];
 
 impl PoolLayout {
@@ -497,10 +466,6 @@ mod tests {
             layout.field("_RTL_LOOKASIDE", "Size"),
             Ok(FakeSymbols::field_value("SizeClass") as usize)
         );
-        assert_eq!(
-            layout.field("_RTL_DYNAMIC_LOOKASIDE", "ListHead"),
-            Ok(FakeSymbols::field_value("ListHead") as usize)
-        );
     }
 
     #[test]
@@ -535,5 +500,53 @@ mod tests {
             )),
             "_POOL_HEADER.PoolTag"
         );
+    }
+
+    #[test]
+    fn test_resolve_does_not_require_unused_metadata() {
+        for unused_type in [
+            "_RTLP_HP_HEAP_MANAGER",
+            "_RTLP_HP_ALLOC_TRACKER",
+            "_RTL_CSPARSE_BITMAP",
+        ] {
+            PoolLayout::resolve(
+                &FakeSymbols {
+                    missing_type: Some(unused_type),
+                    ..FakeSymbols::default()
+                },
+                key(),
+            )
+            .unwrap();
+        }
+
+        for (unused_type, unused_field) in [
+            ("_EX_POOL_HEAP_MANAGER_STATE", "HeapManager"),
+            ("_HEAP_SEG_CONTEXT", "PagesPerUnitShift"),
+            ("_HEAP_VS_CONTEXT", "SubsegmentList"),
+            ("_HEAP_VS_SUBSEGMENT", "ListEntry"),
+            ("_HEAP_VS_CHUNK_HEADER", "EncodedSegmentPageOffset"),
+            ("_HEAP_LFH_SUBSEGMENT", "ListEntry"),
+            ("_RTL_RB_TREE", "Min"),
+        ] {
+            PoolLayout::resolve(
+                &FakeSymbols {
+                    missing_field: Some((unused_type, unused_field)),
+                    ..FakeSymbols::default()
+                },
+                key(),
+            )
+            .unwrap();
+        }
+
+        for unused_global in ["nt!RtlpLfhBucketIndexMap", "nt!RtlpBucketBlockSizes"] {
+            PoolLayout::resolve(
+                &FakeSymbols {
+                    missing_global: Some(unused_global),
+                    ..FakeSymbols::default()
+                },
+                key(),
+            )
+            .unwrap();
+        }
     }
 }

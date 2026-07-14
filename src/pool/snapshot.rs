@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use thiserror::Error;
+
 use super::decode::{
     PAGE_SIZE, PoolHeaderLayout, adjust_page_end_header, big_page_probe, decode_descriptor_at,
     decode_large_allocation, decode_lfh_offsets, decode_pool_header, decode_rb_root,
@@ -7,6 +9,52 @@ use super::decode::{
     valid_descriptor_tree_signature, valid_page_segment_signature, valid_vs_signature,
 };
 use super::{HeapIdentity, PoolBackend, PoolKind, PoolSpan, PoolState, layout::PoolLayout};
+
+type SnapshotSource = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Debug, Error)]
+pub(crate) enum SnapshotError {
+    #[error("read at {address:#x}+{size:#x}: {source}")]
+    Read {
+        address: u64,
+        size: usize,
+        #[source]
+        source: SnapshotSource,
+    },
+    #[error("valid-region query at {address:#x}+{size:#x}: {source}")]
+    RegionQuery {
+        address: u64,
+        size: usize,
+        #[source]
+        source: SnapshotSource,
+    },
+    #[error(
+        "sparse virtual range at {address:#x}+{size:#x} (valid {valid_base:#x}+{valid_size:#x})"
+    )]
+    RegionValidation {
+        address: u64,
+        size: usize,
+        valid_base: u64,
+        valid_size: usize,
+    },
+    #[error("snapshot layout lookup failed: {detail}")]
+    Layout { detail: String },
+    #[error("pool snapshot interrupted by Ctrl+C")]
+    Interrupted,
+    #[error("interrupt-status query failed: {source}")]
+    InterruptQuery {
+        #[source]
+        source: SnapshotSource,
+    },
+    #[error("invalid snapshot data: {detail}")]
+    InvalidData { detail: String },
+}
+
+impl From<String> for SnapshotError {
+    fn from(detail: String) -> Self {
+        Self::Layout { detail }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct PoolRegion {
@@ -33,54 +81,89 @@ pub(crate) struct PoolRegion {
 }
 
 pub(crate) trait PoolMemory {
-    fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, String>;
-    fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), String>;
-    fn interrupted(&self) -> bool;
+    fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError>;
+    fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError>;
+    fn interrupted(&self) -> Result<bool, SnapshotError>;
 }
 
 impl PoolMemory for crate::dbgeng::DebugEngine {
-    fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, String> {
+    fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
         self.read_memory(address, size)
-            .map_err(|error| error.to_string())
+            .map_err(|source| SnapshotError::Read {
+                address,
+                size,
+                source: Box::new(source),
+            })
     }
 
-    fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), String> {
+    fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError> {
         self.valid_virtual_region(address, size)
-            .map_err(|error| error.to_string())
+            .map_err(|source| SnapshotError::RegionQuery {
+                address,
+                size,
+                source: Box::new(source),
+            })
     }
 
-    fn interrupted(&self) -> bool {
-        self.interrupted().unwrap_or(true)
+    fn interrupted(&self) -> Result<bool, SnapshotError> {
+        crate::dbgeng::DebugEngine::interrupted(self).map_err(|source| {
+            SnapshotError::InterruptQuery {
+                source: Box::new(source),
+            }
+        })
     }
 }
 
-fn guarded_read(memory: &impl PoolMemory, address: u64, size: usize) -> Result<Vec<u8>, String> {
+fn check_interrupted(memory: &impl PoolMemory) -> Result<(), SnapshotError> {
+    if memory.interrupted()? {
+        Err(SnapshotError::Interrupted)
+    } else {
+        Ok(())
+    }
+}
+
+fn guarded_read(
+    memory: &impl PoolMemory,
+    address: u64,
+    size: usize,
+) -> Result<Vec<u8>, SnapshotError> {
     if size == 0 {
         return Ok(Vec::new());
     }
-    let (valid_base, valid_size) = memory
-        .valid_region(address, size)
-        .map_err(|error| format!("valid-region query at {address:#x}+{size:#x}: {error}"))?;
+    let (valid_base, valid_size) = memory.valid_region(address, size)?;
     if valid_base != address || valid_size < size {
-        return Err(format!(
-            "sparse virtual range at {address:#x}+{size:#x} (valid {valid_base:#x}+{valid_size:#x})"
-        ));
+        return Err(SnapshotError::RegionValidation {
+            address,
+            size,
+            valid_base,
+            valid_size,
+        });
     }
-    memory
-        .read_exact(address, size)
-        .map_err(|error| format!("read at {address:#x}+{size:#x}: {error}"))
+    memory.read_exact(address, size)
 }
 
-fn scalar(memory: &impl PoolMemory, address: u64, size: usize) -> Result<u64, String> {
+fn scalar(memory: &impl PoolMemory, address: u64, size: usize) -> Result<u64, SnapshotError> {
     let bytes = guarded_read(memory, address, size)?;
     match size {
         1 => Ok(bytes[0] as u64),
-        2 => Ok(u16::from_le_bytes(bytes.try_into().map_err(|_| "short u16")?) as u64),
-        4 => Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| "short u32")?) as u64),
-        8 => Ok(u64::from_le_bytes(
-            bytes.try_into().map_err(|_| "short u64")?,
-        )),
-        _ => Err(format!("unsupported scalar size {size}")),
+        2 => Ok(
+            u16::from_le_bytes(bytes.try_into().map_err(|_| SnapshotError::InvalidData {
+                detail: "short u16".into(),
+            })?) as u64,
+        ),
+        4 => Ok(
+            u32::from_le_bytes(bytes.try_into().map_err(|_| SnapshotError::InvalidData {
+                detail: "short u32".into(),
+            })?) as u64,
+        ),
+        8 => Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| {
+            SnapshotError::InvalidData {
+                detail: "short u64".into(),
+            }
+        })?)),
+        _ => Err(SnapshotError::InvalidData {
+            detail: format!("unsupported scalar size {size}"),
+        }),
     }
 }
 
@@ -92,7 +175,7 @@ fn walk_tree_nodes(
     limit: usize,
     label: &str,
     diagnostics: &mut Vec<String>,
-) -> Vec<u64> {
+) -> Result<Vec<u64>, SnapshotError> {
     let mut nodes = Vec::new();
     let mut stack = vec![root];
     let mut seen = HashSet::new();
@@ -101,10 +184,7 @@ fn walk_tree_nodes(
         if node == 0 {
             continue;
         }
-        if memory.interrupted() {
-            diagnostics.push(format!("{label} traversal interrupted by Ctrl+C"));
-            break;
-        }
+        check_interrupted(memory)?;
         if !seen.insert(node) {
             diagnostics.push(format!("{label} cycle detected at {node:#x}"));
             continue;
@@ -127,7 +207,7 @@ fn walk_tree_nodes(
             Err(error) => diagnostics.push(format!("unreadable {label} node {node:#x}: {error}")),
         }
     }
-    nodes
+    Ok(nodes)
 }
 
 fn tree_nodes(
@@ -137,29 +217,29 @@ fn tree_nodes(
     limit: usize,
     label: &str,
     diagnostics: &mut Vec<String>,
-) -> Vec<u64> {
+) -> Result<Vec<u64>, SnapshotError> {
     let Ok(root_offset) = layout.field("_RTL_RB_TREE", "Root") else {
         diagnostics.push(format!("cannot resolve {label} root field"));
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let encoded = match scalar(memory, tree_address + root_offset as u64, 8) {
         Ok(value) => value,
         Err(error) => {
             diagnostics.push(format!("cannot read {label} root: {error}"));
-            return Vec::new();
+            return Ok(Vec::new());
         }
     };
     let Some(root) = decode_rb_root(encoded, tree_address) else {
         diagnostics.push(format!(
             "rejecting corrupt encoded {label} root {encoded:#x}"
         ));
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let Ok(left) = layout.field("_RTL_BALANCED_NODE", "Left") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let Ok(right) = layout.field("_RTL_BALANCED_NODE", "Right") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     walk_tree_nodes(memory, root, left, right, limit, label, diagnostics)
 }
@@ -171,36 +251,33 @@ fn walk_slist_nodes(
     limit: usize,
     label: &str,
     diagnostics: &mut Vec<String>,
-) -> Vec<u64> {
+) -> Result<Vec<u64>, SnapshotError> {
     let mut nodes = Vec::new();
     let mut seen = HashSet::new();
     let Ok(header) = layout.type_layout("_SLIST_HEADER") else {
         diagnostics.push(format!("cannot resolve {label} SLIST header type"));
-        return nodes;
+        return Ok(nodes);
     };
     let Ok(alignment_offset) = layout.field("_SLIST_HEADER", "Alignment") else {
         diagnostics.push(format!("cannot resolve {label} SLIST depth field"));
-        return nodes;
+        return Ok(nodes);
     };
     let Ok(region_offset) = layout.field("_SLIST_HEADER", "Region") else {
         diagnostics.push(format!("cannot resolve {label} SLIST next field"));
-        return nodes;
+        return Ok(nodes);
     };
     let bytes = match guarded_read(memory, head, header.size as usize) {
         Ok(value) => value,
         Err(error) => {
             diagnostics.push(format!("cannot read {label} list head: {error}"));
-            return nodes;
+            return Ok(nodes);
         }
     };
     let depth = read_u16(&bytes, alignment_offset).map_or(0, usize::from);
     let mut entry = read_u64(&bytes, region_offset).unwrap_or(0) & !0xf;
     let expected = depth.min(limit);
     while entry != 0 && nodes.len() < expected {
-        if memory.interrupted() {
-            diagnostics.push(format!("{label} list traversal interrupted by Ctrl+C"));
-            break;
-        }
+        check_interrupted(memory)?;
         if !seen.insert(entry) {
             diagnostics.push(format!("{label} list cycle detected at {entry:#x}"));
             break;
@@ -222,7 +299,7 @@ fn walk_slist_nodes(
             nodes.len()
         ));
     }
-    nodes
+    Ok(nodes)
 }
 
 fn insert_cached_chunk_candidates(
@@ -251,11 +328,14 @@ fn discover_pool_regions(
     memory: &impl PoolMemory,
     layout: &PoolLayout,
     traversal_limit: usize,
-) -> Result<Discovery, String> {
-    let state_address = *layout
-        .globals
-        .get("ExPoolState")
-        .ok_or("missing ExPoolState")?;
+) -> Result<Discovery, SnapshotError> {
+    let state_address =
+        *layout
+            .globals
+            .get("ExPoolState")
+            .ok_or_else(|| SnapshotError::Layout {
+                detail: "missing ExPoolState".into(),
+            })?;
     let state = layout.type_layout("_EX_POOL_HEAP_MANAGER_STATE")?;
     let node = layout.type_layout("_EX_HEAP_POOL_NODE")?;
     let number_offset = layout.field("_EX_POOL_HEAP_MANAGER_STATE", "NumberOfPools")?;
@@ -264,7 +344,9 @@ fn discover_pool_regions(
     let heaps_offset = layout.field("_EX_HEAP_POOL_NODE", "Heaps")?;
     let number = scalar(memory, state_address + number_offset as u64, 4)? as usize;
     if number == 0 || number > 256 {
-        return Err(format!("implausible ExPoolState.NumberOfPools {number}"));
+        return Err(SnapshotError::InvalidData {
+            detail: format!("implausible ExPoolState.NumberOfPools {number}"),
+        });
     }
     let mut discovery = Discovery::default();
     let mut heaps = Vec::new();
@@ -324,10 +406,13 @@ fn discover_pool_regions(
         }
     }
 
-    let globals_address = *layout
-        .globals
-        .get("RtlpHpHeapGlobals")
-        .ok_or("missing RtlpHpHeapGlobals")?;
+    let globals_address =
+        *layout
+            .globals
+            .get("RtlpHpHeapGlobals")
+            .ok_or_else(|| SnapshotError::Layout {
+                detail: "missing RtlpHpHeapGlobals".into(),
+            })?;
     let heap_key = scalar(
         memory,
         globals_address + layout.field("_RTLP_HP_HEAP_GLOBALS", "HeapKey")? as u64,
@@ -371,13 +456,13 @@ fn discover_vs_evidence(
     heap_address: u64,
     limit: usize,
     diagnostics: &mut Vec<String>,
-) -> (HashSet<u64>, HashSet<u64>) {
+) -> Result<(HashSet<u64>, HashSet<u64>), SnapshotError> {
     let Ok(vs_context_offset) = layout.field("_SEGMENT_HEAP", "VsContext") else {
-        return Default::default();
+        return Ok(Default::default());
     };
     let context = heap_address + vs_context_offset as u64;
     let Ok(tree_offset) = layout.field("_HEAP_VS_CONTEXT", "FreeChunkTree") else {
-        return Default::default();
+        return Ok(Default::default());
     };
     let tree_node_offset = layout
         .field("_HEAP_VS_CHUNK_FREE_HEADER", "TreeNode")
@@ -389,7 +474,7 @@ fn discover_vs_evidence(
         limit,
         "VS free tree",
         diagnostics,
-    )
+    )?
     .into_iter()
     .map(|node| node.saturating_sub(tree_node_offset as u64))
     .collect();
@@ -412,7 +497,7 @@ fn discover_vs_evidence(
             limit,
             "VS delay-free",
             diagnostics,
-        ) {
+        )? {
             insert_cached_chunk_candidates(&mut cached, entry, pool_header_size, vs_header_size);
         }
     }
@@ -471,7 +556,7 @@ fn discover_vs_evidence(
                     limit,
                     "VS dynamic-lookaside",
                     diagnostics,
-                ) {
+                )? {
                     // Lookaside links point at usable data, while delay-free links
                     // point at the VS chunk header. Keep both page-end header
                     // candidates; only a decoded chunk at that address can match.
@@ -485,7 +570,7 @@ fn discover_vs_evidence(
             }
         }
     }
-    (reusable, cached)
+    Ok((reusable, cached))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -500,7 +585,7 @@ fn discover_heap_regions(
     lfh_key: u64,
     traversal_limit: usize,
     discovery: &mut Discovery,
-) -> Result<(), String> {
+) -> Result<(), SnapshotError> {
     let heap = layout.type_layout("_SEGMENT_HEAP")?;
     let context = layout.type_layout("_HEAP_SEG_CONTEXT")?;
     let contexts_offset = layout.field("_SEGMENT_HEAP", "SegContexts")?;
@@ -510,7 +595,7 @@ fn discover_heap_regions(
         heap_address,
         traversal_limit,
         &mut discovery.diagnostics,
-    );
+    )?;
 
     // Touch both LFH roots through guarded reads. Descriptor metadata remains the
     // authoritative source of active subsegments, while these probes make corrupt
@@ -532,9 +617,7 @@ fn discover_heap_regions(
     }
 
     for context_index in 0..2usize {
-        if memory.interrupted() {
-            return Err("pool discovery interrupted by Ctrl+C".into());
-        }
+        check_interrupted(memory)?;
         let context_address =
             heap_address + contexts_offset as u64 + context_index as u64 * context.size as u64;
         if let Err(error) = discover_segment_context(
@@ -566,7 +649,7 @@ fn discover_heap_regions(
         heap_key,
         traversal_limit,
         discovery,
-    );
+    )?;
     let _ = heap.size;
     Ok(())
 }
@@ -585,7 +668,7 @@ fn discover_segment_context(
     reusable_chunks: &HashSet<u64>,
     cached_chunks: &HashSet<u64>,
     discovery: &mut Discovery,
-) -> Result<(), String> {
+) -> Result<(), SnapshotError> {
     let segment = layout.type_layout("_HEAP_PAGE_SEGMENT")?;
     let descriptor = layout.type_layout("_HEAP_PAGE_RANGE_DESCRIPTOR")?;
     let shift = scalar(
@@ -620,7 +703,7 @@ fn discover_segment_context(
         traversal_limit,
         "free-page tree",
         &mut discovery.diagnostics,
-    )
+    )?
     .into_iter()
     .collect();
 
@@ -634,13 +717,13 @@ fn discover_segment_context(
     let tree_node_offset = layout.field("_HEAP_PAGE_RANGE_DESCRIPTOR", "TreeNode")?;
     let metadata_size = descriptor_count
         .checked_mul(descriptor.size as usize)
-        .ok_or("descriptor metadata size overflow")?;
+        .ok_or_else(|| SnapshotError::InvalidData {
+            detail: "descriptor metadata size overflow".into(),
+        })?;
     let mut entry = scalar(memory, list_head, 8)? & !0xf;
     let mut seen = HashSet::new();
     while entry != 0 && entry != list_head && seen.len() < traversal_limit {
-        if memory.interrupted() {
-            return Err("segment-list traversal interrupted by Ctrl+C".into());
-        }
+        check_interrupted(memory)?;
         if !seen.insert(entry) {
             discovery
                 .diagnostics
@@ -664,10 +747,13 @@ fn discover_segment_context(
         let signature = read_u64(&segment_header, signature_offset)
             .or_else(|| read_u32(&segment_header, signature_offset).map(u64::from))
             .unwrap_or(0);
-        let heap_globals = *layout
-            .globals
-            .get("RtlpHpHeapGlobals")
-            .ok_or("missing RtlpHpHeapGlobals")?;
+        let heap_globals =
+            *layout
+                .globals
+                .get("RtlpHpHeapGlobals")
+                .ok_or_else(|| SnapshotError::Layout {
+                    detail: "missing RtlpHpHeapGlobals".into(),
+                })?;
         if !valid_page_segment_signature(signature, segment_address, context_address, heap_globals)
         {
             discovery.diagnostics.push(format!(
@@ -857,9 +943,9 @@ fn discover_large_allocations(
     heap_key: u64,
     traversal_limit: usize,
     discovery: &mut Discovery,
-) {
+) -> Result<(), SnapshotError> {
     let Ok(tree_offset) = layout.field("_SEGMENT_HEAP", "LargeAllocMetadata") else {
-        return;
+        return Ok(());
     };
     let tree_address = heap_address + tree_offset as u64;
     let nodes = tree_nodes(
@@ -869,18 +955,18 @@ fn discover_large_allocations(
         traversal_limit,
         "large-allocation tree",
         &mut discovery.diagnostics,
-    );
+    )?;
     let Ok(large) = layout.type_layout("_HEAP_LARGE_ALLOC_DATA") else {
-        return;
+        return Ok(());
     };
     let Ok(tree_node) = layout.field("_HEAP_LARGE_ALLOC_DATA", "TreeNode") else {
-        return;
+        return Ok(());
     };
     let Ok(virtual_offset) = layout.field("_HEAP_LARGE_ALLOC_DATA", "VirtualAddress") else {
-        return;
+        return Ok(());
     };
     let Ok(pages_offset) = layout.field("_HEAP_LARGE_ALLOC_DATA", "AllocatedPages") else {
-        return;
+        return Ok(());
     };
     for node in nodes {
         let allocation_address = node.saturating_sub(tree_node as u64);
@@ -911,7 +997,7 @@ fn discover_large_allocations(
             layout,
             virtual_address,
             &mut discovery.diagnostics,
-        ) {
+        )? {
             Some(value) => value,
             None => (0, bytes),
         };
@@ -939,56 +1025,117 @@ fn discover_large_allocations(
             cached_chunks: HashSet::new(),
         });
     }
+    Ok(())
 }
+
+const BIG_PAGE_PROBE_BATCH: usize = 256;
 
 fn lookup_big_page_target(
     memory: &impl PoolMemory,
     layout: &PoolLayout,
     address: u64,
     diagnostics: &mut Vec<String>,
-) -> Option<(u32, u64)> {
-    let table_pointer_address = *layout.globals.get("PoolBigPageTable")?;
-    let table = scalar(memory, table_pointer_address, 8).ok()?;
-    let size_address = *layout.globals.get("PoolBigPageTableSize")?;
-    let count = scalar(memory, size_address, 8)
-        .or_else(|_| scalar(memory, size_address, 4))
-        .ok()? as usize;
+) -> Result<Option<(u32, u64)>, SnapshotError> {
+    let table_pointer_address =
+        *layout
+            .globals
+            .get("PoolBigPageTable")
+            .ok_or_else(|| SnapshotError::Layout {
+                detail: "missing PoolBigPageTable".into(),
+            })?;
+    let table = match scalar(memory, table_pointer_address, 8) {
+        Ok(value) => value,
+        Err(error) => {
+            diagnostics.push(format!("cannot read big-page table pointer: {error}"));
+            return Ok(None);
+        }
+    };
+    let size_address =
+        *layout
+            .globals
+            .get("PoolBigPageTableSize")
+            .ok_or_else(|| SnapshotError::Layout {
+                detail: "missing PoolBigPageTableSize".into(),
+            })?;
+    let count = match scalar(memory, size_address, 8).or_else(|_| scalar(memory, size_address, 4)) {
+        Ok(value) => value as usize,
+        Err(error) => {
+            diagnostics.push(format!("cannot read big-page table size: {error}"));
+            return Ok(None);
+        }
+    };
     if table == 0 || count == 0 || count > 0x10_0000 || !count.is_power_of_two() {
         diagnostics.push(format!("rejecting implausible big-page table size {count}"));
-        return None;
+        return Ok(None);
     }
-    let entry = layout.type_layout("_POOL_TRACKER_BIG_PAGES").ok()?;
-    let va_offset = layout.field("_POOL_TRACKER_BIG_PAGES", "Va").ok()?;
-    let tag_offset = layout.field("_POOL_TRACKER_BIG_PAGES", "Key").ok()?;
-    let size_offset = layout
-        .field("_POOL_TRACKER_BIG_PAGES", "NumberOfBytes")
-        .ok()?;
-    for index in big_page_probe(address, count)? {
-        let entry_address = table + index as u64 * entry.size as u64;
-        let bytes = match guarded_read(memory, entry_address, entry.size as usize) {
+    let entry = layout.type_layout("_POOL_TRACKER_BIG_PAGES")?;
+    let entry_size = entry.size as usize;
+    let va_offset = layout.field("_POOL_TRACKER_BIG_PAGES", "Va")?;
+    let tag_offset = layout.field("_POOL_TRACKER_BIG_PAGES", "Key")?;
+    let size_offset = layout.field("_POOL_TRACKER_BIG_PAGES", "NumberOfBytes")?;
+    let mut probes = big_page_probe(address, count).ok_or_else(|| SnapshotError::InvalidData {
+        detail: format!("invalid big-page table size {count}"),
+    })?;
+    let mut remaining = count;
+    'probe: while let Some(first_index) = probes.next() {
+        check_interrupted(memory)?;
+        let batch_len = BIG_PAGE_PROBE_BATCH.min(remaining).min(count - first_index);
+        let byte_len =
+            entry_size
+                .checked_mul(batch_len)
+                .ok_or_else(|| SnapshotError::InvalidData {
+                    detail: "big-page probe batch size overflow".into(),
+                })?;
+        let entry_address = table
+            .checked_add(first_index as u64 * entry.size as u64)
+            .ok_or_else(|| SnapshotError::InvalidData {
+                detail: "big-page probe address overflow".into(),
+            })?;
+        let bytes = match guarded_read(memory, entry_address, byte_len) {
             Ok(bytes) => bytes,
             Err(error) => {
                 diagnostics.push(format!(
-                    "cannot read big-page entry {index} at {entry_address:#x}: {error}"
+                    "cannot read big-page entries {first_index}..{} at {entry_address:#x}: {error}",
+                    first_index + batch_len
                 ));
+                for _ in 1..batch_len {
+                    let _ = probes.next();
+                }
+                remaining -= batch_len;
                 continue;
             }
         };
-        let candidate = read_u64(&bytes, va_offset)?;
-        if candidate == 0 {
-            break;
+        for batch_index in 0..batch_len {
+            let offset = batch_index * entry_size;
+            let index = first_index + batch_index;
+            let Some(candidate) = read_u64(&bytes, offset + va_offset) else {
+                diagnostics.push(format!("truncated big-page entry {index}"));
+                continue;
+            };
+            if candidate == 0 {
+                break 'probe;
+            }
+            if candidate & !1 == address {
+                let Some(tag) = read_u32(&bytes, offset + tag_offset) else {
+                    diagnostics.push(format!("truncated big-page tag at entry {index}"));
+                    continue;
+                };
+                let Some(size) = read_u64(&bytes, offset + size_offset) else {
+                    diagnostics.push(format!("truncated big-page size at entry {index}"));
+                    continue;
+                };
+                return Ok(Some((tag, size)));
+            }
         }
-        if candidate & !1 == address {
-            return Some((
-                read_u32(&bytes, tag_offset)?,
-                read_u64(&bytes, size_offset)?,
-            ));
+        for _ in 1..batch_len {
+            let _ = probes.next();
         }
+        remaining -= batch_len;
     }
     diagnostics.push(format!(
         "no validated big-page entry for large allocation {address:#x}"
     ));
-    None
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1005,7 +1152,7 @@ pub(crate) struct SnapshotWalker<'a, M> {
 }
 
 impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
-    pub(crate) fn walk(&self) -> Result<PoolSnapshot, String> {
+    pub(crate) fn walk(&self) -> Result<PoolSnapshot, SnapshotError> {
         let mut snapshot = PoolSnapshot {
             diagnostics: vec!["per-session paged heaps are not included".into()],
             complete: true,
@@ -1017,13 +1164,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         }
         snapshot.diagnostics.extend(discovery.diagnostics);
         for region in discovery.regions {
-            if self.memory.interrupted() {
-                snapshot.complete = false;
-                snapshot
-                    .diagnostics
-                    .push("pool walk interrupted by Ctrl+C".into());
-                break;
-            }
+            check_interrupted(self.memory)?;
             self.walk_region(&region, &mut snapshot);
         }
         snapshot
@@ -1348,7 +1489,10 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::{
+        cell::Cell,
+        collections::{BTreeMap, HashMap},
+    };
 
     use super::*;
     use crate::pool::layout::{SessionKey, TypeLayout};
@@ -1368,21 +1512,29 @@ mod tests {
     struct SyntheticMemory {
         bytes: BTreeMap<u64, u8>,
         holes: Vec<(u64, u64)>,
+        read_calls: Cell<usize>,
+        interrupt_checks: Cell<usize>,
+        interrupt_after_checks: Option<usize>,
     }
 
     impl PoolMemory for SyntheticMemory {
-        fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, String> {
+        fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
+            self.read_calls.set(self.read_calls.get() + 1);
             (0..size)
                 .map(|offset| {
                     self.bytes
                         .get(&(address + offset as u64))
                         .copied()
-                        .ok_or_else(|| "sparse synthetic memory".into())
+                        .ok_or_else(|| SnapshotError::Read {
+                            address,
+                            size,
+                            source: Box::new(std::io::Error::other("sparse synthetic memory")),
+                        })
                 })
                 .collect()
         }
 
-        fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), String> {
+        fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError> {
             let end = address.saturating_add(size as u64);
             for &(hole_start, hole_end) in &self.holes {
                 if address >= hole_start && address < hole_end {
@@ -1395,8 +1547,12 @@ mod tests {
             Ok((address, size))
         }
 
-        fn interrupted(&self) -> bool {
-            false
+        fn interrupted(&self) -> Result<bool, SnapshotError> {
+            let checks = self.interrupt_checks.get();
+            self.interrupt_checks.set(checks + 1);
+            Ok(self
+                .interrupt_after_checks
+                .is_some_and(|limit| checks >= limit))
         }
     }
 
@@ -1746,7 +1902,34 @@ mod tests {
         SyntheticMemory {
             bytes,
             holes: vec![(SEGMENT + 0x7800, SEGMENT + 0x8000)],
+            read_calls: Cell::new(0),
+            interrupt_checks: Cell::new(0),
+            interrupt_after_checks: None,
         }
+    }
+
+    fn configure_big_page_probe(
+        memory: &mut SyntheticMemory,
+        address: u64,
+        count: usize,
+        collision_distance: usize,
+    ) {
+        put_u64(&mut memory.bytes, BIG_TABLE_COUNT, count as u64);
+        fill(&mut memory.bytes, BIG_TABLE, count * 0x20);
+        let first = super::super::decode::big_page_hash(address, count).unwrap();
+        for distance in 0..collision_distance {
+            let index = (first + distance) % count;
+            put_u64(
+                &mut memory.bytes,
+                BIG_TABLE + index as u64 * 0x20,
+                address + (distance as u64 + 1) * 0x10_0000,
+            );
+        }
+        let index = (first + collision_distance) % count;
+        let entry = BIG_TABLE + index as u64 * 0x20;
+        put_u64(&mut memory.bytes, entry, address);
+        put(&mut memory.bytes, entry + 8, b"BTCH");
+        put_u64(&mut memory.bytes, entry + 0x10, 0x9000);
     }
 
     #[test]
@@ -1830,5 +2013,46 @@ mod tests {
             walker.lookup_big_page(&table, 24, address),
             Some((u32::from_le_bytes(*b"NEXT"), 0x7000))
         );
+    }
+
+    #[test]
+    fn test_big_page_lookup_batches_collision_chain() {
+        let mut memory = synthetic_memory();
+        let layout = synthetic_layout();
+        configure_big_page_probe(&mut memory, LARGE_VA, 512, 300);
+        let reads_before = memory.read_calls.get();
+        let mut diagnostics = Vec::new();
+
+        assert_eq!(
+            lookup_big_page_target(&memory, &layout, LARGE_VA, &mut diagnostics).unwrap(),
+            Some((u32::from_le_bytes(*b"BTCH"), 0x9000))
+        );
+        assert!(memory.read_calls.get() - reads_before <= 5);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_big_page_lookup_honors_interrupt_between_batches() {
+        let mut memory = synthetic_memory();
+        let layout = synthetic_layout();
+        configure_big_page_probe(&mut memory, LARGE_VA, 512, 300);
+        memory.interrupt_after_checks = Some(1);
+
+        assert!(matches!(
+            lookup_big_page_target(&memory, &layout, LARGE_VA, &mut Vec::new()),
+            Err(SnapshotError::Interrupted)
+        ));
+        assert_eq!(memory.interrupt_checks.get(), 2);
+    }
+
+    #[test]
+    fn test_snapshot_errors_preserve_category_and_source() {
+        let memory = synthetic_memory();
+        let error = memory.read_exact(0, 1).unwrap_err();
+        assert!(matches!(&error, SnapshotError::Read { .. }));
+        assert!(std::error::Error::source(&error).is_some());
+
+        let error = guarded_read(&memory, SEGMENT + 0x7800, 0x10).unwrap_err();
+        assert!(matches!(error, SnapshotError::RegionValidation { .. }));
     }
 }
