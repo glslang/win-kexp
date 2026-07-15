@@ -953,15 +953,6 @@ fn discover_large_allocations(
     let Ok(tree_offset) = layout.field("_SEGMENT_HEAP", "LargeAllocMetadata") else {
         return Ok(());
     };
-    let tree_address = heap_address + tree_offset as u64;
-    let nodes = tree_nodes(
-        memory,
-        layout,
-        tree_address,
-        traversal_limit,
-        "large-allocation tree",
-        &mut discovery.diagnostics,
-    )?;
     let Ok(large) = layout.type_layout("_HEAP_LARGE_ALLOC_DATA") else {
         return Ok(());
     };
@@ -974,6 +965,15 @@ fn discover_large_allocations(
     let Ok(pages_offset) = layout.field("_HEAP_LARGE_ALLOC_DATA", "AllocatedPages") else {
         return Ok(());
     };
+    let tree_address = heap_address + tree_offset as u64;
+    let nodes = tree_nodes(
+        memory,
+        layout,
+        tree_address,
+        traversal_limit,
+        "large-allocation tree",
+        &mut discovery.diagnostics,
+    )?;
     for node in nodes {
         let allocation_address = node.saturating_sub(tree_node as u64);
         let allocation = match guarded_read(memory, allocation_address, large.size as usize) {
@@ -1042,10 +1042,9 @@ fn lookup_big_page_target(
     address: u64,
     diagnostics: &mut Vec<String>,
 ) -> Result<Option<(u32, u64)>, SnapshotError> {
-    let table_pointer_address = *layout
-        .globals
-        .get("PoolBigPageTable")
-        .ok_or_else(|| missing_layout("PoolBigPageTable"))?;
+    let Some(&table_pointer_address) = layout.globals.get("PoolBigPageTable") else {
+        return Ok(None);
+    };
     let table = match scalar(memory, table_pointer_address, 8) {
         Ok(value) => value,
         Err(error) => {
@@ -1053,10 +1052,9 @@ fn lookup_big_page_target(
             return Ok(None);
         }
     };
-    let size_address = *layout
-        .globals
-        .get("PoolBigPageTableSize")
-        .ok_or_else(|| missing_layout("PoolBigPageTableSize"))?;
+    let Some(&size_address) = layout.globals.get("PoolBigPageTableSize") else {
+        return Ok(None);
+    };
     let count = match scalar(memory, size_address, 8).or_else(|_| scalar(memory, size_address, 4)) {
         Ok(value) => value as usize,
         Err(error) => {
@@ -1068,11 +1066,19 @@ fn lookup_big_page_target(
         diagnostics.push(format!("rejecting implausible big-page table size {count}"));
         return Ok(None);
     }
-    let entry = layout.type_layout("_POOL_TRACKER_BIG_PAGES")?;
+    let Ok(entry) = layout.type_layout("_POOL_TRACKER_BIG_PAGES") else {
+        return Ok(None);
+    };
     let entry_size = entry.size as usize;
-    let va_offset = layout.field("_POOL_TRACKER_BIG_PAGES", "Va")?;
-    let tag_offset = layout.field("_POOL_TRACKER_BIG_PAGES", "Key")?;
-    let size_offset = layout.field("_POOL_TRACKER_BIG_PAGES", "NumberOfBytes")?;
+    let Ok(va_offset) = layout.field("_POOL_TRACKER_BIG_PAGES", "Va") else {
+        return Ok(None);
+    };
+    let Ok(tag_offset) = layout.field("_POOL_TRACKER_BIG_PAGES", "Key") else {
+        return Ok(None);
+    };
+    let Ok(size_offset) = layout.field("_POOL_TRACKER_BIG_PAGES", "NumberOfBytes") else {
+        return Ok(None);
+    };
     let mut probes = big_page_probe(address, count).ok_or_else(|| SnapshotError::InvalidData {
         detail: format!("invalid big-page table size {count}"),
     })?;
@@ -2087,6 +2093,48 @@ mod tests {
             walker.lookup_big_page(&table, 24, address),
             Some((u32::from_le_bytes(*b"NEXT"), 0x7000))
         );
+    }
+
+    #[test]
+    fn test_snapshot_skips_missing_optional_large_layout() {
+        let memory = synthetic_memory();
+        let mut layout = synthetic_layout();
+        layout.types.remove("_HEAP_LARGE_ALLOC_DATA");
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1024,
+        };
+
+        let snapshot = walker.walk().unwrap();
+
+        for backend in [PoolBackend::Lfh, PoolBackend::Vs, PoolBackend::Segment] {
+            assert!(snapshot.spans.iter().any(|span| span.backend == backend));
+        }
+        assert!(
+            snapshot
+                .spans
+                .iter()
+                .all(|span| span.backend != PoolBackend::Large)
+        );
+    }
+
+    #[test]
+    fn test_large_snapshot_falls_back_without_big_page_layout() {
+        let memory = synthetic_memory();
+        let mut layout = synthetic_layout();
+        layout.types.remove("_POOL_TRACKER_BIG_PAGES");
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1024,
+        };
+
+        let snapshot = walker.walk().unwrap();
+
+        assert!(snapshot.spans.iter().any(|span| {
+            span.backend == PoolBackend::Large && span.raw_tag == 0 && span.size == 0x2000
+        }));
     }
 
     #[test]
