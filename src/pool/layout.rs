@@ -77,7 +77,6 @@ const TYPES: &[TypeSpec] = &[
             ("SegContexts", &["SegContexts", "SegmentContexts"]),
             ("VsContext", &["VsContext"]),
             ("LfhContext", &["LfhContext"]),
-            ("LargeAllocMetadata", &["LargeAllocMetadata"]),
             ("UserContext", &["UserContext"]),
         ],
     },
@@ -173,6 +172,21 @@ const TYPES: &[TypeSpec] = &[
         ],
     },
     TypeSpec {
+        name: "_RTL_DYNAMIC_LOOKASIDE",
+        fields: &[("BucketCount", &["BucketCount"]), ("Buckets", &["Buckets"])],
+    },
+    TypeSpec {
+        name: "_RTL_LOOKASIDE",
+        fields: &[("ListHead", &["ListHead"])],
+    },
+    TypeSpec {
+        name: "_SLIST_HEADER",
+        fields: &[("Alignment", &["Alignment"]), ("Region", &["Region"])],
+    },
+];
+
+const OPTIONAL_TYPES: &[TypeSpec] = &[
+    TypeSpec {
         name: "_POOL_TRACKER_BIG_PAGES",
         fields: &[
             ("Va", &["Va"]),
@@ -188,29 +202,54 @@ const TYPES: &[TypeSpec] = &[
             ("AllocatedPages", &["AllocatedPages", "NumberOfPages"]),
         ],
     },
-    TypeSpec {
-        name: "_RTL_DYNAMIC_LOOKASIDE",
-        fields: &[("BucketCount", &["BucketCount"]), ("Buckets", &["Buckets"])],
-    },
-    TypeSpec {
-        name: "_RTL_LOOKASIDE",
-        fields: &[("ListHead", &["ListHead"])],
-    },
-    TypeSpec {
-        name: "_SLIST_HEADER",
-        fields: &[("Alignment", &["Alignment"]), ("Region", &["Region"])],
-    },
 ];
 
-const OPTIONAL_FIELDS: &[(&str, &str, &[&str])] =
-    &[("_RTL_LOOKASIDE", "Size", &["Size", "SizeClass"])];
+const OPTIONAL_FIELDS: &[(&str, &str, &[&str])] = &[
+    (
+        "_SEGMENT_HEAP",
+        "LargeAllocMetadata",
+        &["LargeAllocMetadata"],
+    ),
+    ("_RTL_LOOKASIDE", "Size", &["Size", "SizeClass"]),
+];
 
 const GLOBALS: &[(&str, &[&str])] = &[
     ("ExPoolState", &["nt!ExPoolState"]),
     ("RtlpHpHeapGlobals", &["nt!RtlpHpHeapGlobals"]),
+];
+
+const OPTIONAL_GLOBALS: &[(&str, &[&str])] = &[
     ("PoolBigPageTable", &["nt!PoolBigPageTable"]),
     ("PoolBigPageTableSize", &["nt!PoolBigPageTableSize"]),
 ];
+
+fn resolve_type(
+    symbols: &impl Symbols,
+    module: u64,
+    spec: &TypeSpec,
+) -> Result<TypeLayout, LayoutError> {
+    let type_id = symbols
+        .type_id(module, spec.name)
+        .map_err(|_| LayoutError::Missing {
+            item: spec.name.into(),
+        })?;
+    let size = symbols
+        .type_size(module, type_id)
+        .map_err(|_| LayoutError::Missing {
+            item: spec.name.into(),
+        })?;
+    let mut fields = HashMap::new();
+    for &(canonical, aliases) in spec.fields {
+        let offset = aliases
+            .iter()
+            .find_map(|field| symbols.field(module, type_id, field).ok())
+            .ok_or_else(|| LayoutError::Missing {
+                item: format!("{}.{canonical}", spec.name),
+            })?;
+        fields.insert(canonical, offset);
+    }
+    Ok(TypeLayout { size, fields })
+}
 
 impl PoolLayout {
     pub(crate) fn type_layout(&self, name: &str) -> Result<&TypeLayout, LayoutError> {
@@ -252,31 +291,19 @@ impl PoolLayout {
                 })?;
             globals.insert(canonical, value);
         }
+        for &(canonical, aliases) in OPTIONAL_GLOBALS {
+            if let Some(value) = aliases.iter().find_map(|name| symbols.symbol(name).ok()) {
+                globals.insert(canonical, value);
+            }
+        }
         let mut types = HashMap::new();
         for spec in TYPES {
-            let type_id =
-                symbols
-                    .type_id(key.kernel_base, spec.name)
-                    .map_err(|_| LayoutError::Missing {
-                        item: spec.name.into(),
-                    })?;
-            let size =
-                symbols
-                    .type_size(key.kernel_base, type_id)
-                    .map_err(|_| LayoutError::Missing {
-                        item: spec.name.into(),
-                    })?;
-            let mut fields = HashMap::new();
-            for &(canonical, aliases) in spec.fields {
-                let offset = aliases
-                    .iter()
-                    .find_map(|field| symbols.field(key.kernel_base, type_id, field).ok())
-                    .ok_or_else(|| LayoutError::Missing {
-                        item: format!("{}.{canonical}", spec.name),
-                    })?;
-                fields.insert(canonical, offset);
+            types.insert(spec.name, resolve_type(symbols, key.kernel_base, spec)?);
+        }
+        for spec in OPTIONAL_TYPES {
+            if let Ok(layout) = resolve_type(symbols, key.kernel_base, spec) {
+                types.insert(spec.name, layout);
             }
-            types.insert(spec.name, TypeLayout { size, fields });
         }
         for &(type_name, canonical, aliases) in OPTIONAL_FIELDS {
             let Some(layout) = types.get_mut(type_name) else {
@@ -354,7 +381,7 @@ mod tests {
         fn type_spec(type_id: u32) -> Option<&'static TypeSpec> {
             type_id
                 .checked_sub(1)
-                .and_then(|index| TYPES.get(index as usize))
+                .and_then(|index| TYPES.iter().chain(OPTIONAL_TYPES).nth(index as usize))
         }
 
         fn resolve_field(&self, spec: &TypeSpec, name: &str) -> Result<u32, DbgEngError> {
@@ -372,12 +399,14 @@ mod tests {
             }
 
             if self.optional_fields
-                && let Some(&(_, _, aliases)) =
+                && let Some(&(_, canonical, aliases)) =
                     OPTIONAL_FIELDS.iter().find(|(type_name, _, aliases)| {
                         *type_name == spec.name && aliases.contains(&name)
                     })
             {
-                if self.fallback_aliases && aliases.len() > 1 && name == aliases[0] {
+                if self.missing_field == Some((spec.name, canonical))
+                    || (self.fallback_aliases && aliases.len() > 1 && name == aliases[0])
+                {
                     return Self::error();
                 }
                 return Ok(Self::field_value(name));
@@ -394,6 +423,7 @@ mod tests {
             }
             GLOBALS
                 .iter()
+                .chain(OPTIONAL_GLOBALS)
                 .position(|(_, aliases)| aliases.contains(&name))
                 .map(|index| 0xffff_8000_0000_0000 + (index as u64 + 1) * 0x1000)
                 .ok_or(DbgEngError::InvalidCommand)
@@ -405,6 +435,7 @@ mod tests {
             }
             TYPES
                 .iter()
+                .chain(OPTIONAL_TYPES)
                 .position(|spec| spec.name == name)
                 .map(|index| index as u32 + 1)
                 .ok_or(DbgEngError::InvalidCommand)
@@ -442,8 +473,8 @@ mod tests {
         let layout = PoolLayout::resolve(&FakeSymbols::default(), key()).unwrap();
 
         assert_eq!(layout.key, key());
-        assert_eq!(layout.globals.len(), GLOBALS.len());
-        assert_eq!(layout.types.len(), TYPES.len());
+        assert_eq!(layout.globals.len(), GLOBALS.len() + OPTIONAL_GLOBALS.len());
+        assert_eq!(layout.types.len(), TYPES.len() + OPTIONAL_TYPES.len());
         assert_eq!(
             layout.field("_POOL_HEADER", "PoolTag"),
             Ok(FakeSymbols::field_value("PoolTag") as usize)
@@ -576,5 +607,62 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn test_resolve_tolerates_missing_optional_large_metadata() {
+        for missing_type in ["_HEAP_LARGE_ALLOC_DATA", "_POOL_TRACKER_BIG_PAGES"] {
+            let layout = PoolLayout::resolve(
+                &FakeSymbols {
+                    optional_fields: true,
+                    missing_type: Some(missing_type),
+                    ..FakeSymbols::default()
+                },
+                key(),
+            )
+            .unwrap();
+
+            assert!(layout.type_layout(missing_type).is_err());
+            assert!(layout.type_layout("_POOL_HEADER").is_ok());
+        }
+
+        for missing_global in ["nt!PoolBigPageTable", "nt!PoolBigPageTableSize"] {
+            let canonical = OPTIONAL_GLOBALS
+                .iter()
+                .find(|(_, aliases)| aliases.contains(&missing_global))
+                .unwrap()
+                .0;
+            let layout = PoolLayout::resolve(
+                &FakeSymbols {
+                    missing_global: Some(missing_global),
+                    ..FakeSymbols::default()
+                },
+                key(),
+            )
+            .unwrap();
+
+            assert!(!layout.globals.contains_key(canonical));
+        }
+
+        let layout = PoolLayout::resolve(
+            &FakeSymbols {
+                optional_fields: true,
+                missing_field: Some(("_SEGMENT_HEAP", "LargeAllocMetadata")),
+                ..FakeSymbols::default()
+            },
+            key(),
+        )
+        .unwrap();
+        assert!(layout.field("_SEGMENT_HEAP", "LargeAllocMetadata").is_err());
+
+        let layout = PoolLayout::resolve(
+            &FakeSymbols {
+                missing_field: Some(("_HEAP_LARGE_ALLOC_DATA", "TreeNode")),
+                ..FakeSymbols::default()
+            },
+            key(),
+        )
+        .unwrap();
+        assert!(layout.type_layout("_HEAP_LARGE_ALLOC_DATA").is_err());
     }
 }
