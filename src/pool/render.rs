@@ -43,6 +43,7 @@ fn kind_name(kind: PoolKind) -> &'static str {
         PoolKind::SpecialNonPaged => "special-nonpaged",
         PoolKind::SpecialNonPagedNx => "special-nonpaged-nx",
         PoolKind::SpecialPaged => "special-paged",
+        PoolKind::SpecialPrototypePaged => "special-prototype-paged",
     }
 }
 

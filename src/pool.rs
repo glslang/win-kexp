@@ -24,13 +24,14 @@ pub(crate) enum PoolKind {
     SpecialNonPaged,
     SpecialNonPagedNx,
     SpecialPaged,
+    SpecialPrototypePaged,
 }
 
 impl PoolKind {
     pub(crate) fn is_paged(self) -> bool {
         matches!(
             self,
-            Self::Paged | Self::PrototypePaged | Self::SpecialPaged
+            Self::Paged | Self::PrototypePaged | Self::SpecialPaged | Self::SpecialPrototypePaged
         )
     }
 }
