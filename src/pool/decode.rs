@@ -146,8 +146,10 @@ pub(crate) fn adjust_page_end_header(candidate: u64, header_size: u64) -> Option
     if header_size == 0 || header_size > PAGE_SIZE {
         return None;
     }
-    if candidate & (PAGE_SIZE - 1) == PAGE_SIZE - header_size {
-        candidate.checked_add(header_size)
+    let page_offset = candidate & (PAGE_SIZE - 1);
+    let last_header_start = PAGE_SIZE - header_size;
+    if page_offset > last_header_start {
+        candidate.checked_sub(page_offset - last_header_start)
     } else {
         Some(candidate)
     }
@@ -385,7 +387,9 @@ mod tests {
             big_page_hash(high_address, 0x100),
             Some(expected as usize & 0xff)
         );
-        assert_eq!(adjust_page_end_header(0x1ff0, 0x10), Some(0x2000));
+        assert_eq!(adjust_page_end_header(0x1ff0, 0x10), Some(0x1ff0));
+        assert_eq!(adjust_page_end_header(0x1ff8, 0x10), Some(0x1ff0));
+        assert_eq!(adjust_page_end_header(0x2000, 0x10), Some(0x2000));
         let tree = 0xffff_8000_0001_0000;
         let root = 0xffff_8000_0002_0000;
         assert_eq!(decode_rb_root((root ^ tree) | 1, tree), Some(root));

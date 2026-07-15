@@ -1468,11 +1468,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 decode_pool_header(bytes, offset, region.pool_header).map(|header| header.tag)
             });
             let address = region.address + slot_offset as u64;
-            let header_size = if region.backend == PoolBackend::Large {
-                0
-            } else {
-                region.pool_header.size.min(size)
-            };
+            let header_size = region.pool_header.size.min(size);
             snapshot.spans.push(self.base_span(
                 region,
                 address,
@@ -1926,7 +1922,7 @@ mod tests {
             let decoded = (4u64 << 16) | (u64::from(allocated) << 48);
             put_u64(&mut bytes, address, decoded ^ address ^ heap_key);
         }
-        pool_header(&mut bytes, first_chunk + 0x20, b"VS!!");
+        pool_header(&mut bytes, first_chunk + 0x10, b"VS!!");
         let vs_context = HEAP + 0x300;
         put_u64(&mut bytes, vs_context, free_chunk + 8);
         put_u64(&mut bytes, free_chunk + 8, 0);
@@ -2052,7 +2048,10 @@ mod tests {
                 .any(|span| span.state == PoolState::Unreadable)
         );
         assert!(snapshot.spans.iter().any(|span| {
-            span.backend == PoolBackend::Vs && span.header_address == SEGMENT + 0x4000
+            span.backend == PoolBackend::Vs
+                && span.header_address == SEGMENT + 0x3ff0
+                && span.usable_address == SEGMENT + 0x4000
+                && span.raw_tag == u32::from_le_bytes(*b"VS!!")
         }));
         assert!(snapshot.spans.iter().any(|span| {
             span.backend == PoolBackend::Large
