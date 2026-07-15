@@ -141,10 +141,6 @@ fn args_string(args: PCSTR) -> Result<String, String> {
         .into_owned())
 }
 
-fn span_contains_address(span: &crate::pool::PoolSpan, address: u64) -> bool {
-    address >= span.header_address && address < span.end()
-}
-
 fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
     let command = parse_args(args)?;
     if !engine
@@ -187,7 +183,7 @@ fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
         let detail = index
             .spans
             .iter()
-            .find(|span| span_contains_address(span, address))
+            .find(|span| span.contains_address(address))
             .map(|span| {
                 format!(
                     "{address:#x}: {} {:#x}+{:#x} tag `{}` {:?} {:?}\n",
@@ -374,12 +370,12 @@ mod tests {
             crate::pool::PoolBackend::Vs,
         );
         span.header_address = 0x1000;
-        assert!(span_contains_address(&span, 0x1000));
-        assert!(span_contains_address(&span, 0x100f));
-        assert!(span_contains_address(&span, 0x1010));
-        assert!(span_contains_address(&span, 0x102f));
-        assert!(!span_contains_address(&span, 0x0fff));
-        assert!(!span_contains_address(&span, 0x1030));
+        assert!(span.contains_address(0x1000));
+        assert!(span.contains_address(0x100f));
+        assert!(span.contains_address(0x1010));
+        assert!(span.contains_address(0x102f));
+        assert!(!span.contains_address(0x0fff));
+        assert!(!span.contains_address(0x1030));
 
         let before = SESSION_GENERATION.load(Ordering::Acquire);
         unsafe { DebugExtensionNotify(DEBUG_NOTIFY_SESSION_INACTIVE, 0) };

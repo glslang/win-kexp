@@ -79,6 +79,10 @@ impl PoolSpan {
         self.usable_address.saturating_add(self.size)
     }
 
+    pub(crate) fn contains_address(&self, address: u64) -> bool {
+        address >= self.header_address && address < self.end()
+    }
+
     #[cfg(test)]
     pub(crate) fn allocation(
         address: u64,

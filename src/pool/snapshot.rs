@@ -729,6 +729,10 @@ fn discover_segment_context(
         .ok_or_else(|| SnapshotError::InvalidData {
             detail: "descriptor metadata size overflow".into(),
         })?;
+    let heap_globals = *layout
+        .globals
+        .get("RtlpHpHeapGlobals")
+        .ok_or_else(|| missing_layout("RtlpHpHeapGlobals"))?;
     let mut entry = scalar(memory, list_head, 8)? & !0xf;
     let mut seen = HashSet::new();
     while entry != 0 && entry != list_head && seen.len() < traversal_limit {
@@ -756,10 +760,6 @@ fn discover_segment_context(
         let signature = read_u64(&segment_header, signature_offset)
             .or_else(|| read_u32(&segment_header, signature_offset).map(u64::from))
             .unwrap_or(0);
-        let heap_globals = *layout
-            .globals
-            .get("RtlpHpHeapGlobals")
-            .ok_or_else(|| missing_layout("RtlpHpHeapGlobals"))?;
         if !valid_page_segment_signature(signature, segment_address, context_address, heap_globals)
         {
             discovery.diagnostics.push(format!(
@@ -1165,7 +1165,11 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         snapshot.diagnostics.extend(discovery.diagnostics);
         for region in discovery.regions {
             check_interrupted(self.memory)?;
-            self.walk_region(&region, &mut snapshot);
+            if region.backend == PoolBackend::Large {
+                self.walk_large(&region, &mut snapshot);
+            } else {
+                self.walk_region(&region, &mut snapshot);
+            }
         }
         snapshot
             .spans
@@ -1225,12 +1229,31 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             match region.backend {
                 PoolBackend::Lfh => self.walk_lfh(region, valid_base, &bytes, snapshot),
                 PoolBackend::Vs => self.walk_vs(region, valid_base, &bytes, snapshot),
-                PoolBackend::Segment | PoolBackend::Large => {
-                    self.walk_page_ranges(region, valid_base, &bytes, snapshot)
-                }
+                PoolBackend::Segment => self.walk_page_ranges(region, valid_base, &bytes, snapshot),
+                PoolBackend::Large => return,
             }
             cursor = valid_end;
         }
+    }
+
+    fn walk_large(&self, region: &PoolRegion, snapshot: &mut PoolSnapshot) {
+        if region.size == 0 {
+            return;
+        }
+        snapshot.spans.push(
+            self.base_span(
+                region,
+                region.address,
+                region.address,
+                region.size as u64,
+                region.known_tag.unwrap_or(0),
+                region
+                    .states
+                    .first()
+                    .copied()
+                    .unwrap_or(PoolState::Allocated),
+            ),
+        );
     }
 
     fn base_span(
@@ -1940,7 +1963,8 @@ mod tests {
         fill(&mut bytes, LARGE_META, 0x28);
         put_u64(&mut bytes, LARGE_META + 0x18, LARGE_VA | 0x1800);
         put_u64(&mut bytes, LARGE_META + 0x20, (2u64 << 12) | 0x5a5);
-        fill(&mut bytes, LARGE_VA, 0x2000);
+        // Large allocations are described entirely by allocator metadata; leave
+        // their payload absent so the walker cannot accidentally read it.
         put_u64(&mut bytes, BIG_TABLE_POINTER, BIG_TABLE);
         put_u64(&mut bytes, BIG_TABLE_COUNT, 4);
         fill(&mut bytes, BIG_TABLE, 4 * 0x20);
@@ -1985,6 +2009,7 @@ mod tests {
     #[test]
     fn test_pool_snapshot_walks_all_backends() {
         let memory = synthetic_memory();
+        assert!(!memory.bytes.contains_key(&LARGE_VA));
         let layout = synthetic_layout();
         let walker = SnapshotWalker {
             memory: &memory,
