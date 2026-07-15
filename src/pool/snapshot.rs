@@ -339,6 +339,13 @@ struct Discovery {
     diagnostics: Vec<String>,
 }
 
+const SPECIAL_POOL_KINDS: [PoolKind; 4] = [
+    PoolKind::SpecialNonPaged,
+    PoolKind::SpecialNonPagedNx,
+    PoolKind::SpecialPaged,
+    PoolKind::SpecialPrototypePaged,
+];
+
 fn discover_pool_regions(
     memory: &impl PoolMemory,
     layout: &PoolLayout,
@@ -398,19 +405,10 @@ fn discover_pool_regions(
             }
         }
     }
-    for special_index in 0..3usize {
+    for (special_index, pool_kind) in SPECIAL_POOL_KINDS.into_iter().enumerate() {
         let pointer_address = state_address + special_offset as u64 + special_index as u64 * 8;
         match scalar(memory, pointer_address, 8) {
-            Ok(heap) if heap != 0 => heaps.push((
-                heap,
-                0,
-                match special_index {
-                    0 => PoolKind::SpecialNonPaged,
-                    1 => PoolKind::SpecialNonPagedNx,
-                    _ => PoolKind::SpecialPaged,
-                },
-                true,
-            )),
+            Ok(heap) if heap != 0 => heaps.push((heap, 0, pool_kind, true)),
             Ok(_) => {}
             Err(error) => discovery.diagnostics.push(format!(
                 "cannot read special pool heap {special_index}: {error}"
@@ -887,7 +885,8 @@ fn discover_segment_context(
                 };
                 let signature =
                     read_u16(&header, layout.field("_HEAP_VS_SUBSEGMENT", "Signature")?)
-                        .unwrap_or(0);
+                        .unwrap_or(0)
+                        & 0x7fff;
                 let declared =
                     read_u16(&header, layout.field("_HEAP_VS_SUBSEGMENT", "Size")?).unwrap_or(0);
                 if !valid_vs_signature(signature ^ declared) {
@@ -1068,7 +1067,7 @@ fn lookup_big_page_target(
     let Some(&size_address) = layout.globals.get("PoolBigPageTableSize") else {
         return Ok(None);
     };
-    let count = match scalar(memory, size_address, 8).or_else(|_| scalar(memory, size_address, 4)) {
+    let count = match scalar(memory, size_address, 4).or_else(|_| scalar(memory, size_address, 8)) {
         Ok(value) => value as usize,
         Err(error) => {
             diagnostics.push(format!("cannot read big-page table size: {error}"));
@@ -1569,8 +1568,11 @@ mod tests {
             if address == BIG_TABLE_POINTER && size == 8 {
                 return Ok(BIG_TABLE.to_le_bytes().to_vec());
             }
+            if address == BIG_TABLE_COUNT && size == 4 {
+                return Ok((self.count as u32).to_le_bytes().to_vec());
+            }
             if address == BIG_TABLE_COUNT && size == 8 {
-                return Ok((self.count as u64).to_le_bytes().to_vec());
+                return Ok(((1u64 << 32) | self.count as u64).to_le_bytes().to_vec());
             }
             let offset = address
                 .checked_sub(BIG_TABLE)
@@ -1915,7 +1917,7 @@ mod tests {
 
         let vs = SEGMENT + 0x3000;
         fill(&mut bytes, vs, 0x2000);
-        put_u16(&mut bytes, vs, 0x2bed ^ 2);
+        put_u16(&mut bytes, vs, 0x8000 | (0x2bed ^ 2));
         put_u16(&mut bytes, vs + 2, 2);
         let first_chunk = vs + 0xfe0;
         let cached_chunk = first_chunk + 0x40;
@@ -2093,6 +2095,13 @@ mod tests {
             walker.lookup_big_page(&table, 24, address),
             Some((u32::from_le_bytes(*b"NEXT"), 0x7000))
         );
+    }
+
+    #[test]
+    fn test_special_pool_kinds_cover_all_heap_slots() {
+        assert_eq!(SPECIAL_POOL_KINDS.len(), 4);
+        assert_eq!(SPECIAL_POOL_KINDS[3], PoolKind::SpecialPrototypePaged);
+        assert!(SPECIAL_POOL_KINDS[3].is_paged());
     }
 
     #[test]
