@@ -77,7 +77,6 @@ const TYPES: &[TypeSpec] = &[
             ("SegContexts", &["SegContexts", "SegmentContexts"]),
             ("VsContext", &["VsContext"]),
             ("LfhContext", &["LfhContext"]),
-            ("UserContext", &["UserContext"]),
         ],
     },
     TypeSpec {
@@ -132,10 +131,7 @@ const TYPES: &[TypeSpec] = &[
     },
     TypeSpec {
         name: "_HEAP_LFH_CONTEXT",
-        fields: &[
-            ("Buckets", &["Buckets"]),
-            ("AffinitySlots", &["AffinitySlots", "AffinitizedInfoArrays"]),
-        ],
+        fields: &[("Buckets", &["Buckets"])],
     },
     TypeSpec {
         name: "_HEAP_LFH_SUBSEGMENT",
@@ -172,6 +168,13 @@ const TYPES: &[TypeSpec] = &[
         ],
     },
     TypeSpec {
+        name: "_SLIST_HEADER",
+        fields: &[("Alignment", &["Alignment"]), ("Region", &["Region"])],
+    },
+];
+
+const OPTIONAL_TYPES: &[TypeSpec] = &[
+    TypeSpec {
         name: "_RTL_DYNAMIC_LOOKASIDE",
         fields: &[("BucketCount", &["BucketCount"]), ("Buckets", &["Buckets"])],
     },
@@ -179,13 +182,6 @@ const TYPES: &[TypeSpec] = &[
         name: "_RTL_LOOKASIDE",
         fields: &[("ListHead", &["ListHead"])],
     },
-    TypeSpec {
-        name: "_SLIST_HEADER",
-        fields: &[("Alignment", &["Alignment"]), ("Region", &["Region"])],
-    },
-];
-
-const OPTIONAL_TYPES: &[TypeSpec] = &[
     TypeSpec {
         name: "_POOL_TRACKER_BIG_PAGES",
         fields: &[
@@ -205,10 +201,16 @@ const OPTIONAL_TYPES: &[TypeSpec] = &[
 ];
 
 const OPTIONAL_FIELDS: &[(&str, &str, &[&str])] = &[
+    ("_EX_HEAP_POOL_NODE", "Lookasides", &["Lookasides"]),
     (
         "_SEGMENT_HEAP",
         "LargeAllocMetadata",
         &["LargeAllocMetadata"],
+    ),
+    (
+        "_HEAP_LFH_CONTEXT",
+        "AffinitySlots",
+        &["AffinitySlots", "AffinitizedInfoArrays"],
     ),
     ("_RTL_LOOKASIDE", "Size", &["Size", "SizeClass"]),
 ];
@@ -499,6 +501,10 @@ mod tests {
             layout.field("_RTL_LOOKASIDE", "Size"),
             Ok(FakeSymbols::field_value("SizeClass") as usize)
         );
+        assert_eq!(
+            layout.field("_HEAP_LFH_CONTEXT", "AffinitySlots"),
+            Ok(FakeSymbols::field_value("AffinitizedInfoArrays") as usize)
+        );
     }
 
     #[test]
@@ -664,5 +670,38 @@ mod tests {
         )
         .unwrap();
         assert!(layout.type_layout("_HEAP_LARGE_ALLOC_DATA").is_err());
+    }
+
+    #[test]
+    fn test_resolve_tolerates_missing_optional_cache_metadata() {
+        for missing_type in ["_RTL_DYNAMIC_LOOKASIDE", "_RTL_LOOKASIDE"] {
+            let layout = PoolLayout::resolve(
+                &FakeSymbols {
+                    missing_type: Some(missing_type),
+                    ..FakeSymbols::default()
+                },
+                key(),
+            )
+            .unwrap();
+
+            assert!(layout.type_layout(missing_type).is_err());
+        }
+
+        for missing_field in [
+            ("_EX_HEAP_POOL_NODE", "Lookasides"),
+            ("_HEAP_LFH_CONTEXT", "AffinitySlots"),
+        ] {
+            let layout = PoolLayout::resolve(
+                &FakeSymbols {
+                    optional_fields: true,
+                    missing_field: Some(missing_field),
+                    ..FakeSymbols::default()
+                },
+                key(),
+            )
+            .unwrap();
+
+            assert!(layout.field(missing_field.0, missing_field.1).is_err());
+        }
     }
 }

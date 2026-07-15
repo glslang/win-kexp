@@ -361,6 +361,11 @@ fn discover_pool_regions(
     let node_offset = layout.field("_EX_POOL_HEAP_MANAGER_STATE", "PoolNode")?;
     let special_offset = layout.field("_EX_POOL_HEAP_MANAGER_STATE", "SpecialHeaps")?;
     let heaps_offset = layout.field("_EX_HEAP_POOL_NODE", "Heaps")?;
+    let lookasides_offset = layout.field("_EX_HEAP_POOL_NODE", "Lookasides").ok();
+    let dynamic_lookaside_size = layout
+        .type_layout("_RTL_DYNAMIC_LOOKASIDE")
+        .ok()
+        .map(|lookaside| lookaside.size as u64);
     let number = scalar(memory, state_address + number_offset as u64, 4)? as usize;
     if number == 0 || number > 256 {
         return Err(SnapshotError::InvalidData {
@@ -391,24 +396,28 @@ fn discover_pool_regions(
                 }
             };
             if heap != 0 {
-                heaps.push((
-                    heap,
-                    numa_node as u16,
-                    match heap_index {
-                        0 => PoolKind::NonPagedExecutable,
-                        1 => PoolKind::NonPagedNx,
-                        2 => PoolKind::Paged,
-                        _ => PoolKind::PrototypePaged,
-                    },
-                    false,
-                ));
+                let pool_kind = match heap_index {
+                    0 => PoolKind::NonPagedExecutable,
+                    1 => PoolKind::NonPagedNx,
+                    2 => PoolKind::Paged,
+                    _ => PoolKind::PrototypePaged,
+                };
+                let dynamic_lookaside =
+                    lookasides_offset
+                        .zip(dynamic_lookaside_size)
+                        .and_then(|(offset, size)| {
+                            node_address.checked_add(offset as u64).and_then(|base| {
+                                base.checked_add(u64::from(pool_kind.is_paged()) * size)
+                            })
+                        });
+                heaps.push((heap, numa_node as u16, pool_kind, false, dynamic_lookaside));
             }
         }
     }
     for (special_index, pool_kind) in SPECIAL_POOL_KINDS.into_iter().enumerate() {
         let pointer_address = state_address + special_offset as u64 + special_index as u64 * 8;
         match scalar(memory, pointer_address, 8) {
-            Ok(heap) if heap != 0 => heaps.push((heap, 0, pool_kind, true)),
+            Ok(heap) if heap != 0 => heaps.push((heap, 0, pool_kind, true, None)),
             Ok(_) => {}
             Err(error) => discovery.diagnostics.push(format!(
                 "cannot read special pool heap {special_index}: {error}"
@@ -430,7 +439,7 @@ fn discover_pool_regions(
         globals_address + layout.field("_RTLP_HP_HEAP_GLOBALS", "LfhKey")? as u64,
         8,
     )?;
-    for (heap_address, numa_node, pool_kind, special) in heaps {
+    for (heap_address, numa_node, pool_kind, special, dynamic_lookaside) in heaps {
         let identity = HeapIdentity {
             pool_state: state_address,
             heap: heap_address,
@@ -443,6 +452,7 @@ fn discover_pool_regions(
             numa_node,
             pool_kind,
             identity,
+            dynamic_lookaside,
             heap_key,
             lfh_key,
             traversal_limit,
@@ -461,6 +471,7 @@ fn discover_vs_evidence(
     memory: &impl PoolMemory,
     layout: &PoolLayout,
     heap_address: u64,
+    dynamic_lookaside: Option<u64>,
     limit: usize,
     diagnostics: &mut Vec<String>,
 ) -> Result<(HashSet<u64>, HashSet<u64>), SnapshotError> {
@@ -509,12 +520,7 @@ fn discover_vs_evidence(
         }
     }
 
-    let dynamic = layout
-        .field("_SEGMENT_HEAP", "UserContext")
-        .ok()
-        .and_then(|offset| scalar(memory, heap_address + offset as u64, 8).ok())
-        .unwrap_or(0);
-    if dynamic != 0 {
+    if let Some(dynamic) = dynamic_lookaside {
         let bucket_count = layout
             .field("_RTL_DYNAMIC_LOOKASIDE", "BucketCount")
             .ok()
@@ -588,6 +594,7 @@ fn discover_heap_regions(
     numa_node: u16,
     pool_kind: PoolKind,
     identity: HeapIdentity,
+    dynamic_lookaside: Option<u64>,
     heap_key: u64,
     lfh_key: u64,
     traversal_limit: usize,
@@ -600,6 +607,7 @@ fn discover_heap_regions(
         memory,
         layout,
         heap_address,
+        dynamic_lookaside,
         traversal_limit,
         &mut discovery.diagnostics,
     )?;
@@ -1527,7 +1535,8 @@ mod tests {
     const BIG_TABLE_POINTER: u64 = K + 0x12_0000;
     const BIG_TABLE_COUNT: u64 = K + 0x12_0010;
     const HEAP: u64 = K + 0x20_0000;
-    const DYNAMIC_LOOKASIDE: u64 = K + 0x21_0000;
+    const POOL_NODE: u64 = STATE + 0x40;
+    const DYNAMIC_LOOKASIDE: u64 = POOL_NODE + 0x20;
     const SEGMENT: u64 = K + 0x30_0000;
     const LARGE_META: u64 = K + 0x80_0000;
     const LARGE_VA: u64 = K + 0x90_0000;
@@ -1649,7 +1658,7 @@ mod tests {
         types.insert(
             "_EX_POOL_HEAP_MANAGER_STATE",
             type_layout(
-                0x100,
+                0x200,
                 &[
                     ("HeapManager", 8),
                     ("PoolNode", 0x40),
@@ -1658,7 +1667,10 @@ mod tests {
                 ],
             ),
         );
-        types.insert("_EX_HEAP_POOL_NODE", type_layout(0x40, &[("Heaps", 0)]));
+        types.insert(
+            "_EX_HEAP_POOL_NODE",
+            type_layout(0x120, &[("Heaps", 0), ("Lookasides", 0x20)]),
+        );
         types.insert(
             "_SEGMENT_HEAP",
             type_layout(
@@ -1668,7 +1680,6 @@ mod tests {
                     ("VsContext", 0x300),
                     ("LfhContext", 0x380),
                     ("LargeAllocMetadata", 0x400),
-                    ("UserContext", 0x500),
                 ],
             ),
         );
@@ -1732,10 +1743,7 @@ mod tests {
             "_HEAP_VS_CHUNK_FREE_HEADER",
             type_layout(0x20, &[("TreeNode", 8)]),
         );
-        types.insert(
-            "_HEAP_LFH_CONTEXT",
-            type_layout(0x20, &[("Buckets", 0), ("AffinitySlots", 8)]),
-        );
+        types.insert("_HEAP_LFH_CONTEXT", type_layout(0x20, &[("Buckets", 0)]));
         types.insert(
             "_HEAP_LFH_SUBSEGMENT",
             type_layout(
@@ -1853,7 +1861,7 @@ mod tests {
 
     fn synthetic_memory() -> SyntheticMemory {
         let mut bytes = BTreeMap::new();
-        fill(&mut bytes, STATE, 0x100);
+        fill(&mut bytes, STATE, 0x200);
         put_u32(&mut bytes, STATE, 1);
         for heap_index in 0..4 {
             put_u64(&mut bytes, STATE + 0x40 + heap_index * 8, HEAP);
@@ -1940,7 +1948,6 @@ mod tests {
         put_u64(&mut bytes, delay_head + 8, cached_chunk + 0x20);
         put_u64(&mut bytes, cached_chunk + 0x20, 0);
 
-        put_u64(&mut bytes, HEAP + 0x500, DYNAMIC_LOOKASIDE);
         fill(&mut bytes, DYNAMIC_LOOKASIDE, 0x80);
         put_u32(&mut bytes, DYNAMIC_LOOKASIDE + 8, 1);
         let lookaside_chunk = free_chunk + 0x40;
@@ -2038,6 +2045,11 @@ mod tests {
         }));
         assert!(snapshot.spans.iter().any(|span| {
             span.backend == PoolBackend::Vs && span.state == PoolState::CachedFree
+        }));
+        assert!(snapshot.spans.iter().any(|span| {
+            span.backend == PoolBackend::Vs
+                && span.header_address == SEGMENT + 0x40b0
+                && span.state == PoolState::CachedFree
         }));
         assert!(
             snapshot
