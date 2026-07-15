@@ -129,14 +129,15 @@ pub(crate) fn decode_lfh_offsets(encoded: u32, subsegment: u64, lfh_key: u32) ->
     (decoded as u16, (decoded >> 16) as u16)
 }
 
-/// Each LFH slot uses two bits: 0 is reusable, 1 allocated, and 2/3 cached.
+/// Each LFH slot uses two bits. Bit 0 is the busy state, while bit 1 records
+/// unused-byte metadata and does not affect whether the block is allocated.
 pub(crate) fn lfh_bitmap_state(bitmap: &[u8], slot: usize) -> Option<PoolState> {
     let bit = slot.checked_mul(2)?;
     let byte = *bitmap.get(bit / 8)?;
-    Some(match (byte >> (bit % 8)) & 3 {
-        0 => PoolState::ReusableFree,
-        1 => PoolState::Allocated,
-        _ => PoolState::CachedFree,
+    Some(if (byte >> (bit % 8)) & 1 == 0 {
+        PoolState::ReusableFree
+    } else {
+        PoolState::Allocated
     })
 }
 
@@ -315,10 +316,17 @@ mod tests {
             decode_lfh_offsets(encoded_offsets, subsegment, lfh_key),
             (0x30, 0x248)
         );
+        let lfh_bitmap = [0b1110_0100];
         assert_eq!(
-            lfh_bitmap_state(&[0b0010_0100], 1),
-            Some(PoolState::Allocated)
+            lfh_bitmap_state(&lfh_bitmap, 0),
+            Some(PoolState::ReusableFree)
         );
+        assert_eq!(lfh_bitmap_state(&lfh_bitmap, 1), Some(PoolState::Allocated));
+        assert_eq!(
+            lfh_bitmap_state(&lfh_bitmap, 2),
+            Some(PoolState::ReusableFree)
+        );
+        assert_eq!(lfh_bitmap_state(&lfh_bitmap, 3), Some(PoolState::Allocated));
         assert_eq!(lfh_bitmap_state(&[], 0), None);
 
         let mut shifted = [0u8; 24];
