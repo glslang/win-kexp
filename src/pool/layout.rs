@@ -202,6 +202,7 @@ const OPTIONAL_TYPES: &[TypeSpec] = &[
 
 const OPTIONAL_FIELDS: &[(&str, &str, &[&str])] = &[
     ("_EX_HEAP_POOL_NODE", "Lookasides", &["Lookasides"]),
+    ("_RTL_RB_TREE", "Encoded", &["Encoded"]),
     (
         "_SEGMENT_HEAP",
         "LargeAllocMetadata",
@@ -504,6 +505,10 @@ mod tests {
         assert_eq!(
             layout.field("_HEAP_LFH_CONTEXT", "AffinitySlots"),
             Ok(FakeSymbols::field_value("AffinitizedInfoArrays") as usize)
+        );
+        assert_eq!(
+            layout.field("_RTL_RB_TREE", "Encoded"),
+            Ok(FakeSymbols::field_value("Encoded") as usize)
         );
     }
 
