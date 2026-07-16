@@ -100,9 +100,9 @@ pub(crate) fn valid_page_segment_signature(
     signature: u64,
     segment: u64,
     context: u64,
-    heap_globals: u64,
+    heap_key: u64,
 ) -> bool {
-    signature == segment ^ context ^ heap_globals ^ PAGE_SEGMENT_SIGNATURE
+    signature == segment ^ context ^ heap_key ^ PAGE_SEGMENT_SIGNATURE
 }
 
 pub(crate) fn valid_descriptor_tree_signature(signature: u32) -> bool {
@@ -372,12 +372,16 @@ mod tests {
         assert!(valid_vs_signature(VS_SIGNATURE));
         let segment = 0xffff_8000_1234_0000;
         let context = 0xffff_8000_1000_0000;
-        let globals = 0xffff_8000_0100_0000;
+        let heap_key = 0x55aa_1234_9876_0000;
+        let signature = segment ^ context ^ heap_key ^ PAGE_SEGMENT_SIGNATURE;
         assert!(valid_page_segment_signature(
-            segment ^ context ^ globals ^ PAGE_SEGMENT_SIGNATURE,
+            signature, segment, context, heap_key
+        ));
+        assert!(!valid_page_segment_signature(
+            signature,
             segment,
             context,
-            globals
+            0xffff_8000_0100_0000
         ));
         assert!(valid_descriptor_tree_signature(DESCRIPTOR_TREE_SIGNATURE));
         let first = big_page_hash(0x9000, 8).unwrap();
