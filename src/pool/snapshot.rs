@@ -3,10 +3,10 @@ use std::collections::HashSet;
 use thiserror::Error;
 
 use super::decode::{
-    PAGE_SIZE, PoolHeaderLayout, adjust_page_end_header, big_page_probe, decode_descriptor_at,
-    decode_large_allocation, decode_lfh_offsets, decode_pool_header, decode_rb_root,
-    decode_vs_sizes, lfh_bitmap_state, read_u16, read_u32, read_u64,
-    valid_descriptor_tree_signature, valid_page_segment_signature, valid_vs_signature,
+    DESCRIPTOR_FLAG_LFH, DESCRIPTOR_FLAG_VS, PAGE_SIZE, PoolHeaderLayout, adjust_page_end_header,
+    big_page_probe, decode_descriptor_at, decode_large_allocation, decode_lfh_offsets,
+    decode_pool_header, decode_rb_root, decode_vs_sizes, lfh_bitmap_state, read_u16, read_u32,
+    read_u64, valid_descriptor_tree_signature, valid_page_segment_signature, valid_vs_signature,
 };
 use super::{
     HeapIdentity, PoolBackend, PoolKind, PoolSpan, PoolState,
@@ -828,10 +828,12 @@ fn discover_segment_context(
                 descriptor_index += unit_size.max(1);
                 continue;
             }
-            let backend = match decoded.flags & 0x0c {
-                0x08 => PoolBackend::Lfh,
-                0x0c => PoolBackend::Vs,
-                _ => PoolBackend::Segment,
+            let backend = if decoded.flags & DESCRIPTOR_FLAG_LFH != 0 {
+                PoolBackend::Lfh
+            } else if decoded.flags & DESCRIPTOR_FLAG_VS != 0 {
+                PoolBackend::Vs
+            } else {
+                PoolBackend::Segment
             };
             let mut region_address = address;
             let mut region_size = size;
@@ -1536,7 +1538,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::pool::layout::{SessionKey, TypeLayout};
+    use crate::pool::{
+        decode::DESCRIPTOR_FLAG_COMMITTED,
+        layout::{SessionKey, TypeLayout},
+    };
 
     const K: u64 = 0xffff_8000_0000_0000;
     const STATE: u64 = K + 0x10_0000;
@@ -1898,14 +1903,18 @@ mod tests {
         );
         fill(&mut bytes, SEGMENT + 0x100, 16 * 0x20);
         for (index, units, flags) in [
-            (1u64, 2u8, 0x09u8),
-            (3, 2, 0x0d),
-            (5, 1, 0x01),
+            (
+                1u64,
+                2u8,
+                DESCRIPTOR_FLAG_LFH | DESCRIPTOR_FLAG_COMMITTED | 0x0c,
+            ),
+            (3, 2, DESCRIPTOR_FLAG_VS | DESCRIPTOR_FLAG_COMMITTED | 0x0c),
+            (5, 1, DESCRIPTOR_FLAG_COMMITTED | 0x0c),
             (6, 1, 0x00),
-            (7, 1, 0x01),
+            (7, 1, DESCRIPTOR_FLAG_COMMITTED | 0x0c),
         ] {
             let descriptor = SEGMENT + 0x100 + index * 0x20;
-            if flags & 1 != 0 {
+            if flags & DESCRIPTOR_FLAG_COMMITTED != 0 {
                 put_u32(
                     &mut bytes,
                     descriptor,
