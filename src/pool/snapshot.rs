@@ -5,8 +5,9 @@ use thiserror::Error;
 use super::decode::{
     DESCRIPTOR_FLAG_LFH, DESCRIPTOR_FLAG_VS, PAGE_SIZE, PoolHeaderLayout, adjust_page_end_header,
     big_page_probe, decode_descriptor_at, decode_large_allocation, decode_lfh_offsets,
-    decode_pool_header, decode_rb_root, decode_vs_sizes, lfh_bitmap_state, read_u16, read_u32,
-    read_u64, valid_descriptor_tree_signature, valid_page_segment_signature, valid_vs_signature,
+    decode_pool_header, decode_rb_root, decode_slist_header_next, decode_vs_sizes,
+    lfh_bitmap_state, read_u16, read_u32, read_u64, valid_descriptor_tree_signature,
+    valid_page_segment_signature, valid_vs_signature,
 };
 use super::{
     HeapIdentity, PoolBackend, PoolKind, PoolSpan, PoolState,
@@ -298,7 +299,9 @@ fn walk_slist_nodes(
         }
     };
     let depth = read_u16(&bytes, alignment_offset).map_or(0, usize::from);
-    let mut entry = read_u64(&bytes, region_offset).unwrap_or(0) & !0xf;
+    let mut entry = read_u64(&bytes, region_offset)
+        .map(decode_slist_header_next)
+        .unwrap_or(0);
     let expected = depth.min(limit);
     while entry != 0 && nodes.len() < expected {
         check_interrupted(memory)?;
@@ -1862,6 +1865,10 @@ mod tests {
         put(bytes, address, &value.to_le_bytes());
     }
 
+    fn packed_slist_next(entry: u64) -> u64 {
+        (entry << 4) | 3
+    }
+
     fn pool_header(bytes: &mut BTreeMap<u64, u8>, address: u64, tag: &[u8; 4]) {
         fill(bytes, address, 0x10);
         put(bytes, address, &[1, 0, 4, 1]);
@@ -1958,7 +1965,11 @@ mod tests {
         put_u64(&mut bytes, free_chunk + 16, 0);
         let delay_head = vs_context + 0x10;
         put_u16(&mut bytes, delay_head, 1);
-        put_u64(&mut bytes, delay_head + 8, cached_chunk + 0x20);
+        put_u64(
+            &mut bytes,
+            delay_head + 8,
+            packed_slist_next(cached_chunk + 0x20),
+        );
         put_u64(&mut bytes, cached_chunk + 0x20, 0);
 
         fill(&mut bytes, DYNAMIC_LOOKASIDE, 0x80);
@@ -1972,7 +1983,11 @@ mod tests {
         );
         let lookaside_head = DYNAMIC_LOOKASIDE + 0x40;
         put_u16(&mut bytes, lookaside_head, 1);
-        put_u64(&mut bytes, lookaside_head + 8, lookaside_chunk + 0x20);
+        put_u64(
+            &mut bytes,
+            lookaside_head + 8,
+            packed_slist_next(lookaside_chunk + 0x20),
+        );
         put_u64(&mut bytes, lookaside_chunk + 0x20, 0);
         put_u32(&mut bytes, lookaside_head + 0x30, 0x40);
 

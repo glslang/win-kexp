@@ -193,6 +193,12 @@ pub(crate) fn decode_rb_root(root: u64, tree_address: u64, encoded: bool) -> Opt
     (pointer == 0 || is_kernel_pointer(pointer)).then_some(pointer)
 }
 
+/// Decode the 60-bit `NextEntry` field packed above the low four reserved bits
+/// in the x64 and ARM64 `_SLIST_HEADER.Region` word.
+pub(crate) fn decode_slist_header_next(region: u64) -> u64 {
+    (region as i64 >> 4) as u64
+}
+
 /// Decode the two packed words in `_HEAP_LARGE_ALLOC_DATA`.
 ///
 /// `VirtualAddress` shares its low 16 bits with `UnusedBytes`, while
@@ -409,6 +415,11 @@ mod tests {
         assert_eq!(decode_rb_root(root, tree, false), Some(root));
         assert_eq!(decode_rb_root(root ^ tree, tree, true), Some(root));
         assert_eq!(decode_rb_root(tree, tree, true), Some(0));
+        let slist_entry = 0xffff_8000_0012_3fe0;
+        assert_eq!(
+            decode_slist_header_next((slist_entry << 4) | 3),
+            slist_entry
+        );
         assert_eq!(
             decode_large_allocation(root | 0x1234, (0x2345u64 << 12) | 0xabc),
             Some((root, 0x2345))
