@@ -744,10 +744,6 @@ fn discover_segment_context(
         .ok_or_else(|| SnapshotError::InvalidData {
             detail: "descriptor metadata size overflow".into(),
         })?;
-    let heap_globals = *layout
-        .globals
-        .get("RtlpHpHeapGlobals")
-        .ok_or_else(|| missing_layout("RtlpHpHeapGlobals"))?;
     let mut entry = scalar(memory, list_head, 8)? & !0xf;
     let mut seen = HashSet::new();
     while entry != 0 && entry != list_head && seen.len() < traversal_limit {
@@ -775,8 +771,7 @@ fn discover_segment_context(
         let signature = read_u64(&segment_header, signature_offset)
             .or_else(|| read_u32(&segment_header, signature_offset).map(u64::from))
             .unwrap_or(0);
-        if !valid_page_segment_signature(signature, segment_address, context_address, heap_globals)
-        {
+        if !valid_page_segment_signature(signature, segment_address, context_address, heap_key) {
             discovery.diagnostics.push(format!(
                 "rejecting page segment {segment_address:#x} with invalid signature {signature:#x}"
             ));
@@ -1899,7 +1894,7 @@ mod tests {
         put_u64(
             &mut bytes,
             SEGMENT + 0x20,
-            SEGMENT ^ context ^ GLOBALS ^ super::super::decode::PAGE_SEGMENT_SIGNATURE,
+            SEGMENT ^ context ^ heap_key ^ super::super::decode::PAGE_SEGMENT_SIGNATURE,
         );
         fill(&mut bytes, SEGMENT + 0x100, 16 * 0x20);
         for (index, units, flags) in [
