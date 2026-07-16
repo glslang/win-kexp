@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # write is required so /code-review --comment can publish inline PR feedback
       pull-requests: write
       issues: read
       id-token: write
