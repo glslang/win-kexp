@@ -4,6 +4,9 @@ pub(crate) const PAGE_SIZE: u64 = 0x1000;
 pub(crate) const VS_SIGNATURE: u16 = 0x2bed;
 pub(crate) const PAGE_SEGMENT_SIGNATURE: u64 = 0xa2e6_4ead_a2e6_4ead;
 pub(crate) const DESCRIPTOR_TREE_SIGNATURE: u32 = 0xccdd_ccdd;
+pub(crate) const DESCRIPTOR_FLAG_LFH: u8 = 0x01;
+pub(crate) const DESCRIPTOR_FLAG_COMMITTED: u8 = 0x02;
+pub(crate) const DESCRIPTOR_FLAG_VS: u8 = 0x20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Descriptor {
@@ -66,7 +69,7 @@ pub(crate) fn decode_descriptor(word: u32) -> Option<Descriptor> {
     (unit_size != 0).then_some(Descriptor {
         unit_size,
         flags,
-        committed: flags & 1 != 0,
+        committed: flags & DESCRIPTOR_FLAG_COMMITTED != 0,
     })
 }
 
@@ -278,22 +281,25 @@ mod tests {
     fn test_pool_decoder_bounds_and_shifted_offsets() {
         assert_eq!(read_u32(&[0, 1, 2, 3, 4], 1), Some(0x0403_0201));
         assert_eq!(read_u64(&[0; 7], 0), None);
-        assert_eq!(decode_descriptor(0x0100_0020).unwrap().unit_size, 0x20);
+        let committed = decode_descriptor(0x0200_0020).unwrap();
+        assert_eq!(committed.unit_size, 0x20);
+        assert!(committed.committed);
+        assert!(!decode_descriptor(0x0100_0020).unwrap().committed);
         assert_eq!(decode_descriptor(0), None);
         let mut descriptor = [0u8; 12];
         descriptor[7] = 0x20;
-        descriptor[3] = 1;
+        descriptor[3] = DESCRIPTOR_FLAG_COMMITTED;
         assert_eq!(
             decode_descriptor_at(&descriptor, 2, 10, 5, 1),
             Some(Descriptor {
                 unit_size: 0x20,
-                flags: 1,
+                flags: DESCRIPTOR_FLAG_COMMITTED,
                 committed: true
             })
         );
         let mut wide_descriptor = [0u8; 16];
         wide_descriptor[5..8].copy_from_slice(&[0x56, 0x34, 0x12]);
-        wide_descriptor[2] = 1;
+        wide_descriptor[2] = DESCRIPTOR_FLAG_COMMITTED;
         assert_eq!(
             decode_descriptor_at(&wide_descriptor, 0, 8, 5, 2)
                 .unwrap()
