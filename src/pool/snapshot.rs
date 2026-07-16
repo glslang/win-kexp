@@ -237,17 +237,26 @@ fn tree_nodes(
         diagnostics.push(format!("cannot resolve {label} root field"));
         return Ok(Vec::new());
     };
-    let encoded = match scalar(memory, tree_address + root_offset as u64, 8) {
+    let root_value = match scalar(memory, tree_address + root_offset as u64, 8) {
         Ok(value) => value,
         Err(error) => {
             diagnostics.push(format!("cannot read {label} root: {error}"));
             return Ok(Vec::new());
         }
     };
-    let Some(root) = decode_rb_root(encoded, tree_address) else {
-        diagnostics.push(format!(
-            "rejecting corrupt encoded {label} root {encoded:#x}"
-        ));
+    let encoded = if let Ok(encoded_offset) = layout.field("_RTL_RB_TREE", "Encoded") {
+        match scalar(memory, tree_address + encoded_offset as u64, 1) {
+            Ok(value) => value & 1 != 0,
+            Err(error) => {
+                diagnostics.push(format!("cannot read {label} encoded flag: {error}"));
+                return Ok(Vec::new());
+            }
+        }
+    } else {
+        false
+    };
+    let Some(root) = decode_rb_root(root_value, tree_address, encoded) else {
+        diagnostics.push(format!("rejecting corrupt {label} root {root_value:#x}"));
         return Ok(Vec::new());
     };
     let Ok(left) = layout.field("_RTL_BALANCED_NODE", "Left") else {
@@ -1766,7 +1775,7 @@ mod tests {
         );
         types.insert(
             "_RTL_RB_TREE",
-            type_layout(0x10, &[("Root", 0), ("Min", 8)]),
+            type_layout(0x10, &[("Root", 0), ("Encoded", 8)]),
         );
         types.insert(
             "_RTL_BALANCED_NODE",
@@ -1970,7 +1979,8 @@ mod tests {
         pool_header(&mut bytes, SEGMENT + 0x7000, b"SPRS");
 
         let large_tree = HEAP + 0x400;
-        put_u64(&mut bytes, large_tree, (LARGE_META ^ large_tree) | 1);
+        put_u64(&mut bytes, large_tree, LARGE_META ^ large_tree);
+        put(&mut bytes, large_tree + 8, &[1]);
         fill(&mut bytes, LARGE_META, 0x28);
         put_u64(&mut bytes, LARGE_META + 0x18, LARGE_VA | 0x1800);
         put_u64(&mut bytes, LARGE_META + 0x20, (2u64 << 12) | 0x5a5);

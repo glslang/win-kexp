@@ -185,12 +185,8 @@ pub(crate) fn decode_pool_header(
     (header.block_size != 0 && header.pool_type <= 0x7f).then_some(header)
 }
 
-pub(crate) fn decode_rb_root(encoded: u64, tree_address: u64) -> Option<u64> {
-    let pointer = if encoded & 1 != 0 {
-        (encoded & !1) ^ tree_address
-    } else {
-        encoded
-    } & !0xf;
+pub(crate) fn decode_rb_root(root: u64, tree_address: u64, encoded: bool) -> Option<u64> {
+    let pointer = if encoded { root ^ tree_address } else { root } & !0xf;
     (pointer == 0 || is_kernel_pointer(pointer)).then_some(pointer)
 }
 
@@ -400,7 +396,9 @@ mod tests {
         assert_eq!(adjust_page_end_header(0x2000, 0x10), Some(0x2000));
         let tree = 0xffff_8000_0001_0000;
         let root = 0xffff_8000_0002_0000;
-        assert_eq!(decode_rb_root((root ^ tree) | 1, tree), Some(root));
+        assert_eq!(decode_rb_root(root, tree, false), Some(root));
+        assert_eq!(decode_rb_root(root ^ tree, tree, true), Some(root));
+        assert_eq!(decode_rb_root(tree, tree, true), Some(0));
         assert_eq!(
             decode_large_allocation(root | 0x1234, (0x2345u64 << 12) | 0xabc),
             Some((root, 0x2345))
