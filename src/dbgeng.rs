@@ -674,9 +674,16 @@ impl DebugEngine {
             let _ = self.client.SetOutputCallbacks(None);
         }
 
+        let interrupted = fired.load(Ordering::SeqCst);
+        if interrupted {
+            // The watchdog may have raised `SetInterrupt` right as `Execute` finished (or fired
+            // once more before we joined it), leaving a Ctrl+Break *pending* that would abort the
+            // next command on its first interrupt poll. Drain it now via `GetInterrupt` so
+            // subsequent calls stay usable — the whole point of a bounded command.
+            let _ = self.interrupted();
+        }
         // A watchdog-forced interrupt makes `Execute` fail (or return partial output); that is
         // expected, so only propagate a genuine (non-interrupted) error.
-        let interrupted = fired.load(Ordering::SeqCst);
         if !interrupted {
             result.map_err(DbgEngError::CommandFailed)?;
         }
