@@ -604,6 +604,96 @@ impl DebugEngine {
         Ok(String::from_utf8_lossy(&output_buffer).to_string())
     }
 
+    /// Like [`Self::execute_command`], but **bounded**: a watchdog thread `SetInterrupt`s the
+    /// engine after `timeout_ms` so a runaway command — most importantly a broad `s` memory
+    /// search — aborts and frees the single engine thread instead of pinning it (every later
+    /// call would otherwise block behind it). `SetInterrupt` is the one DbgEng call documented
+    /// as safe from another thread (see [`InterruptHandle`]); a long command polls for it
+    /// exactly as WinDbg's Ctrl+Break does.
+    ///
+    /// Returns whatever output was captured up to the interrupt; when the watchdog fires it
+    /// appends a short note and does **not** surface the resulting `Execute` error (the abort
+    /// is expected). `timeout_ms == 0` disables the watchdog (equivalent to `execute_command`).
+    pub fn execute_command_bounded(
+        &self,
+        command: &str,
+        timeout_ms: u32,
+    ) -> Result<String, DbgEngError> {
+        let cmd_c = CString::new(command).map_err(|_| DbgEngError::InvalidCommand)?;
+        let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
+
+        let mut output_buffer = Vec::<u8>::with_capacity(4096);
+        let output_callbacks = OutputCallbacks::new(&mut output_buffer);
+        let output_interface: IDebugOutputCallbacks = output_callbacks.into();
+        unsafe {
+            self.client
+                .SetOutputCallbacks(Some(&output_interface))
+                .map_err(DbgEngError::CommandFailed)?;
+        }
+
+        // Arm a watchdog that Ctrl+Breaks the engine after `timeout_ms` so a long `Execute`
+        // returns instead of hanging the engine thread. Mirrors `wait_for_event_bounded`.
+        let done = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
+        let watchdog = (timeout_ms > 0).then(|| {
+            let done_watch = Arc::clone(&done);
+            let fired_watch = Arc::clone(&fired);
+            let handle = InterruptHandle(self.control.as_raw());
+            let deadline = Duration::from_millis(timeout_ms as u64);
+            thread::spawn(move || {
+                let handle = handle; // move the whole (Send) handle, not just the raw field
+                let start = Instant::now();
+                loop {
+                    if done_watch.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if start.elapsed() >= deadline
+                        && let Some(ctl) = unsafe { IDebugControl4::from_raw_borrowed(&handle.0) }
+                    {
+                        // Repeat in case a busy command swallows one interrupt.
+                        let _ = unsafe { ctl.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) };
+                        fired_watch.store(true, Ordering::SeqCst);
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+            })
+        });
+
+        let result = unsafe {
+            self.control
+                .Execute(DEBUG_OUTCTL_THIS_CLIENT, cmd, DEBUG_EXECUTE_ECHO)
+        };
+
+        done.store(true, Ordering::SeqCst);
+        if let Some(w) = watchdog {
+            let _ = w.join();
+        }
+
+        // Always detach the callbacks before `output_interface`/`output_buffer` drop.
+        unsafe {
+            let _ = self.client.SetOutputCallbacks(None);
+        }
+
+        // A watchdog-forced interrupt makes `Execute` fail (or return partial output); that is
+        // expected, so only propagate a genuine (non-interrupted) error.
+        let interrupted = fired.load(Ordering::SeqCst);
+        if !interrupted {
+            result.map_err(DbgEngError::CommandFailed)?;
+        }
+
+        let mut out = String::from_utf8_lossy(&output_buffer).to_string();
+        if interrupted {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "[win-kexp] command interrupted after {timeout_ms} ms (Ctrl+Break) — it was \
+                 taking too long. Scope it (e.g. a bounded memory range) and retry."
+            ));
+        }
+        Ok(out)
+    }
+
     /// Waits for the target to break
     pub fn wait_for_event(&self, timeout_ms: u32) -> Result<(), DbgEngError> {
         let result = unsafe { self.control.WaitForEvent(0, timeout_ms) };
