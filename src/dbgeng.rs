@@ -1152,6 +1152,18 @@ impl Drop for DebugEngine {
         // Only tear down sessions we opened ourselves. Wrapping a borrowed WinDbg
         // client must not end the host's active session when the wrapper drops.
         if !self.owns_session {
+            // That session outlives this wrapper, so it may still complete a deferred spawn
+            // or dial and read the parked input buffers — and nothing will ever tell us when
+            // that is over. Leak them rather than free memory the host's engine still holds a
+            // pointer to; `end_session` is the only place a release can be justified, and a
+            // borrowed client never reaches it. Costs nothing unless a `*_begin` opener was
+            // actually used on a borrowed client.
+            std::mem::forget(std::mem::take(
+                &mut *self
+                    .deferred_inputs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            ));
             return;
         }
         // Don't leave a live kernel frozen at a break if we're torn down without an
@@ -1222,14 +1234,24 @@ enum TargetInput {
 /// The type is what makes the ordering unforgeable: the guard cannot exist unless the side
 /// effect returned `Ok`.
 ///
-/// **Dropping the guard without calling [`wait`](Self::wait) is safe but does not cancel
-/// anything.** The engine has already been told to spawn or connect, and it completes that
-/// at the next `WaitForEvent` from any source — `execute_and_wait` and `run_to_address`
-/// included — reading the input buffers then. Those buffers live in the [`DebugEngine`]
-/// precisely so this is sound whether or not the guard is waited on; dropping merely
-/// forfeits the initial-break wait, leaving the target to materialize later. Drop does not
-/// block: driving the wait from there could hang without bound on a kernel attach whose
-/// link is still coming up.
+/// **Dropping the guard without calling [`wait`](Self::wait) is safe and cancels nothing.**
+/// The engine has already been told to spawn or connect, and it completes that at the next
+/// `WaitForEvent` from any source — `execute_and_wait` and `run_to_address` included —
+/// reading the input buffers then. Those buffers live in the [`DebugEngine`] precisely so
+/// this is sound whether or not the guard is waited on; dropping merely forfeits the
+/// initial-break wait, leaving the target to materialize later.
+///
+/// There is deliberately no `Drop` impl. Driving the wait from one could hang without bound
+/// on a kernel attach whose link is still coming up (`SetInterrupt` cannot cancel that wait),
+/// and clearing that attach's `DEBUG_ENGOPT_INITIAL_BREAK` would half-cancel a request that
+/// is still pending — the target would connect and keep *running* instead of stopping, which
+/// is the one thing the attach asked for.
+///
+/// The cost, for an abandoned **kernel** guard only: `DEBUG_ENGOPT_INITIAL_BREAK` stays armed
+/// for the session, since only [`Self::wait`] clears it. The pending attach still breaks in
+/// as asked, but a later `go`/step can immediately re-break until something clears the
+/// option. Abandoning a kernel attach is a poor way to change your mind; prefer `wait()` and
+/// then `end_session`.
 #[must_use = "the target was created but never waited for; call `wait()` to reach the initial break"]
 pub struct PendingTarget<'a> {
     engine: &'a DebugEngine,
@@ -1246,20 +1268,6 @@ impl<'a> PendingTarget<'a> {
         match self.kind {
             WaitKind::Live => self.engine.wait_for_event(LIVE_WAIT_MS),
             WaitKind::KernelBreakIn => self.engine.wait_for_kernel_break_in(),
-        }
-    }
-}
-
-impl Drop for PendingTarget<'_> {
-    fn drop(&mut self) {
-        // The input buffers are the engine's, so there is nothing here to free early and no
-        // wait to force. Undo the one piece of state `wait` would have: a kernel attach set
-        // `DEBUG_ENGOPT_INITIAL_BREAK`, which `wait_for_kernel_break_in` clears once the
-        // target stops. Abandoned, it would stay set for the session and re-break every
-        // later `go`. `RemoveEngineOptions` returns immediately, so this cannot block, and it
-        // is idempotent — the `wait()` path having cleared it already is fine.
-        if matches!(self.kind, WaitKind::KernelBreakIn) {
-            self.engine.clear_initial_break();
         }
     }
 }
