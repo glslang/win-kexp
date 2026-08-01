@@ -88,22 +88,25 @@ fn main() {
     let _ = victim.wait();
 
     // --- 4. guard abandoned without wait() ----------------------------------------
-    // The hazard the split introduced: `CreateProcessWide` is deferred, so if the guard
-    // released the command-line buffer on drop the engine would read freed memory at the
-    // *next* `WaitForEvent` — which any later call can trigger. `Drop` therefore performs
-    // the wait. Expect the target to be at the loader breakpoint anyway, and the follow-up
-    // commands (which pump the engine) to behave normally rather than crash.
-    println!("\n=== 4. drop the guard without calling wait() ===");
+    // The exact sequence that would be a use-after-free if the command-line buffer lived in
+    // the guard: abandon the guard *first*, then pump the engine. `CreateProcessWide` is
+    // deferred, so the spawn — and the read of the command line — happens in the
+    // `wait_for_event` below, strictly after the guard is gone. The engine owns the buffer,
+    // so it is still valid there and the launch lands normally.
+    println!("\n=== 4. drop the guard, THEN pump the engine ===");
     match e.launch_process_begin(LAUNCH_CMD) {
         Ok(pending) => {
-            drop(pending); // completes the wait; buffer stays alive across it
-            println!("guard dropped without wait() — engine should still be sane");
+            drop(pending);
+            println!("guard dropped without wait(); nothing has spawned yet");
         }
         Err(err) => println!("begin ERR: {err}"),
     }
+    // The deferred spawn happens here, reading a buffer whose guard died above.
+    match e.wait_for_event(30_000) {
+        Ok(()) => println!("post-drop wait OK — deferred spawn completed"),
+        Err(err) => println!("post-drop wait ERR: {err}"),
+    }
     show(&e, "|");
-    // Pump the engine again: this is where a freed buffer would surface as a crash or a
-    // bogus spawn if `Drop` had not completed the deferred work.
     show(&e, "r rip");
     let _ = e.end_session();
 

@@ -1,6 +1,6 @@
 use std::ffi::CString;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -153,6 +153,18 @@ pub struct DebugEngine {
     /// responsible for ending it on `Drop`. False when wrapping a borrowed WinDbg
     /// client, so going out of scope can't stop the host's active session.
     owns_session: bool,
+    /// Input buffers handed to DbgEng by a *deferred* call — `CreateProcessWide`, which
+    /// spawns at the next `WaitForEvent` and reads the command line then, and the kernel
+    /// connection string, whose link is likewise established during the wait.
+    ///
+    /// They live here, not in [`PendingTarget`], because the engine is what DbgEng reads
+    /// them on behalf of and the guard's lifetime is the caller's to end. A guard that
+    /// owned them would be a use-after-free the moment it was dropped without waiting — and
+    /// the alternative, waiting from `Drop`, can block without bound on a kernel attach
+    /// whose link is still coming up (`SetInterrupt` cannot cancel that wait; see
+    /// [`DebugEngine::wait_for_event_bounded`]). Owning them here costs one small
+    /// allocation per open, released when the session ends.
+    deferred_inputs: Mutex<Vec<TargetInput>>,
 }
 
 impl Default for DebugEngine {
@@ -226,6 +238,7 @@ impl DebugEngine {
             // Default to "borrowed": constructors that wrap an existing WinDbg client
             // go through here, and only `new()` (which calls `DebugCreate`) sets this.
             owns_session: false,
+            deferred_inputs: Mutex::new(Vec::new()),
         }
     }
 
@@ -255,6 +268,7 @@ impl DebugEngine {
             dataspaces,
             symbols,
             owns_session: false,
+            deferred_inputs: Mutex::new(Vec::new()),
         })
     }
 
@@ -507,11 +521,7 @@ impl DebugEngine {
         // A live kernel needs an INFINITE WaitForEvent (a finite timeout returns
         // E_NOTIMPL); INITIAL_BREAK makes it stop at the first event. `wait()` bounds it
         // so an unresponsive target can't hang the engine thread forever.
-        Ok(PendingTarget::new(
-            self,
-            WaitKind::KernelBreakIn,
-            TargetInput::None,
-        ))
+        Ok(PendingTarget::new(self, WaitKind::KernelBreakIn))
     }
 
     /// Attaches to a kernel over a connection string (e.g. `net:port=50000,key=...`)
@@ -550,11 +560,8 @@ impl DebugEngine {
         // above makes the engine stop once the KDNET link establishes, and `wait()` bounds
         // it so an unreachable target can't hang the engine thread forever. The connection
         // string rides along because that link is only established during the wait.
-        Ok(PendingTarget::new(
-            self,
-            WaitKind::KernelBreakIn,
-            TargetInput::Ansi(connection),
-        ))
+        self.retain_deferred_input(TargetInput::Ansi(connection));
+        Ok(PendingTarget::new(self, WaitKind::KernelBreakIn))
     }
 
     /// Shared tail of the kernel attach paths: wait (bounded) for the INITIAL_BREAK stop,
@@ -1045,11 +1052,8 @@ impl DebugEngine {
         // that point — so `wide` moves into the guard, which owns it until the wait
         // returns. With the initial-breakpoint filter enabled above, that wait stops at
         // the loader breakpoint.
-        Ok(PendingTarget::new(
-            self,
-            WaitKind::Live,
-            TargetInput::Wide(wide),
-        ))
+        self.retain_deferred_input(TargetInput::Wide(wide));
+        Ok(PendingTarget::new(self, WaitKind::Live))
     }
 
     /// Attaches to an existing user-mode process by PID and waits for the break-in,
@@ -1070,7 +1074,7 @@ impl DebugEngine {
         unsafe { self.client.AttachProcess(0, pid, DEBUG_ATTACH_DEFAULT) }
             .map_err(DbgEngError::OperationFailed)?;
         // The attach completes during `WaitForEvent`, which breaks the target in.
-        Ok(PendingTarget::new(self, WaitKind::Live, TargetInput::None))
+        Ok(PendingTarget::new(self, WaitKind::Live))
     }
 
     /// Opens a crash dump (`.dmp`) or a Time Travel Debugging trace (`.run`).
@@ -1089,16 +1093,44 @@ impl DebugEngine {
         self.open_dump(path)
     }
 
+    /// Parks an input buffer for the life of the session, so DbgEng can still read it when
+    /// it completes a deferred spawn or dial. See [`DebugEngine::deferred_inputs`].
+    fn retain_deferred_input(&self, input: TargetInput) {
+        self.deferred_inputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(input);
+    }
+
+    /// Releases the parked input buffers. Only sound once the session is over: until then
+    /// the engine may still owe a deferred spawn or dial that reads them.
+    fn release_deferred_inputs(&self) {
+        self.deferred_inputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
     /// Ends the current debug session without destroying the client, so it can be
     /// reused for another target.
     pub fn end_session(&self) -> Result<(), DbgEngError> {
         // A live kernel left halted (at a break) and detached *passively* stays FROZEN —
         // one CPU halted, the rest spinning — because a passive detach never tells the
         // target to run. Resume it and actively detach instead, leaving it running.
-        if self.is_live_kernel() {
-            return self.resume_and_detach_live_kernel();
+        let ended = if self.is_live_kernel() {
+            self.resume_and_detach_live_kernel()
+        } else {
+            unsafe { self.client.EndSession(DEBUG_END_PASSIVE) }
+                .map_err(DbgEngError::OperationFailed)
+        };
+        // Released only once the session is *confirmed* torn down: an outstanding deferred
+        // spawn or dial dies with it, so nothing can read these buffers afterwards. A failed
+        // teardown may leave the session live and still owing that read, so the buffers stay
+        // — retaining a few bytes for the life of the engine beats a use-after-free.
+        if ended.is_ok() {
+            self.release_deferred_inputs();
         }
-        unsafe { self.client.EndSession(DEBUG_END_PASSIVE) }.map_err(DbgEngError::OperationFailed)
+        ended
     }
 
     /// Detaches from a live kernel leaving it **running**, not frozen at the last break.
@@ -1159,7 +1191,6 @@ enum WaitKind {
 // opener and hand DbgEng a dangling pointer during the wait — the exact bug this guards.
 #[allow(dead_code)]
 enum TargetInput {
-    None,
     Wide(Vec<u16>),
     Ansi(CString),
 }
@@ -1189,50 +1220,29 @@ enum TargetInput {
 /// ```
 ///
 /// The type is what makes the ordering unforgeable: the guard cannot exist unless the side
-/// effect returned `Ok`, and it owns the input buffers DbgEng reads *during* the wait, so
-/// they cannot be dropped early.
+/// effect returned `Ok`.
 ///
-/// **Dropping without calling [`wait`](Self::wait) still performs the wait**, best-effort,
-/// and can therefore block for up to the relevant timeout. That is deliberate, and it is a
-/// soundness requirement rather than a convenience: the engine has already been told to
-/// spawn or connect, and it reads `_input` at the *next* `WaitForEvent` — whichever call
-/// makes it, `execute_and_wait` and `run_to_address` included. A guard that simply released
-/// the buffer on drop would hand DbgEng a dangling pointer from ordinary safe code, and
-/// `#[must_use]` is a lint that cannot prevent it. Waiting here also lets the kernel paths
-/// clear `DEBUG_ENGOPT_INITIAL_BREAK`, which otherwise stays set for the session. The cost
-/// is not new — the fused openers always paid this wait.
+/// **Dropping the guard without calling [`wait`](Self::wait) is safe but does not cancel
+/// anything.** The engine has already been told to spawn or connect, and it completes that
+/// at the next `WaitForEvent` from any source — `execute_and_wait` and `run_to_address`
+/// included — reading the input buffers then. Those buffers live in the [`DebugEngine`]
+/// precisely so this is sound whether or not the guard is waited on; dropping merely
+/// forfeits the initial-break wait, leaving the target to materialize later. Drop does not
+/// block: driving the wait from there could hang without bound on a kernel attach whose
+/// link is still coming up.
 #[must_use = "the target was created but never waited for; call `wait()` to reach the initial break"]
 pub struct PendingTarget<'a> {
     engine: &'a DebugEngine,
     kind: WaitKind,
-    _input: TargetInput,
-    waited: bool,
 }
 
 impl<'a> PendingTarget<'a> {
-    fn new(engine: &'a DebugEngine, kind: WaitKind, input: TargetInput) -> Self {
-        Self {
-            engine,
-            kind,
-            _input: input,
-            waited: false,
-        }
+    fn new(engine: &'a DebugEngine, kind: WaitKind) -> Self {
+        Self { engine, kind }
     }
 
     /// Waits for the target's initial break, completing the open.
-    pub fn wait(mut self) -> Result<(), DbgEngError> {
-        // Mark first: `self` still drops at the end of this function, and `Drop` must not
-        // wait a second time.
-        self.waited = true;
-        self.wait_inner()
-    }
-
-    /// The wait itself, by reference so both [`Self::wait`] and `Drop` can drive it.
-    ///
-    /// Takes `&self`, which is what keeps `_input` alive for the call in either path: fields
-    /// are dropped *after* `Drop::drop` returns, so the buffers DbgEng reads are still valid
-    /// even on the drop-without-wait path.
-    fn wait_inner(&self) -> Result<(), DbgEngError> {
+    pub fn wait(self) -> Result<(), DbgEngError> {
         match self.kind {
             WaitKind::Live => self.engine.wait_for_event(LIVE_WAIT_MS),
             WaitKind::KernelBreakIn => self.engine.wait_for_kernel_break_in(),
@@ -1242,13 +1252,15 @@ impl<'a> PendingTarget<'a> {
 
 impl Drop for PendingTarget<'_> {
     fn drop(&mut self) {
-        if self.waited {
-            return;
+        // The input buffers are the engine's, so there is nothing here to free early and no
+        // wait to force. Undo the one piece of state `wait` would have: a kernel attach set
+        // `DEBUG_ENGOPT_INITIAL_BREAK`, which `wait_for_kernel_break_in` clears once the
+        // target stops. Abandoned, it would stay set for the session and re-break every
+        // later `go`. `RemoveEngineOptions` returns immediately, so this cannot block, and it
+        // is idempotent — the `wait()` path having cleared it already is fine.
+        if matches!(self.kind, WaitKind::KernelBreakIn) {
+            self.engine.clear_initial_break();
         }
-        // Abandoned without a wait. See the type's docs: releasing `_input` while the engine
-        // still owes a deferred spawn/dial is a use-after-free waiting for the next
-        // `WaitForEvent`, so drive it here and discard the outcome — the caller threw it away.
-        let _ = self.wait_inner();
     }
 }
 
