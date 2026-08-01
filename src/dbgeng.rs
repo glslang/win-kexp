@@ -1432,6 +1432,30 @@ mod tests {
             .unwrap_or_else(|_| panic!("no value in `?` output for {expr}: {out:?}"))
     }
 
+    /// Runs a command and reports whether it actually *took effect*, by having it stamp a
+    /// sentinel into `$t1` and reading it back.
+    ///
+    /// Substring-matching the captured output cannot answer this. `execute_command` passes
+    /// `DEBUG_EXECUTE_ECHO`, so DbgEng echoes the command text into the output buffer before
+    /// running it, and [`OutputCallbacks`] appends every chunk unfiltered — a check like
+    /// `output.contains("version")` therefore matches the echo alone and passes even when the
+    /// command was aborted immediately after being echoed, which is precisely the failure
+    /// these tests exist to catch.
+    #[cfg(not(miri))]
+    fn command_took_effect(e: &DebugEngine, sentinel: u64) -> bool {
+        // Clear first, so a value left by an earlier probe cannot pass for a fresh one.
+        e.execute_command("r $t1 = 0").expect("clearing $t1 failed");
+        if read_pseudo_register(e, "$t1") != 0 {
+            panic!("$t1 did not clear; the probe itself is unreliable here");
+        }
+        if e.execute_command(&format!("r $t1 = 0x{sentinel:x}"))
+            .is_err()
+        {
+            return false;
+        }
+        read_pseudo_register(e, "$t1") == sentinel
+    }
+
     // The `#[ignore]`d tests below each drive a real debuggee, and MUST be run with
     // `--test-threads=1`. dbgeng.dll holds one debuggee session per *process*, so two of them
     // running concurrently in the same test binary fight over the same session and fail in
@@ -1504,21 +1528,16 @@ mod tests {
         let e = DebugEngine::new();
         e.launch_process("cmd.exe /c exit").expect("launch failed");
 
-        // Baseline: what a healthy `version` looks like.
-        let baseline = e.execute_command("version").expect("baseline failed");
-        assert!(baseline.to_lowercase().contains("version"));
+        // Baseline: the probe reports a healthy engine before anything is staged.
+        assert!(
+            command_took_effect(&e, 0xBA5E),
+            "baseline command did not take effect; the probe is broken, not the engine"
+        );
 
         // Undrained: stage the race, then run a command.
         unsafe { e.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }.expect("SetInterrupt failed");
-        let undrained = e.execute_command("version");
-        match &undrained {
-            Ok(out) => println!(
-                "undrained next command: Ok, {} bytes, looks normal: {}",
-                out.len(),
-                out.to_lowercase().contains("version")
-            ),
-            Err(err) => println!("undrained next command: Err({err})"),
-        }
+        let undrained = command_took_effect(&e, 0xA11);
+        println!("undrained next command took effect: {undrained}");
 
         // Drained: stage the same race, consume it, then run the same command.
         //
@@ -1534,40 +1553,34 @@ mod tests {
             "staged interrupt was not pending — nothing was drained, so the case below is not \
              the drained one it claims to be"
         );
-        let drained = e.execute_command("version");
-        match &drained {
-            Ok(out) => println!(
-                "drained   next command: Ok, {} bytes, looks normal: {}",
-                out.len(),
-                out.to_lowercase().contains("version")
-            ),
-            Err(err) => println!("drained   next command: Err({err})"),
-        }
+        let drained = command_took_effect(&e, 0xB22);
+        println!("drained   next command took effect: {drained}");
 
         // A short command like `version` may simply never poll for the interrupt. The case
         // that matters is a *long* next command, which does — if a stale Ctrl+Break aborts
         // that, the drain is load-bearing; if not, it is a no-op.
-        let long = ".for (r $t0 = 0; @$t0 < 0x40000; r $t0 = @$t0 + 1) { }";
+        // Whether it *finished* is read from `$t0`, not inferred from the clock.
+        const LONG_ITERS: u64 = 0x4_0000;
+        let long = format!(".for (r $t0 = 0; @$t0 < 0x{LONG_ITERS:x}; r $t0 = @$t0 + 1) {{ }}");
+
         let clean_start = Instant::now();
-        let _ = e.execute_command(long).expect("long command failed");
+        e.execute_command(&long).expect("long command failed");
         let clean = clean_start.elapsed();
+        let clean_t0 = read_pseudo_register(&e, "$t0");
 
         unsafe { e.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }.expect("SetInterrupt failed");
         let stale_start = Instant::now();
-        let stale = e.execute_command(long);
+        let stale = e.execute_command(&long);
         let stale_elapsed = stale_start.elapsed();
+        let stale_t0 = read_pseudo_register(&e, "$t0");
+        let stale_result = if stale.is_ok() { "Ok" } else { "Err" };
+        println!("long command, clean:           {clean:?} (t0={clean_t0} of {LONG_ITERS})");
         println!(
-            "long command: clean {:?}, with a stale interrupt pending {:?} ({})",
-            clean,
-            stale_elapsed,
-            match &stale {
-                Ok(_) => "Ok",
-                Err(_) => "Err",
-            }
+            "long command, stale interrupt: {stale_elapsed:?} (t0={stale_t0} of {LONG_ITERS}, {stale_result})"
         );
         println!(
             "  -> stale interrupt {} the long command",
-            if stale_elapsed < clean / 2 {
+            if stale_t0 < LONG_ITERS {
                 "ABORTED"
             } else {
                 "did NOT abort"
@@ -1575,12 +1588,9 @@ mod tests {
         );
         let _ = e.interrupted();
 
-        // Only the drained case is asserted; the undrained one is the measurement.
+        // Only the drained case is asserted; the undrained ones are the measurement.
         assert!(
-            drained
-                .expect("drained command errored")
-                .to_lowercase()
-                .contains("version"),
+            drained,
             "draining should leave the next command fully usable"
         );
 
@@ -1634,12 +1644,13 @@ mod tests {
             "no interruption note despite a loop that stopped short"
         );
 
-        // The command under test. If a stale interrupt survived, this aborts instead.
-        let after = e.execute_command("version").expect("next command errored");
-        println!("--- next command output ---\n{after}\n---");
+        // The command under test. If a stale interrupt survived, this aborts instead — so the
+        // check has to be that it *took effect*, not that its text came back. `Execute` echoes
+        // the command into the output buffer before running it, which makes any substring
+        // check against the command name pass on the echo alone.
         assert!(
-            after.to_lowercase().contains("version"),
-            "next command produced no real output — stale interrupt aborted it"
+            command_took_effect(&e, 0x5A5E),
+            "next command did not take effect — a stale interrupt aborted it"
         );
 
         let _ = e.end_session();
