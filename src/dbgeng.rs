@@ -486,7 +486,18 @@ impl DebugEngine {
     /// Returns an error rather than panicking when the attach fails (e.g. the host
     /// was not booted with local kernel debugging enabled), so callers driving the
     /// engine on a worker thread can surface a clean message instead of unwinding.
+    ///
+    /// Fuses the attach with the break-in wait, so a failure cannot say which half
+    /// failed. Use [`Self::attach_local_kernel_begin`] when that matters.
     pub fn attach_local_kernel(&self) -> Result<(), DbgEngError> {
+        self.attach_local_kernel_begin()?.wait()
+    }
+
+    /// [`Self::attach_local_kernel`] up to — and not including — the break-in wait.
+    ///
+    /// An `Ok` means the engine has claimed the local kernel as its target, so attaching
+    /// again is no longer a clean retry. See [`PendingTarget`].
+    pub fn attach_local_kernel_begin(&self) -> Result<PendingTarget<'_>, DbgEngError> {
         self.request_initial_break()?;
         unsafe {
             self.client
@@ -494,9 +505,13 @@ impl DebugEngine {
                 .map_err(DbgEngError::AttachFailed)?;
         }
         // A live kernel needs an INFINITE WaitForEvent (a finite timeout returns
-        // E_NOTIMPL); INITIAL_BREAK makes it stop at the first event. Bound it so an
-        // unresponsive target can't hang the engine thread forever.
-        self.wait_for_kernel_break_in()
+        // E_NOTIMPL); INITIAL_BREAK makes it stop at the first event. `wait()` bounds it
+        // so an unresponsive target can't hang the engine thread forever.
+        Ok(PendingTarget::new(
+            self,
+            WaitKind::KernelBreakIn,
+            TargetInput::None,
+        ))
     }
 
     /// Attaches to a kernel over a connection string (e.g. `net:port=50000,key=...`)
@@ -504,7 +519,21 @@ impl DebugEngine {
     ///
     /// Returns an error rather than panicking when the connection string is invalid or
     /// the attach fails (e.g. the transport/port is already owned by another debugger).
+    ///
+    /// Fuses the attach with the break-in wait, so a failure cannot say which half
+    /// failed. Use [`Self::attach_kernel_begin`] when that matters.
     pub fn attach_kernel(&self, connection_string: &str) -> Result<(), DbgEngError> {
+        self.attach_kernel_begin(connection_string)?.wait()
+    }
+
+    /// [`Self::attach_kernel`] up to — and not including — the break-in wait.
+    ///
+    /// An `Ok` means the engine has taken the connection, so dialing again is no longer a
+    /// clean retry — it re-dials a link that may already be up. See [`PendingTarget`].
+    pub fn attach_kernel_begin(
+        &self,
+        connection_string: &str,
+    ) -> Result<PendingTarget<'_>, DbgEngError> {
         let connection =
             CString::new(connection_string).map_err(|_| DbgEngError::InvalidCommand)?;
 
@@ -518,9 +547,14 @@ impl DebugEngine {
                 .map_err(DbgEngError::AttachFailed)?;
         }
         // Live kernel: INFINITE wait is mandatory (finite → E_NOTIMPL). INITIAL_BREAK
-        // above makes the engine stop once the KDNET link establishes. Bound it so an
-        // unreachable target can't hang the engine thread forever.
-        self.wait_for_kernel_break_in()
+        // above makes the engine stop once the KDNET link establishes, and `wait()` bounds
+        // it so an unreachable target can't hang the engine thread forever. The connection
+        // string rides along because that link is only established during the wait.
+        Ok(PendingTarget::new(
+            self,
+            WaitKind::KernelBreakIn,
+            TargetInput::Ansi(connection),
+        ))
     }
 
     /// Shared tail of the kernel attach paths: wait (bounded) for the INITIAL_BREAK stop,
@@ -979,7 +1013,22 @@ impl DebugEngine {
 
     /// Launches a new user-mode process under the debugger and waits for it to stop at
     /// its initial breakpoint, leaving a current process/thread ready to inspect.
+    ///
+    /// Fuses the launch with the initial-break wait, so a failure cannot say which half
+    /// failed. Use [`Self::launch_process_begin`] when that matters.
     pub fn launch_process(&self, command_line: &str) -> Result<(), DbgEngError> {
+        self.launch_process_begin(command_line)?.wait()
+    }
+
+    /// [`Self::launch_process`] up to — and not including — the initial-break wait.
+    ///
+    /// An `Ok` means the session is committed even though the process has not started yet:
+    /// `CreateProcessWide` is deferred, so the spawn happens inside the wait, and from the
+    /// caller's side a retry would spawn a second process. See [`PendingTarget`].
+    pub fn launch_process_begin(
+        &self,
+        command_line: &str,
+    ) -> Result<PendingTarget<'_>, DbgEngError> {
         self.enable_initial_break()?;
         let mut wide = to_wide(command_line);
         unsafe {
@@ -992,20 +1041,36 @@ impl DebugEngine {
         .map_err(DbgEngError::OperationFailed)?;
 
         // `CreateProcessWide` is deferred: the engine doesn't actually spawn the process
-        // until the next `WaitForEvent`, and it reads the command-line buffer (`wide`)
-        // at that point — so drive the wait here, while `wide` is still alive. With the
-        // initial-breakpoint filter enabled above, this stops at the loader breakpoint.
-        self.wait_for_event(LIVE_WAIT_MS)
+        // until the next `WaitForEvent`, and it reads the command-line buffer (`wide`) at
+        // that point — so `wide` moves into the guard, which owns it until the wait
+        // returns. With the initial-breakpoint filter enabled above, that wait stops at
+        // the loader breakpoint.
+        Ok(PendingTarget::new(
+            self,
+            WaitKind::Live,
+            TargetInput::Wide(wide),
+        ))
     }
 
     /// Attaches to an existing user-mode process by PID and waits for the break-in,
     /// leaving a current process/thread ready to inspect.
+    ///
+    /// Fuses the attach with the break-in wait, so a failure cannot say which half failed.
+    /// Use [`Self::attach_process_begin`] when that matters.
     pub fn attach_process(&self, pid: u32) -> Result<(), DbgEngError> {
+        self.attach_process_begin(pid)?.wait()
+    }
+
+    /// [`Self::attach_process`] up to — and not including — the break-in wait.
+    ///
+    /// An `Ok` means the debugger is attached to `pid`, so attaching again is no longer a
+    /// clean retry — it attaches to the same process twice. See [`PendingTarget`].
+    pub fn attach_process_begin(&self, pid: u32) -> Result<PendingTarget<'_>, DbgEngError> {
         self.enable_initial_break()?;
         unsafe { self.client.AttachProcess(0, pid, DEBUG_ATTACH_DEFAULT) }
             .map_err(DbgEngError::OperationFailed)?;
         // The attach completes during `WaitForEvent`, which breaks the target in.
-        self.wait_for_event(LIVE_WAIT_MS)
+        Ok(PendingTarget::new(self, WaitKind::Live, TargetInput::None))
     }
 
     /// Opens a crash dump (`.dmp`) or a Time Travel Debugging trace (`.run`).
@@ -1066,6 +1131,90 @@ impl Drop for DebugEngine {
         // Best-effort teardown; ignore errors (e.g. when no session is active).
         unsafe {
             let _ = self.client.EndSession(DEBUG_END_PASSIVE);
+        }
+    }
+}
+
+/// Which initial-break wait completes a [`PendingTarget`].
+#[derive(Clone, Copy)]
+enum WaitKind {
+    /// User-mode launch/attach: a finite `WaitForEvent`.
+    Live,
+    /// Kernel attach: the bounded INFINITE wait plus its INITIAL_BREAK bookkeeping.
+    KernelBreakIn,
+}
+
+/// Input buffers DbgEng may still read *after* the target-creating call has returned,
+/// held so the pointers handed to the engine stay valid across the seam.
+///
+/// `CreateProcessWide` is the documented case: the spawn is deferred until the next
+/// `WaitForEvent`, and the engine reads the command line at that point. A kernel
+/// connection string gets the same treatment, because the link it describes is likewise
+/// only established during the wait — before the split its buffer stayed alive by accident
+/// of scope, and freeing it early here would be a silent regression. Never read by this
+/// crate; held only to own the allocation.
+//
+// The payloads are deliberately never read, so rustc reports them as dead and offers to
+// replace them with `()`. Taking that suggestion would free the buffers at the end of the
+// opener and hand DbgEng a dangling pointer during the wait — the exact bug this guards.
+#[allow(dead_code)]
+enum TargetInput {
+    None,
+    Wide(Vec<u16>),
+    Ansi(CString),
+}
+
+/// A debug target that has been created or claimed, but not yet waited for.
+///
+/// Separates the two halves the openers otherwise fuse: the side effect that creates or
+/// claims a target (`CreateProcessWide` / `AttachProcess` / `AttachKernel`) and the wait
+/// for the resulting initial break. Fused, one `Err` covers both "nothing happened, the
+/// slate is clean" and "the target exists and only the wait failed" — which need opposite
+/// recovery, since re-running the first is correct and re-running the second spawns a
+/// second process, attaches twice, or re-dials a live KD link.
+///
+/// Holding one of these means the side effect *succeeded*. A caller that tracks sessions
+/// can commit that bookkeeping here, before a wait that may still fail or time out:
+///
+/// ```no_run
+/// # use win_kexp::dbgeng::DebugEngine;
+/// # fn commit(_: &str) {}
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let engine = DebugEngine::new();
+/// let pending = engine.launch_process_begin("notepad.exe")?;
+/// commit("session-1"); // the target is ours from here, even if the wait below fails
+/// pending.wait()?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The type is what makes the ordering unforgeable: the guard cannot exist unless the side
+/// effect returned `Ok`, and it owns the input buffers DbgEng reads *during* the wait, so
+/// they cannot be dropped early.
+#[must_use = "the target was created but never waited for; call `wait()` to reach the initial break"]
+pub struct PendingTarget<'a> {
+    engine: &'a DebugEngine,
+    kind: WaitKind,
+    _input: TargetInput,
+}
+
+impl<'a> PendingTarget<'a> {
+    fn new(engine: &'a DebugEngine, kind: WaitKind, input: TargetInput) -> Self {
+        Self {
+            engine,
+            kind,
+            _input: input,
+        }
+    }
+
+    /// Waits for the target's initial break, completing the open.
+    pub fn wait(self) -> Result<(), DbgEngError> {
+        // Read `kind` out of `self` rather than destructuring: `self` — and with it the
+        // `_input` buffers DbgEng reads during the wait — must stay alive until this
+        // returns, which is exactly what binding it by value here guarantees.
+        match self.kind {
+            WaitKind::Live => self.engine.wait_for_event(LIVE_WAIT_MS),
+            WaitKind::KernelBreakIn => self.engine.wait_for_kernel_break_in(),
         }
     }
 }
