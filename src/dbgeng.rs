@@ -164,6 +164,17 @@ pub struct DebugEngine {
     /// whose link is still coming up (`SetInterrupt` cannot cancel that wait; see
     /// [`DebugEngine::wait_for_event_bounded`]). Owning them here costs one small
     /// allocation per open, released when the session ends.
+    ///
+    /// **Why not release each entry as soon as its `wait()` succeeds?** It looks safe — the
+    /// spawn has happened, the link is up — but that is an inference about DbgEng's
+    /// internals, not a documented guarantee, and `.restart` re-launches a process from the
+    /// original command line. If the engine kept the caller's pointer for that, an early
+    /// release would be a use-after-free, which is the one bug this field exists to prevent.
+    /// End of session is the only release point that needs no such inference. The cost is a
+    /// per-open allocation retained until then, and — for a *borrowed* client, which never
+    /// reaches `end_session` — retained for good. Verifying on hardware that DbgEng does not
+    /// re-read the buffer (drive `.restart` after a `launch_process`) is what would make a
+    /// tighter release safe.
     deferred_inputs: Mutex<Vec<TargetInput>>,
 }
 
