@@ -1414,6 +1414,24 @@ mod tests {
         // DebugEngine's Drop impl will handle cleanup and detach
     }
 
+    /// Reads a debugger pseudo-register (`$t0`, …) as a number, via `? <expr>` — whose output
+    /// is `Evaluate expression: <decimal> = <hex>`. Used to observe how far an interrupted
+    /// command actually got, which is engine state rather than a timing inference.
+    #[cfg(not(miri))]
+    fn read_pseudo_register(e: &DebugEngine, expr: &str) -> u64 {
+        let out = e
+            .execute_command(&format!("? @{expr}"))
+            .unwrap_or_else(|err| panic!("evaluating {expr} failed: {err}"));
+        let tail = out
+            .split("Evaluate expression: ")
+            .nth(1)
+            .unwrap_or_else(|| panic!("unexpected `?` output for {expr}: {out:?}"));
+        let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("no value in `?` output for {expr}: {out:?}"))
+    }
+
     // The `#[ignore]`d tests below each drive a real debuggee, and MUST be run with
     // `--test-threads=1`. dbgeng.dll holds one debuggee session per *process*, so two of them
     // running concurrently in the same test binary fight over the same session and fail in
@@ -1503,8 +1521,19 @@ mod tests {
         }
 
         // Drained: stage the same race, consume it, then run the same command.
+        //
+        // The drain's return value is asserted, not discarded. `Execute` resets the request
+        // itself, so if the staged interrupt never registered — or `GetInterrupt` errored —
+        // the `version` below would still succeed and this case would pass while draining
+        // nothing. The assertion is what makes it the *drained* case rather than a second
+        // undrained one, and it has to stand on its own here: this test is documented as
+        // runnable by name, without `test_get_interrupt_drain_semantics` to catch it first.
         unsafe { e.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }.expect("SetInterrupt failed");
-        let _ = e.interrupted();
+        assert!(
+            e.interrupted().expect("GetInterrupt failed"),
+            "staged interrupt was not pending — nothing was drained, so the case below is not \
+             the drained one it claims to be"
+        );
         let drained = e.execute_command("version");
         match &drained {
             Ok(out) => println!(
@@ -1573,32 +1602,36 @@ mod tests {
 
         // A deliberately runaway command. Note a broad `s` search does *not* work here: it
         // skips unmapped ranges, so even `L?0x7fffffffff` returns almost immediately. A tight
-        // `.for` in the expression evaluator is genuinely CPU-bound and interruptible.
-        //
-        // At ~4.7s per 0x40000 iterations (measured), 0x1000000 runs for minutes untouched.
+        // `.for` in the expression evaluator is genuinely CPU-bound and interruptible, and it
+        // leaves its progress behind in `$t0` — which is what proves the interruption below.
+        const ITERATIONS: u64 = 0x100_0000;
         const TIMEOUT_MS: u32 = 1_500;
         let started = Instant::now();
         let out = e
             .execute_command_bounded(
-                ".for (r $t0 = 0; @$t0 < 0x1000000; r $t0 = @$t0 + 1) { }",
+                &format!(".for (r $t0 = 0; @$t0 < 0x{ITERATIONS:x}; r $t0 = @$t0 + 1) {{ }}"),
                 TIMEOUT_MS,
             )
             .expect("bounded command should return, not error");
         let elapsed = started.elapsed();
-        println!("bounded command returned after {elapsed:?}");
 
-        // Proof of interruption has to be the clock, not the diagnostic note: that note is
-        // appended whenever the watchdog *attempted* `SetInterrupt`, so a `SetInterrupt` the
-        // engine ignored would still produce it, and this test would then pass while
-        // exercising nothing. Minutes of work returning in seconds cannot be anything else.
+        // Proof of interruption is the loop counter, not the clock and not the diagnostic
+        // note. The note is appended whenever the watchdog *attempted* `SetInterrupt`, so an
+        // interrupt the engine ignored still produces it. A wall-clock bound is no better: it
+        // has to be picked for this host, and on a faster machine or a cheaper `.for` the loop
+        // could finish naturally inside the bound, passing both checks while the watchdog did
+        // nothing. `$t0` is host-independent — short of `ITERATIONS`, the loop did not finish.
+        let t0 = read_pseudo_register(&e, "$t0");
+        println!("bounded command returned after {elapsed:?}, $t0 = {t0} of {ITERATIONS}");
+        assert!(t0 > 0, "loop never started; $t0 = {t0}");
         assert!(
-            elapsed < Duration::from_secs(30),
-            "command ran {elapsed:?} — the watchdog did not cut it short, so the rest of this \
-             test would prove nothing"
+            t0 < ITERATIONS,
+            "loop ran to completion ($t0 = {t0}) — the watchdog did not cut it short, so the \
+             rest of this test would prove nothing"
         );
         assert!(
             out.contains("interrupted after"),
-            "no interruption note despite an early return"
+            "no interruption note despite a loop that stopped short"
         );
 
         // The command under test. If a stale interrupt survived, this aborts instead.
