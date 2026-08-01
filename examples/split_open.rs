@@ -87,5 +87,25 @@ fn main() {
     let _ = victim.kill();
     let _ = victim.wait();
 
-    println!("\ndone — expect cmd.exe as the current process in 1, 2 and 3");
+    // --- 4. guard abandoned without wait() ----------------------------------------
+    // The hazard the split introduced: `CreateProcessWide` is deferred, so if the guard
+    // released the command-line buffer on drop the engine would read freed memory at the
+    // *next* `WaitForEvent` — which any later call can trigger. `Drop` therefore performs
+    // the wait. Expect the target to be at the loader breakpoint anyway, and the follow-up
+    // commands (which pump the engine) to behave normally rather than crash.
+    println!("\n=== 4. drop the guard without calling wait() ===");
+    match e.launch_process_begin(LAUNCH_CMD) {
+        Ok(pending) => {
+            drop(pending); // completes the wait; buffer stays alive across it
+            println!("guard dropped without wait() — engine should still be sane");
+        }
+        Err(err) => println!("begin ERR: {err}"),
+    }
+    show(&e, "|");
+    // Pump the engine again: this is where a freed buffer would surface as a crash or a
+    // bogus spawn if `Drop` had not completed the deferred work.
+    show(&e, "r rip");
+    let _ = e.end_session();
+
+    println!("\ndone — expect cmd.exe as the current process in 1, 2, 3 and 4");
 }
