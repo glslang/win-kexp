@@ -889,20 +889,28 @@ impl DebugEngine {
         Ok(String::from_utf8_lossy(&output_buffer).to_string())
     }
 
-    /// Runs the target until it reaches `address`, using a one-shot `g <addr>` (a
-    /// temporary breakpoint DbgEng auto-clears, so the caller's own breakpoints are
-    /// untouched) and reports a **structured** stop reason instead of raw text. A
-    /// [`RunToOutcome::Hit`] confirms empirically that the current input/state actually
-    /// drives execution to that block.
+    /// Runs the target until it reaches `address` and reports a **structured** stop reason
+    /// instead of raw text. A [`RunToOutcome::Hit`] confirms empirically that the current
+    /// input/state actually drives execution to that block.
     ///
-    /// Live-kernel targets require an INFINITE `WaitForEvent`; this bounds it with the same
-    /// watchdog as [`Self::execute_and_wait`], so `timeout_ms` caps the wait. Classification
-    /// is by the actual stop, not the watchdog: a hit at `address` landing in the same window
-    /// the watchdog fires still reports [`RunToOutcome::Hit`]; only a break *elsewhere* (or a
-    /// still-running target) is a [`RunToOutcome::Timeout`]. For non-live targets a finite
-    /// `WaitForEvent` timeout returns S_FALSE (an `Ok`) leaving the target running, so it is
-    /// detected via the post-wait `DEBUG_STATUS_GO` and then broken in (so the caller isn't
-    /// left with a running target).
+    /// Uses an explicitly managed breakpoint ([`ScopedBreakpoint`]) plus a plain `g`, so the
+    /// breakpoint is removed on *every* exit path — hit, stopped elsewhere, timed out, or
+    /// errored. The caller's own breakpoints are untouched.
+    ///
+    /// Every target type uses one wait: `WaitForEvent(INFINITE)` bounded by the same watchdog
+    /// as [`Self::execute_and_wait`], so `timeout_ms` caps it and a target that never reaches
+    /// `address` is left broken in rather than running.
+    ///
+    /// A *finite* `WaitForEvent` is not usable here even where DbgEng accepts one. It returns
+    /// `S_FALSE` with the target still running and the engine holding no current
+    /// process/thread, and nothing recovers from that — a subsequent `SetInterrupt` plus
+    /// `WaitForEvent` never delivers a break, because the engine is no longer pumping events.
+    /// Commands needing a current process (`bl` among them) fail from then on.
+    ///
+    /// Classification is by the actual stop, not the watchdog: a hit at `address` landing in
+    /// the same window the deadline passes still reports [`RunToOutcome::Hit`]; only a break
+    /// *elsewhere* is [`RunToOutcome::StoppedElsewhere`], and a target that had to be forced
+    /// to a halt is [`RunToOutcome::Timeout`].
     pub fn run_to_address(
         &self,
         address: u64,
@@ -915,10 +923,14 @@ impl DebugEngine {
         if status == DEBUG_STATUS_NO_DEBUGGEE {
             return Err(DbgEngError::NoDebuggee);
         }
-        let live_kernel = self.is_live_kernel();
+        // An explicitly managed breakpoint, not `g <addr>`. WinDbg's one-shot form auto-clears
+        // only when *hit* and hands back no handle, so every other exit — stopped elsewhere,
+        // timed out, errored — left it armed with no way to remove it, and a later unrelated
+        // `g` passing `address` could stop there spuriously. This guard removes it on every
+        // path, including the `?` returns below.
+        let _breakpoint = ScopedBreakpoint::at(self, address)?;
 
-        let cmd_c =
-            CString::new(format!("g 0x{address:x}")).map_err(|_| DbgEngError::InvalidCommand)?;
+        let cmd_c = CString::new("g").map_err(|_| DbgEngError::InvalidCommand)?;
         let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
 
         let mut output_buffer = Vec::<u8>::with_capacity(4096);
@@ -934,12 +946,20 @@ impl DebugEngine {
             self.control
                 .Execute(DEBUG_OUTCTL_THIS_CLIENT, cmd, DEBUG_EXECUTE_ECHO)
         };
-        let (waited, forced) = if exec.is_ok() {
-            if live_kernel {
-                self.wait_for_event_bounded(timeout_ms)
+        // One wait for every target type: `WaitForEvent(INFINITE)` bounded by a watchdog that
+        // Ctrl+Breaks at `timeout_ms`. A *finite* wait cannot be used here even where DbgEng
+        // allows one — it returns S_FALSE with the target still running and the engine holding
+        // no current process/thread, and no interrupt afterwards recovers it, because the
+        // engine is no longer pumping events. `expired` is then simply "the watchdog fired".
+        let (waited, expired) = if exec.is_ok() {
+            let (waited, forced) = self.wait_for_event_bounded(timeout_ms);
+            // A forced return is reported as `Ok`, so only a genuine failure propagates.
+            let waited = if forced {
+                Ok(())
             } else {
-                (unsafe { self.control.WaitForEvent(0, timeout_ms) }, false)
-            }
+                waited.map_err(DbgEngError::CommandFailed)
+            };
+            (waited, forced)
         } else {
             (Ok(()), false)
         };
@@ -948,27 +968,20 @@ impl DebugEngine {
             let _ = self.client.SetOutputCallbacks(None);
         }
         exec.map_err(DbgEngError::CommandFailed)?;
+        waited?;
 
         let output = String::from_utf8_lossy(&output_buffer).to_string();
 
-        // Propagate a genuine `WaitForEvent` failure first (target unavailable/interrupted/
-        // unable to generate events). DbgEng reports an expired *finite* wait as S_FALSE —
-        // an `Ok` — so this only trips on real errors, not timeouts. The live-kernel
-        // watchdog path returns `Ok` when it forces a break, so a forced timeout skips this.
-        if !forced {
-            waited.map_err(DbgEngError::CommandFailed)?;
-        }
-
-        let after =
-            unsafe { self.control.GetExecutionStatus() }.map_err(DbgEngError::CommandFailed)?;
-        if after == DEBUG_STATUS_GO {
-            // A finite wait timed out (S_FALSE): the target is still running and the one-shot
-            // `g <addr>` breakpoint is still armed. Break in so we don't leak a running
-            // target into the next engine call. (The breakpoint only auto-clears when hit; a
-            // later run_to/go arms its own, and a stale one at `address` is harmless here.)
-            unsafe {
-                let _ = self.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE);
-                let _ = self.control.WaitForEvent(0, timeout_ms);
+        if expired {
+            // The watchdog has already broken the target in, so the caller is not left with a
+            // running one. A hit landing in the same window as the deadline is still a hit, so
+            // consult the instruction pointer before concluding otherwise — leniently, since a
+            // failed read here means "no clean stop to report", which is the timeout.
+            if self.instruction_pointer().ok() == Some(address) {
+                return Ok(RunToResult {
+                    outcome: RunToOutcome::Hit,
+                    output,
+                });
             }
             return Ok(RunToResult {
                 outcome: RunToOutcome::Timeout,
@@ -976,15 +989,10 @@ impl DebugEngine {
             });
         }
 
-        // The target halted. A hit at `address` is authoritative even when the live-kernel
-        // watchdog also fired in the same window, so check the IP before concluding a forced
-        // timeout — otherwise a hit landing right at the deadline is misreported as Timeout.
+        // The target stopped on its own.
         let rip = self.instruction_pointer()?;
         let outcome = if rip == address {
             RunToOutcome::Hit
-        } else if forced {
-            // The watchdog Ctrl+Break'd the target somewhere other than `address` — a timeout.
-            RunToOutcome::Timeout
         } else {
             RunToOutcome::StoppedElsewhere { stopped_at: rip }
         };
@@ -1339,9 +1347,71 @@ impl windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbac
     }
 }
 
+/// A breakpoint owned by a single operation and removed when that operation ends —
+/// on success, on an early `?`, and on an unwind alike.
+///
+/// [`DebugEngine::run_to_address`] previously drove execution with WinDbg's one-shot
+/// `g <addr>`, which DbgEng clears only when the breakpoint is *hit* and for which it hands
+/// back no handle. Every other outcome therefore left it armed and unremovable, and a later
+/// unrelated `g` passing `address` could stop there spuriously. Owning the handle is what
+/// makes cleanup possible at all.
+///
+/// Distinct from [`Breakpoint`], which is a caller-managed handle with explicit
+/// `enable`/`disable`/`remove` and no `Drop`.
+struct ScopedBreakpoint<'a> {
+    control: &'a IDebugControl4,
+    breakpoint: std::mem::ManuallyDrop<IDebugBreakpoint2>,
+}
+
+impl<'a> ScopedBreakpoint<'a> {
+    /// Adds an enabled code breakpoint at `address`.
+    fn at(engine: &'a DebugEngine, address: u64) -> Result<Self, DbgEngError> {
+        let breakpoint = unsafe {
+            engine
+                .control
+                .AddBreakpoint2(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID)
+        }
+        .map_err(DbgEngError::BreakpointFailed)?;
+        // Wrapped before it is configured, so a failure below still removes it rather than
+        // leaking a half-built breakpoint into the session.
+        let scoped = Self {
+            control: &engine.control,
+            breakpoint: std::mem::ManuallyDrop::new(breakpoint),
+        };
+        unsafe {
+            scoped
+                .breakpoint
+                .SetOffset(address)
+                .map_err(DbgEngError::BreakpointFailed)?;
+            scoped
+                .breakpoint
+                .AddFlags(DEBUG_BREAKPOINT_ENABLED)
+                .map_err(DbgEngError::BreakpointFailed)?;
+        }
+        Ok(scoped)
+    }
+}
+
+impl Drop for ScopedBreakpoint<'_> {
+    fn drop(&mut self) {
+        // Best-effort: a failure here has nowhere to go, and this runs on unwind paths where
+        // panicking would abort the process.
+        unsafe {
+            let _ = self.control.RemoveBreakpoint2(&*self.breakpoint);
+        }
+        // `breakpoint` is deliberately not dropped. DbgEng owns breakpoint objects and
+        // `RemoveBreakpoint2` destroys this one, so letting the generated wrapper `Release()`
+        // it afterwards dereferences freed memory — observed as an access violation that took
+        // down the host process, not as an error return. `ManuallyDrop` is what stops that.
+    }
+}
+
 pub struct Breakpoint<'a> {
     control: &'a IDebugControl4,
-    breakpoint: IDebugBreakpoint,
+    /// Never released by this wrapper: DbgEng owns breakpoint objects, and [`Self::remove`]
+    /// destroys this one, so a `Release()` afterwards would be a use-after-free. See
+    /// [`ScopedBreakpoint`], where the same hazard showed up as a host-process crash.
+    breakpoint: std::mem::ManuallyDrop<IDebugBreakpoint>,
 }
 
 impl<'a> Breakpoint<'a> {
@@ -1357,7 +1427,7 @@ impl<'a> Breakpoint<'a> {
         }
 
         Ok(Self {
-            breakpoint: breakpoint.unwrap(),
+            breakpoint: std::mem::ManuallyDrop::new(breakpoint.unwrap()),
             control: &engine.control,
         })
     }
@@ -1393,7 +1463,7 @@ impl<'a> Breakpoint<'a> {
     pub fn remove(&self) {
         unsafe {
             self.control
-                .RemoveBreakpoint(&self.breakpoint)
+                .RemoveBreakpoint(&*self.breakpoint)
                 .expect("[-] Failed to remove breakpoint");
         }
     }
@@ -1423,10 +1493,33 @@ mod tests {
     /// measurement instead of recording it.
     #[cfg(not(miri))]
     fn read_pseudo_register_opt(e: &DebugEngine, expr: &str) -> Option<u64> {
-        let out = e.execute_command(&format!("? @{expr}")).ok()?;
+        eval_expression(e, &format!("@{expr}"))
+    }
+
+    /// Evaluates a debugger expression — a symbol, an address, a pseudo-register — via
+    /// `? <expr>`, whose output is `Evaluate expression: <decimal> = <hex>`. `None` when no
+    /// value came back, for the same reason as [`read_pseudo_register_opt`].
+    #[cfg(not(miri))]
+    fn eval_expression(e: &DebugEngine, expr: &str) -> Option<u64> {
+        let out = e.execute_command(&format!("? {expr}")).ok()?;
         let tail = out.split("Evaluate expression: ").nth(1)?;
         let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
         digits.parse().ok()
+    }
+
+    /// Breakpoints the engine currently holds, as `bl` lines. `None` when `bl` itself failed —
+    /// which must not be read as "no breakpoints", since that is the answer these tests want.
+    #[cfg(not(miri))]
+    fn breakpoints(e: &DebugEngine) -> Option<Vec<String>> {
+        let out = e.execute_command("bl").ok()?;
+        Some(
+            out.lines()
+                .map(str::trim)
+                // `DEBUG_EXECUTE_ECHO` puts the command itself in the buffer first.
+                .filter(|line| !line.is_empty() && *line != "bl")
+                .map(str::to_string)
+                .collect(),
+        )
     }
 
     /// [`read_pseudo_register_opt`] for call sites where a failed read means the test's own
@@ -1477,6 +1570,80 @@ mod tests {
     //
     // They are ignored rather than gated on an env var because CI has no target to give them
     // on any platform, so there is no configuration in which they would run there.
+
+    /// A reachable address: `run_to_address` reports [`RunToOutcome::Hit`] and leaves no
+    /// breakpoint behind.
+    ///
+    /// Ignored: needs a live target; see the note above these tests.
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 test_run_to_address_hit`
+    #[cfg(not(miri))]
+    #[test]
+    #[ignore = "needs a live debuggee; run manually with --ignored"]
+    fn test_run_to_address_hit_removes_its_breakpoint() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+        assert_eq!(
+            breakpoints(&e).expect("bl failed"),
+            Vec::<String>::new(),
+            "the target should start with no breakpoints"
+        );
+
+        // `cmd.exe` opens files as it starts up, so this is reached.
+        let addr = eval_expression(&e, "ntdll!NtCreateFile").expect("could not resolve symbol");
+        let res = e
+            .run_to_address(addr, 20_000)
+            .expect("run_to_address errored");
+        assert_eq!(res.outcome, RunToOutcome::Hit, "output: {}", res.output);
+
+        // Not vacuous: an `Ok` outcome means the breakpoint was successfully added, so an
+        // empty `bl` here can only mean it was removed again. `breakpoints` returns None
+        // rather than an empty list if `bl` itself fails.
+        assert_eq!(
+            breakpoints(&e).expect("bl failed"),
+            Vec::<String>::new(),
+            "run_to_address left its breakpoint armed after a hit"
+        );
+        let _ = e.end_session();
+    }
+
+    /// An address the target never reaches: `run_to_address` reports
+    /// [`RunToOutcome::Timeout`], leaves no breakpoint behind, and leaves the engine usable.
+    ///
+    /// The last part is the regression that motivated the rewrite. Detecting the timeout from
+    /// `GetExecutionStatus` did not work — an expired wait reports `DEBUG_STATUS_BREAK`, not
+    /// `DEBUG_STATUS_GO`, and the engine has dropped the current process/thread by then — so
+    /// this case used to fall through to a register read that failed with `0x8000FFFF`,
+    /// returning a "Catastrophic failure" error and no usable session.
+    ///
+    /// Ignored: needs a live target; see the note above these tests.
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 test_run_to_address_timeout`
+    #[cfg(not(miri))]
+    #[test]
+    #[ignore = "needs a live debuggee; run manually with --ignored"]
+    fn test_run_to_address_timeout_removes_its_breakpoint() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+
+        // Nothing in this target calls it.
+        let addr = eval_expression(&e, "ntdll!NtShutdownSystem").expect("could not resolve symbol");
+        let res = e
+            .run_to_address(addr, 2_000)
+            .expect("run_to_address errored");
+        assert_eq!(res.outcome, RunToOutcome::Timeout, "output: {}", res.output);
+
+        assert_eq!(
+            breakpoints(&e).expect("bl failed"),
+            Vec::<String>::new(),
+            "run_to_address left its breakpoint armed after a timeout — a later `g` passing              that address would stop there spuriously"
+        );
+        assert!(
+            command_took_effect(&e, 0x63),
+            "the engine is unusable after a timeout — the target was left running, or the              current process/thread was never restored"
+        );
+        let _ = e.end_session();
+    }
 
     /// Probes whether `GetInterrupt` *consumes* a pending `SetInterrupt`, which
     /// [`DebugEngine::execute_command_bounded`]'s stale-interrupt drain assumes. DbgEng
