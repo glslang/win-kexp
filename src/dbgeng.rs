@@ -1191,11 +1191,22 @@ enum TargetInput {
 /// The type is what makes the ordering unforgeable: the guard cannot exist unless the side
 /// effect returned `Ok`, and it owns the input buffers DbgEng reads *during* the wait, so
 /// they cannot be dropped early.
+///
+/// **Dropping without calling [`wait`](Self::wait) still performs the wait**, best-effort,
+/// and can therefore block for up to the relevant timeout. That is deliberate, and it is a
+/// soundness requirement rather than a convenience: the engine has already been told to
+/// spawn or connect, and it reads `_input` at the *next* `WaitForEvent` — whichever call
+/// makes it, `execute_and_wait` and `run_to_address` included. A guard that simply released
+/// the buffer on drop would hand DbgEng a dangling pointer from ordinary safe code, and
+/// `#[must_use]` is a lint that cannot prevent it. Waiting here also lets the kernel paths
+/// clear `DEBUG_ENGOPT_INITIAL_BREAK`, which otherwise stays set for the session. The cost
+/// is not new — the fused openers always paid this wait.
 #[must_use = "the target was created but never waited for; call `wait()` to reach the initial break"]
 pub struct PendingTarget<'a> {
     engine: &'a DebugEngine,
     kind: WaitKind,
     _input: TargetInput,
+    waited: bool,
 }
 
 impl<'a> PendingTarget<'a> {
@@ -1204,18 +1215,40 @@ impl<'a> PendingTarget<'a> {
             engine,
             kind,
             _input: input,
+            waited: false,
         }
     }
 
     /// Waits for the target's initial break, completing the open.
-    pub fn wait(self) -> Result<(), DbgEngError> {
-        // Read `kind` out of `self` rather than destructuring: `self` — and with it the
-        // `_input` buffers DbgEng reads during the wait — must stay alive until this
-        // returns, which is exactly what binding it by value here guarantees.
+    pub fn wait(mut self) -> Result<(), DbgEngError> {
+        // Mark first: `self` still drops at the end of this function, and `Drop` must not
+        // wait a second time.
+        self.waited = true;
+        self.wait_inner()
+    }
+
+    /// The wait itself, by reference so both [`Self::wait`] and `Drop` can drive it.
+    ///
+    /// Takes `&self`, which is what keeps `_input` alive for the call in either path: fields
+    /// are dropped *after* `Drop::drop` returns, so the buffers DbgEng reads are still valid
+    /// even on the drop-without-wait path.
+    fn wait_inner(&self) -> Result<(), DbgEngError> {
         match self.kind {
             WaitKind::Live => self.engine.wait_for_event(LIVE_WAIT_MS),
             WaitKind::KernelBreakIn => self.engine.wait_for_kernel_break_in(),
         }
+    }
+}
+
+impl Drop for PendingTarget<'_> {
+    fn drop(&mut self) {
+        if self.waited {
+            return;
+        }
+        // Abandoned without a wait. See the type's docs: releasing `_input` while the engine
+        // still owes a deferred spawn/dial is a use-after-free waiting for the next
+        // `WaitForEvent`, so drive it here and discard the outcome — the caller threw it away.
+        let _ = self.wait_inner();
     }
 }
 
