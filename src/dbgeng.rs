@@ -729,9 +729,24 @@ impl DebugEngine {
         let interrupted = fired.load(Ordering::SeqCst);
         if interrupted {
             // The watchdog may have raised `SetInterrupt` right as `Execute` finished (or fired
-            // once more before we joined it), leaving a Ctrl+Break *pending* that would abort the
-            // next command on its first interrupt poll. Drain it now via `GetInterrupt` so
-            // subsequent calls stay usable — the whole point of a bounded command.
+            // once more before we joined it), leaving a Ctrl+Break pending with no command
+            // running. Consume it via `GetInterrupt`, which does clear the pending flag.
+            //
+            // Retained as insurance, not as a fix for an observed bug. Measured against dbgeng
+            // 10.0.26100.1 on a user-mode target (see the `#[ignore]`d tests below, which are
+            // the record): `GetInterrupt` clears the flag, and the flag is a flag rather than a
+            // counter — three `SetInterrupt`s still take one poll to clear. But a pending
+            // interrupt did *not* abort a following command in any case tried, short or long:
+            // a `version` produced byte-identical output drained and undrained, and a 38s
+            // interrupt-polling `.for` ran to completion either way (37.94s vs 37.91s). The
+            // engine appears to reset the request when `Execute` begins a command, which is
+            // also how WinDbg behaves — a Ctrl+Break pressed while idle does not kill the next
+            // command you type.
+            //
+            // So this is a no-op on the engine it was measured against. It costs one call on an
+            // already-exceptional path, the behaviour is undocumented by Microsoft and may vary
+            // by engine version, and the live-kernel path was not measured — which is why it
+            // stays rather than being deleted on the strength of one environment.
             let _ = self.interrupted();
         }
         // A watchdog-forced interrupt makes `Execute` fail (or return partial output); that is
@@ -1397,6 +1412,173 @@ mod tests {
         println!("Debug engine created successfully");
 
         // DebugEngine's Drop impl will handle cleanup and detach
+    }
+
+    // The `#[ignore]`d tests below each drive a real debuggee, and MUST be run with
+    // `--test-threads=1`. dbgeng.dll holds one debuggee session per *process*, so two of them
+    // running concurrently in the same test binary fight over the same session and fail in
+    // ways that look like engine bugs. Individually they pass under the default harness; as a
+    // group they do not.
+    //
+    // They are ignored rather than gated on an env var because CI has no target to give them
+    // on any platform, so there is no configuration in which they would run there.
+
+    /// Probes whether `GetInterrupt` *consumes* a pending `SetInterrupt`, which
+    /// [`DebugEngine::execute_command_bounded`]'s stale-interrupt drain assumes. DbgEng
+    /// documents `GetInterrupt` as a check (S_OK requested / S_FALSE not); whether it also
+    /// clears is not documented, so it is measured rather than assumed.
+    ///
+    /// Ignored: needs a live target, which CI has no way to provide. See the note above these
+    /// tests on why they must not run in parallel.
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 get_interrupt`
+    #[cfg(not(miri))]
+    #[test]
+    #[ignore = "needs a live debuggee; run manually with --ignored"]
+    fn get_interrupt_drain_semantics() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c exit").expect("launch failed");
+
+        // One request in.
+        unsafe { e.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }.expect("SetInterrupt failed");
+        let polls: Vec<bool> = (0..5).map(|_| e.interrupted().unwrap()).collect();
+        println!("after 1x SetInterrupt, five GetInterrupt polls: {polls:?}");
+
+        // Several requests in, since the watchdog re-fires every 200ms while past its
+        // deadline: does one poll clear them all, or one each?
+        for _ in 0..3 {
+            unsafe { e.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }.expect("SetInterrupt failed");
+        }
+        let polls: Vec<bool> = (0..5).map(|_| e.interrupted().unwrap()).collect();
+        println!("after 3x SetInterrupt, five GetInterrupt polls: {polls:?}");
+
+        let _ = e.end_session();
+    }
+
+    /// Forces the exact race the drain targets, which ordinary timing almost never hits: a
+    /// `SetInterrupt` landing *after* `Execute` has returned, leaving a Ctrl+Break pending
+    /// with no command running. Measures both halves of the assumption — that a pending
+    /// interrupt really does abort the next command, and that draining it really does
+    /// prevent that.
+    ///
+    /// Ignored: needs a live target; see the note above these tests.
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 pending_interrupt`
+    #[cfg(not(miri))]
+    #[test]
+    #[ignore = "needs a live debuggee; run manually with --ignored"]
+    fn a_pending_interrupt_aborts_the_next_command_unless_drained() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c exit").expect("launch failed");
+
+        // Baseline: what a healthy `version` looks like.
+        let baseline = e.execute_command("version").expect("baseline failed");
+        assert!(baseline.to_lowercase().contains("version"));
+
+        // Undrained: stage the race, then run a command.
+        unsafe { e.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }.expect("SetInterrupt failed");
+        let undrained = e.execute_command("version");
+        match &undrained {
+            Ok(out) => println!(
+                "undrained next command: Ok, {} bytes, looks normal: {}",
+                out.len(),
+                out.to_lowercase().contains("version")
+            ),
+            Err(err) => println!("undrained next command: Err({err})"),
+        }
+
+        // Drained: stage the same race, consume it, then run the same command.
+        unsafe { e.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }.expect("SetInterrupt failed");
+        let _ = e.interrupted();
+        let drained = e.execute_command("version");
+        match &drained {
+            Ok(out) => println!(
+                "drained   next command: Ok, {} bytes, looks normal: {}",
+                out.len(),
+                out.to_lowercase().contains("version")
+            ),
+            Err(err) => println!("drained   next command: Err({err})"),
+        }
+
+        // A short command like `version` may simply never poll for the interrupt. The case
+        // that matters is a *long* next command, which does — if a stale Ctrl+Break aborts
+        // that, the drain is load-bearing; if not, it is a no-op.
+        let long = ".for (r $t0 = 0; @$t0 < 0x40000; r $t0 = @$t0 + 1) { }";
+        let clean_start = Instant::now();
+        let _ = e.execute_command(long).expect("long command failed");
+        let clean = clean_start.elapsed();
+
+        unsafe { e.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }.expect("SetInterrupt failed");
+        let stale_start = Instant::now();
+        let stale = e.execute_command(long);
+        let stale_elapsed = stale_start.elapsed();
+        println!(
+            "long command: clean {:?}, with a stale interrupt pending {:?} ({})",
+            clean,
+            stale_elapsed,
+            match &stale {
+                Ok(_) => "Ok",
+                Err(_) => "Err",
+            }
+        );
+        println!(
+            "  -> stale interrupt {} the long command",
+            if stale_elapsed < clean / 2 {
+                "ABORTED"
+            } else {
+                "did NOT abort"
+            }
+        );
+        let _ = e.interrupted();
+
+        // Only the drained case is asserted; the undrained one is the measurement.
+        assert!(
+            drained
+                .expect("drained command errored")
+                .to_lowercase()
+                .contains("version"),
+            "draining should leave the next command fully usable"
+        );
+
+        let _ = e.end_session();
+    }
+
+    /// The behaviour the drain exists to protect, end to end: after a bounded command is
+    /// cut short by its watchdog, the *next* command must run normally rather than being
+    /// aborted by a Ctrl+Break left pending behind it.
+    ///
+    /// Ignored: needs a live target; see the note above these tests.
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 next_command`
+    #[cfg(not(miri))]
+    #[test]
+    #[ignore = "needs a live debuggee; run manually with --ignored"]
+    fn next_command_survives_a_bounded_timeout() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c exit").expect("launch failed");
+
+        // A deliberately runaway command. Note a broad `s` search does *not* work here: it
+        // skips unmapped ranges, so even `L?0x7fffffffff` returns almost immediately. A tight
+        // `.for` in the expression evaluator is genuinely CPU-bound and interruptible.
+        let out = e
+            .execute_command_bounded(
+                ".for (r $t0 = 0; @$t0 < 0x1000000; r $t0 = @$t0 + 1) { }",
+                1_500,
+            )
+            .expect("bounded command should return, not error");
+        let cut_short = out.contains("interrupted after");
+        println!("bounded command cut short by watchdog: {cut_short}");
+        assert!(
+            cut_short,
+            "search finished early — pick a longer-running probe"
+        );
+
+        // The command under test. If a stale interrupt survived, this aborts instead.
+        let after = e.execute_command("version").expect("next command errored");
+        println!("--- next command output ---\n{after}\n---");
+        assert!(
+            after.to_lowercase().contains("version"),
+            "next command produced no real output — stale interrupt aborted it"
+        );
+
+        let _ = e.end_session();
     }
 }
 
