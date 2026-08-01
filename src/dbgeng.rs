@@ -1415,21 +1415,27 @@ mod tests {
     }
 
     /// Reads a debugger pseudo-register (`$t0`, …) as a number, via `? <expr>` — whose output
-    /// is `Evaluate expression: <decimal> = <hex>`. Used to observe how far an interrupted
-    /// command actually got, which is engine state rather than a timing inference.
+    /// is `Evaluate expression: <decimal> = <hex>`. `None` when no value came back.
+    ///
+    /// Fallible rather than panicking, because a read that fails is one of the outcomes these
+    /// tests are here to observe: on an engine where a stale interrupt aborts the next
+    /// command, this read can *be* that next command. Panicking would crash out of the
+    /// measurement instead of recording it.
+    #[cfg(not(miri))]
+    fn read_pseudo_register_opt(e: &DebugEngine, expr: &str) -> Option<u64> {
+        let out = e.execute_command(&format!("? @{expr}")).ok()?;
+        let tail = out.split("Evaluate expression: ").nth(1)?;
+        let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    }
+
+    /// [`read_pseudo_register_opt`] for call sites where a failed read means the test's own
+    /// setup is broken rather than an observation — reading `$t0` after a command that is
+    /// asserted to have run, for instance.
     #[cfg(not(miri))]
     fn read_pseudo_register(e: &DebugEngine, expr: &str) -> u64 {
-        let out = e
-            .execute_command(&format!("? @{expr}"))
-            .unwrap_or_else(|err| panic!("evaluating {expr} failed: {err}"));
-        let tail = out
-            .split("Evaluate expression: ")
-            .nth(1)
-            .unwrap_or_else(|| panic!("unexpected `?` output for {expr}: {out:?}"));
-        let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
-        digits
-            .parse()
-            .unwrap_or_else(|_| panic!("no value in `?` output for {expr}: {out:?}"))
+        read_pseudo_register_opt(e, expr)
+            .unwrap_or_else(|| panic!("could not read {expr} from the engine"))
     }
 
     /// Runs a command and reports whether it actually *took effect*, by having it stamp a
@@ -1441,19 +1447,26 @@ mod tests {
     /// `output.contains("version")` therefore matches the echo alone and passes even when the
     /// command was aborted immediately after being echoed, which is precisely the failure
     /// these tests exist to catch.
+    ///
+    /// Every step is fallible and none of them panic. The clear below is itself a command, so
+    /// on an engine where a stale interrupt does abort the next one, *this* is the command it
+    /// aborts — panicking there would take out the measurement the caller is in the middle of,
+    /// and the undrained case could never report the very behaviour it exists to report. A
+    /// probe that cannot run at all is caught instead by the caller's baseline assertion,
+    /// taken before anything is staged.
     #[cfg(not(miri))]
     fn command_took_effect(e: &DebugEngine, sentinel: u64) -> bool {
         // Clear first, so a value left by an earlier probe cannot pass for a fresh one.
-        e.execute_command("r $t1 = 0").expect("clearing $t1 failed");
-        if read_pseudo_register(e, "$t1") != 0 {
-            panic!("$t1 did not clear; the probe itself is unreliable here");
+        if e.execute_command("r $t1 = 0").is_err() || read_pseudo_register_opt(e, "$t1") != Some(0)
+        {
+            return false;
         }
         if e.execute_command(&format!("r $t1 = 0x{sentinel:x}"))
             .is_err()
         {
             return false;
         }
-        read_pseudo_register(e, "$t1") == sentinel
+        read_pseudo_register_opt(e, "$t1") == Some(sentinel)
     }
 
     // The `#[ignore]`d tests below each drive a real debuggee, and MUST be run with
