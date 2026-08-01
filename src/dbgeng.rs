@@ -1430,18 +1430,27 @@ mod tests {
     ///
     /// Ignored: needs a live target, which CI has no way to provide. See the note above these
     /// tests on why they must not run in parallel.
-    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 get_interrupt`
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 test_get_interrupt`
     #[cfg(not(miri))]
     #[test]
     #[ignore = "needs a live debuggee; run manually with --ignored"]
-    fn get_interrupt_drain_semantics() {
+    fn test_get_interrupt_drain_semantics() {
         let e = DebugEngine::new();
         e.launch_process("cmd.exe /c exit").expect("launch failed");
+
+        // Asserted, not just printed: this test is the record the production drain rests on,
+        // so an engine that stopped clearing — or started counting — has to fail here rather
+        // than quietly print a different vector on a manual run.
+        const DRAINS_ON_FIRST_POLL: [bool; 5] = [true, false, false, false, false];
 
         // One request in.
         unsafe { e.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }.expect("SetInterrupt failed");
         let polls: Vec<bool> = (0..5).map(|_| e.interrupted().unwrap()).collect();
         println!("after 1x SetInterrupt, five GetInterrupt polls: {polls:?}");
+        assert_eq!(
+            polls, DRAINS_ON_FIRST_POLL,
+            "GetInterrupt no longer clears the pending request on this engine"
+        );
 
         // Several requests in, since the watchdog re-fires every 200ms while past its
         // deadline: does one poll clear them all, or one each?
@@ -1450,22 +1459,30 @@ mod tests {
         }
         let polls: Vec<bool> = (0..5).map(|_| e.interrupted().unwrap()).collect();
         println!("after 3x SetInterrupt, five GetInterrupt polls: {polls:?}");
+        assert_eq!(
+            polls, DRAINS_ON_FIRST_POLL,
+            "repeated SetInterrupt now accumulates; one drain no longer suffices"
+        );
 
         let _ = e.end_session();
     }
 
     /// Forces the exact race the drain targets, which ordinary timing almost never hits: a
     /// `SetInterrupt` landing *after* `Execute` has returned, leaving a Ctrl+Break pending
-    /// with no command running. Measures both halves of the assumption — that a pending
-    /// interrupt really does abort the next command, and that draining it really does
-    /// prevent that.
+    /// with no command running.
+    ///
+    /// Named for what it measures, not for a result: on the engine tested a stale interrupt
+    /// does **not** abort the next command, short or long, so only the drained case is
+    /// asserted. The undrained case prints its observation rather than asserting one, because
+    /// pinning it down would encode "stale interrupts are harmless" as a requirement — the
+    /// opposite of what this test exists to keep watching.
     ///
     /// Ignored: needs a live target; see the note above these tests.
-    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 pending_interrupt`
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 test_stale_interrupt`
     #[cfg(not(miri))]
     #[test]
     #[ignore = "needs a live debuggee; run manually with --ignored"]
-    fn a_pending_interrupt_aborts_the_next_command_unless_drained() {
+    fn test_stale_interrupt_effect_on_the_next_command() {
         let e = DebugEngine::new();
         e.launch_process("cmd.exe /c exit").expect("launch failed");
 
@@ -1546,28 +1563,42 @@ mod tests {
     /// aborted by a Ctrl+Break left pending behind it.
     ///
     /// Ignored: needs a live target; see the note above these tests.
-    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 next_command`
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 test_next_command`
     #[cfg(not(miri))]
     #[test]
     #[ignore = "needs a live debuggee; run manually with --ignored"]
-    fn next_command_survives_a_bounded_timeout() {
+    fn test_next_command_survives_a_bounded_timeout() {
         let e = DebugEngine::new();
         e.launch_process("cmd.exe /c exit").expect("launch failed");
 
         // A deliberately runaway command. Note a broad `s` search does *not* work here: it
         // skips unmapped ranges, so even `L?0x7fffffffff` returns almost immediately. A tight
         // `.for` in the expression evaluator is genuinely CPU-bound and interruptible.
+        //
+        // At ~4.7s per 0x40000 iterations (measured), 0x1000000 runs for minutes untouched.
+        const TIMEOUT_MS: u32 = 1_500;
+        let started = Instant::now();
         let out = e
             .execute_command_bounded(
                 ".for (r $t0 = 0; @$t0 < 0x1000000; r $t0 = @$t0 + 1) { }",
-                1_500,
+                TIMEOUT_MS,
             )
             .expect("bounded command should return, not error");
-        let cut_short = out.contains("interrupted after");
-        println!("bounded command cut short by watchdog: {cut_short}");
+        let elapsed = started.elapsed();
+        println!("bounded command returned after {elapsed:?}");
+
+        // Proof of interruption has to be the clock, not the diagnostic note: that note is
+        // appended whenever the watchdog *attempted* `SetInterrupt`, so a `SetInterrupt` the
+        // engine ignored would still produce it, and this test would then pass while
+        // exercising nothing. Minutes of work returning in seconds cannot be anything else.
         assert!(
-            cut_short,
-            "search finished early — pick a longer-running probe"
+            elapsed < Duration::from_secs(30),
+            "command ran {elapsed:?} — the watchdog did not cut it short, so the rest of this \
+             test would prove nothing"
+        );
+        assert!(
+            out.contains("interrupted after"),
+            "no interruption note despite an early return"
         );
 
         // The command under test. If a stale interrupt survived, this aborts instead.
