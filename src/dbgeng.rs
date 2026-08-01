@@ -1576,27 +1576,42 @@ mod tests {
         const LONG_ITERS: u64 = 0x4_0000;
         let long = format!(".for (r $t0 = 0; @$t0 < 0x{LONG_ITERS:x}; r $t0 = @$t0 + 1) {{ }}");
 
+        // Seed `$t0` with a value the loop cannot produce before *each* run. The loop's own
+        // `r $t0 = 0` initializer is part of the command, so an abort landing before it leaves
+        // `$t0` holding `LONG_ITERS` from the previous run — which would read as "completed"
+        // and report the immediate abort, the very case this probe exists to catch, as "did
+        // NOT abort". Seeding makes "never started" its own observable value.
+        const UNSTARTED: u64 = 0xDEAD_BEEF;
+        let seed = format!("r $t0 = 0x{UNSTARTED:x}");
+
+        e.execute_command(&seed).expect("seeding $t0 failed");
         let clean_start = Instant::now();
         e.execute_command(&long).expect("long command failed");
         let clean = clean_start.elapsed();
         let clean_t0 = read_pseudo_register(&e, "$t0");
+        assert_eq!(
+            clean_t0, LONG_ITERS,
+            "the uninterrupted run did not complete — the probe is broken, not the engine"
+        );
 
+        e.execute_command(&seed).expect("seeding $t0 failed");
         unsafe { e.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }.expect("SetInterrupt failed");
         let stale_start = Instant::now();
         let stale = e.execute_command(&long);
         let stale_elapsed = stale_start.elapsed();
-        let stale_t0 = read_pseudo_register(&e, "$t0");
+        let stale_t0 = read_pseudo_register_opt(&e, "$t0");
         let stale_result = if stale.is_ok() { "Ok" } else { "Err" };
         println!("long command, clean:           {clean:?} (t0={clean_t0} of {LONG_ITERS})");
         println!(
-            "long command, stale interrupt: {stale_elapsed:?} (t0={stale_t0} of {LONG_ITERS}, {stale_result})"
+            "long command, stale interrupt: {stale_elapsed:?} (t0={stale_t0:?} of {LONG_ITERS}, {stale_result})"
         );
         println!(
             "  -> stale interrupt {} the long command",
-            if stale_t0 < LONG_ITERS {
-                "ABORTED"
-            } else {
-                "did NOT abort"
+            match stale_t0 {
+                None => "gave no readable $t0 after",
+                Some(UNSTARTED) => "ABORTED, before the loop even started,",
+                Some(t0) if t0 < LONG_ITERS => "ABORTED mid-loop",
+                _ => "did NOT abort",
             }
         );
         let _ = e.interrupted();
