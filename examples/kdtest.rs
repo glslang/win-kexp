@@ -15,9 +15,9 @@
 //!      up, and a `vertarget` that reads the real target, is the evidence.
 //!    - *`wait_for_kernel_break_in`'s bookkeeping still runs on the `wait()` side.* It
 //!      clears `INITIAL_BREAK`, absorbs the spurious re-break, and maps a watchdog-forced
-//!      return to `KernelBreakTimeout`. Landing on a *real* breakpoint at the first `g`
-//!      proves the first two. The third needs a target that connects and then fails to
-//!      break in — see [`timeout_probe`] for why an unreachable one will not do.
+//!      return to `KernelBreakTimeout`. A `RunToOutcome::Hit` on the first resume proves the
+//!      first two. The third needs a target that connects and then fails to break in — see
+//!      [`timeout_probe`] for why an unreachable one will not do.
 //!
 //! 2. Verify `end_session` leaves a live kernel RUNNING (not frozen). attach -> bp -> go ->
 //!    end_session (resume+detach), wait, then re-attach: if System Uptime advanced by ~the
@@ -31,7 +31,7 @@
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use win_kexp::dbgeng::{DbgEngError, DebugEngine, PendingTarget};
+use win_kexp::dbgeng::{DbgEngError, DebugEngine, PendingTarget, RunToOutcome};
 
 /// A connection nothing will ever answer: the debugger listens, the target never dials.
 /// Used only by [`timeout_probe`].
@@ -84,46 +84,64 @@ fn run(e: &DebugEngine, cmd: &str) {
 /// for. Both of those clears moved behind `PendingTarget::wait`, so this is the check that
 /// they did not get stranded on the `begin` side.
 fn check_break_in_bookkeeping(e: &DebugEngine) {
-    run(e, "bp nt!NtCreateFile");
-    println!("=== go (expect a stop at nt!NtCreateFile, not at the initial-break artifact) ===");
-    let out = match e.execute_and_wait("g", 60_000) {
-        Ok(out) => {
-            print!("{out}");
-            out
+    // Resolve first. A `bp` on an unresolvable symbol installs nothing, so the `g` below would
+    // run to the 60s bound and be forced to stop — landing at nt!DbgBreakPointWithStatus, which
+    // is *also* where a stranded INITIAL_BREAK lands. Failing here instead keeps "no symbols"
+    // from being reported as "the bookkeeping is broken".
+    let address = match e.symbol_offset("nt!NtCreateFile") {
+        Ok(address) => {
+            println!("nt!NtCreateFile resolved to {address:#x}");
+            address
         }
+        Err(err) => {
+            println!("[??] cannot resolve nt!NtCreateFile: {err} — symbols unavailable, skipping");
+            return;
+        }
+    };
+
+    println!("=== run to nt!NtCreateFile (expect Hit, not the initial-break artifact) ===");
+    // `run_to_address`, not `execute_and_wait("g")`: the latter discards the watchdog-fired
+    // flag (it treats a forced break as a fine outcome for go/step), so its caller cannot tell
+    // "hit the breakpoint" from "the bound expired and we Ctrl+Break'd ourselves". Both stop at
+    // nt!DbgBreakPointWithStatus, so classifying on the stop site alone reports a timeout as a
+    // bookkeeping failure. `run_to_address` keeps the flag and surfaces it as `Timeout`.
+    let result = match e.run_to_address(address, 60_000) {
+        Ok(result) => result,
         Err(err) => {
             println!("ERR: {err}");
             return;
         }
     };
+    print!("{}", result.output);
     println!();
 
-    // `g`'s own output is not a reliable witness for *where* the target stopped. A KDNET
-    // breakpoint stop came back as a bare "Breakpoint 0 hit" with no location line, which an
-    // earlier version of this check read as an unrecognized stop and reported a pass as `[??]`.
-    // Ask the engine for the current instruction instead — `u . L1` names the symbol whatever
-    // `g` chose to echo — and keep `g`'s text only as a secondary signal.
-    println!("--- u . L1 (where it actually stopped) ---");
-    let site = match e.execute_command("u . L1") {
-        Ok(site) => {
+    match result.outcome {
+        RunToOutcome::Hit => {
+            println!("[ok] reached the real breakpoint — INITIAL_BREAK cleared, artifact absorbed")
+        }
+        RunToOutcome::StoppedElsewhere { stopped_at } => {
+            let site = e
+                .execute_command(&format!("ln {stopped_at:#x}"))
+                .unwrap_or_default();
             print!("{site}");
-            site
+            if site.contains("DbgBreakPointWithStatus") {
+                println!(
+                    "[FAIL] stopped at the initial-break artifact — wait()'s bookkeeping did not run"
+                );
+            } else {
+                println!(
+                    "[??] stopped at {stopped_at:#x}, not the breakpoint — read the output above"
+                );
+            }
         }
-        Err(err) => {
-            println!("ERR: {err}");
-            String::new()
-        }
-    };
-    println!();
-
-    // Test for the artifact first: it is the specific failure being ruled out, and a stop
-    // there is unambiguous, whereas "hit a breakpoint" has several spellings.
-    if site.contains("DbgBreakPointWithStatus") || out.contains("Break instruction exception") {
-        println!("[FAIL] stopped at the initial-break artifact — wait()'s bookkeeping did not run");
-    } else if site.contains("NtCreateFile") || out.contains("Breakpoint") {
-        println!("[ok] stopped at the real breakpoint — INITIAL_BREAK cleared, artifact absorbed");
-    } else {
-        println!("[??] unrecognized stop — read the output above");
+        // Deliberately not [FAIL]. The watchdog's own Ctrl+Break lands at
+        // nt!DbgBreakPointWithStatus exactly like a stranded INITIAL_BREAK does, so a stop
+        // reached this way carries no information about the bookkeeping either way.
+        RunToOutcome::Timeout => println!(
+            "[??] inconclusive — the 60s bound expired and the watchdog forced the stop, which \
+             is indistinguishable from the artifact. Re-run against a target that reaches \
+             nt!NtCreateFile (any file I/O on the guest will do)."
+        ),
     }
 }
 

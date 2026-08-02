@@ -556,8 +556,14 @@ impl DebugEngine {
     ///
     /// [`DbgEngError::KernelBreakTimeout`] therefore covers only a target that connects and
     /// *then* fails to break in — not the far more common case of one that never connects.
-    /// Callers that must stay responsive (a server, an MCP endpoint) should run this on a
-    /// thread they can abandon, since nothing can interrupt it from outside.
+    ///
+    /// Callers that must stay responsive (a server, an MCP endpoint) need a **separate process
+    /// they can kill**. Moving the call to a worker thread and abandoning it is not a recovery:
+    /// detaching a `JoinHandle` frees nothing, so the thread, its stack, this `DebugEngine`, its
+    /// COM objects and the claimed transport endpoint all live on, still blocked, for the life
+    /// of the process. Retrying then leaks another set and can find the endpoint still held.
+    /// Nothing can interrupt the wait from outside, so the only way to reclaim the resources is
+    /// to exit the process holding them.
     ///
     /// Fuses the attach with the break-in wait, so a failure cannot say which half
     /// failed. Use [`Self::attach_kernel_begin`] when that matters.
@@ -598,10 +604,12 @@ impl DebugEngine {
     /// [`DbgEngError::KernelBreakTimeout`] if the target never broke in within the bound,
     /// rather than reporting a false success.
     ///
-    /// That covers a target that *connects* and then fails to break in (not booted in debug
-    /// mode, wedged). A target that never connects at all does not reach this error: the
-    /// watchdog cannot interrupt a dial that has not established its link, so the wait blocks
-    /// instead — see [`Self::wait_for_event_bounded`].
+    /// That covers a target that *connects* and then fails to break in — wedged, or spinning
+    /// somewhere the break-in cannot be serviced. A target that never connects at all does not
+    /// reach this error: the watchdog cannot interrupt a dial that has not established its
+    /// link, so the wait blocks instead — see [`Self::wait_for_event_bounded`]. Note that a
+    /// guest not booted with `bcdedit /debug on` is the *second* case, not the first: it never
+    /// dials, so it hangs rather than timing out.
     fn wait_for_kernel_break_in(&self) -> Result<(), DbgEngError> {
         let (waited, timed_out) = self.wait_for_event_bounded(KERNEL_ATTACH_WAIT_MS);
         self.clear_initial_break();
