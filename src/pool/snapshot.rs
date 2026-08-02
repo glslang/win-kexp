@@ -1554,9 +1554,57 @@ mod tests {
     const LARGE_VA: u64 = K + 0x90_0000;
     const BIG_TABLE: u64 = K + 0xa0_0000;
 
+    /// Sparse synthetic memory, stored as coalesced contiguous runs.
+    ///
+    /// Built from a byte-keyed `BTreeMap` — which is the natural way to *write* the fixture,
+    /// and cheap, since setup happens once — then frozen into runs for reading. The naive form
+    /// kept the map and did one `BTreeMap::get` per byte in `read_exact`; native runs absorbed
+    /// that, but under Miri every lookup is interpreted and borrow-checked, and the two pool
+    /// snapshot tests took 18m13s and 5m44s of a ~28 minute CI job. Runs turn each read into a
+    /// binary search plus a `memcpy`, with identical semantics: a byte is readable iff it was
+    /// written, so a read spanning a gap still fails.
+    ///
+    /// Measured, not assumed: those two tests together run in 366s here versus 731s with the
+    /// byte map, on the same machine — **2.0x**, not the order of magnitude the lookup count
+    /// suggests. Most of what remains is Miri interpreting the walk itself rather than the
+    /// fixture, so this is worth having but is not the whole story.
     struct SyntheticMemory {
-        bytes: BTreeMap<u64, u8>,
+        /// `(start, bytes)` for each contiguous written range, sorted by `start` and never
+        /// overlapping or abutting.
+        runs: Vec<(u64, Vec<u8>)>,
         holes: Vec<(u64, u64)>,
+    }
+
+    impl SyntheticMemory {
+        fn new(bytes: BTreeMap<u64, u8>, holes: Vec<(u64, u64)>) -> Self {
+            let mut runs: Vec<(u64, Vec<u8>)> = Vec::new();
+            for (address, byte) in bytes {
+                match runs.last_mut() {
+                    // `BTreeMap` iterates in key order, so a run extends whenever the next
+                    // address is the one after the last byte written.
+                    Some((start, data)) if *start + data.len() as u64 == address => {
+                        data.push(byte);
+                    }
+                    _ => runs.push((address, vec![byte])),
+                }
+            }
+            Self { runs, holes }
+        }
+
+        /// The run containing `address`, if any.
+        fn run_at(&self, address: u64) -> Option<&(u64, Vec<u8>)> {
+            let index = self
+                .runs
+                .partition_point(|(start, _)| *start <= address)
+                .checked_sub(1)?;
+            let run = &self.runs[index];
+            (address < run.0 + run.1.len() as u64).then_some(run)
+        }
+
+        /// Whether a single byte was written — the fixture's own sanity checks ask this.
+        fn contains(&self, address: u64) -> bool {
+            self.run_at(address).is_some()
+        }
     }
 
     struct ShortMemory;
@@ -1626,18 +1674,18 @@ mod tests {
 
     impl PoolMemory for SyntheticMemory {
         fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
-            (0..size)
-                .map(|offset| {
-                    self.bytes
-                        .get(&(address + offset as u64))
-                        .copied()
-                        .ok_or_else(|| SnapshotError::Read {
-                            address,
-                            size,
-                            source: Box::new(std::io::Error::other("sparse synthetic memory")),
-                        })
-                })
-                .collect()
+            let unreadable = || SnapshotError::Read {
+                address,
+                size,
+                source: Box::new(std::io::Error::other("sparse synthetic memory")),
+            };
+            let (start, data) = self.run_at(address).ok_or_else(unreadable)?;
+            let offset = (address - start) as usize;
+            // One run must cover the whole read: runs never abut, so a read that runs off the
+            // end of one has hit a gap, exactly as the per-byte lookup used to report.
+            data.get(offset..offset + size)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(unreadable)
         }
 
         fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError> {
@@ -2017,10 +2065,7 @@ mod tests {
         put(&mut bytes, entry + 8, b"BIG!");
         put_u64(&mut bytes, entry + 0x10, 0x1800);
 
-        SyntheticMemory {
-            bytes,
-            holes: vec![(SEGMENT + 0x7800, SEGMENT + 0x8000)],
-        }
+        SyntheticMemory::new(bytes, vec![(SEGMENT + 0x7800, SEGMENT + 0x8000)])
     }
 
     fn big_page_memory(address: u64, count: usize, collision_distance: usize) -> BigPageMemory {
@@ -2049,7 +2094,7 @@ mod tests {
     #[test]
     fn test_pool_snapshot_walks_all_backends() {
         let memory = synthetic_memory();
-        assert!(!memory.bytes.contains_key(&LARGE_VA));
+        assert!(!memory.contains(LARGE_VA));
         let layout = synthetic_layout();
         let walker = SnapshotWalker {
             memory: &memory,
