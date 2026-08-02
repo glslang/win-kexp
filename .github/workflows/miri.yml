@@ -12,6 +12,18 @@ on:
 
   workflow_dispatch:
 
+concurrency:
+  # A superseded push or PR update should cancel its predecessor. Without this every push to a
+  # PR left its predecessor running to completion — five pushes to one PR meant five concurrent
+  # Miri runs, which for Miri is five times ~28 minutes of runner doing work nobody will read.
+  #
+  # Manual dispatches are deliberately excluded. A dispatch shares `github.ref` with the
+  # branch's own run, so a shared group would have the two cancel each other, and a repeat
+  # dispatch would kill the run someone had just asked for. Keying dispatches by run id gives
+  # each one a group of its own: never cancelled, never cancelling.
+  group: miri-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
