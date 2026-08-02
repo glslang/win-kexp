@@ -911,6 +911,15 @@ impl DebugEngine {
     /// the same window the deadline passes still reports [`RunToOutcome::Hit`]; only a break
     /// *elsewhere* is [`RunToOutcome::StoppedElsewhere`], and a target that had to be forced
     /// to a halt is [`RunToOutcome::Timeout`].
+    ///
+    /// `timeout_ms == 0` means an *immediate* timeout — the watchdog's deadline has already
+    /// passed on its first check, so it interrupts at once and the result is a
+    /// [`RunToOutcome::Timeout`] with the target barely resumed. Note this is the opposite of
+    /// [`Self::execute_command_bounded`], where `0` disables the watchdog entirely. The
+    /// asymmetry is deliberate: there, an unbounded command is a documented escape hatch
+    /// (plain `execute_command`), whereas here "no bound" would mean waiting forever for a
+    /// target that may never reach `address`, hanging the single engine thread — the exact
+    /// outcome the watchdog exists to prevent.
     pub fn run_to_address(
         &self,
         address: u64,
