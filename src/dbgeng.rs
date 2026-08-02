@@ -577,8 +577,13 @@ impl DebugEngine {
 
     /// Shared tail of the kernel attach paths: wait (bounded) for the INITIAL_BREAK stop,
     /// clear the option, and absorb the one spurious re-break it leaves. Returns
-    /// [`DbgEngError::KernelBreakTimeout`] if the target never broke in within the bound
-    /// (e.g. unreachable or not in debug mode), rather than reporting a false success.
+    /// [`DbgEngError::KernelBreakTimeout`] if the target never broke in within the bound,
+    /// rather than reporting a false success.
+    ///
+    /// That covers a target that *connects* and then fails to break in (not booted in debug
+    /// mode, wedged). A target that never connects at all does not reach this error: the
+    /// watchdog cannot interrupt a dial that has not established its link, so the wait blocks
+    /// instead — see [`Self::wait_for_event_bounded`].
     fn wait_for_kernel_break_in(&self) -> Result<(), DbgEngError> {
         let (waited, timed_out) = self.wait_for_event_bounded(KERNEL_ATTACH_WAIT_MS);
         self.clear_initial_break();
@@ -793,6 +798,11 @@ impl DebugEngine {
     /// Limitation: `SetInterrupt` can only unblock a wait once the target is *connected*.
     /// A wait still establishing the KDNET link (e.g. an unreachable target) cannot be
     /// cancelled this way and will block like `kd` itself does on a dead connection.
+    /// Measured (`cargo run --example kdtest -- --timeout-probe`, in-box dbgeng on Windows 11
+    /// 26200): dialing a port nothing answers on returned from `AttachKernel` in ~8ms and was
+    /// still blocked in this wait when killed at 300s — five times `timeout_ms`, no return.
+    /// So the `bool` below can only ever be `true` for a target that connected; an
+    /// unreachable one hangs instead of timing out.
     fn wait_for_event_bounded(&self, timeout_ms: u32) -> (windows::core::Result<()>, bool) {
         let done = Arc::new(AtomicBool::new(false));
         let fired = Arc::new(AtomicBool::new(false));
