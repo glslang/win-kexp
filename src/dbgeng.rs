@@ -107,8 +107,13 @@ const LIVE_WAIT_MS: u32 = 30_000;
 const WAIT_INFINITE: u32 = u32::MAX;
 /// Upper bound (ms) on a live-kernel break-in wait. The wait itself must be INFINITE
 /// (a finite `WaitForEvent` returns `E_NOTIMPL` on a live kernel), so a watchdog forces
-/// it to return after this long — the single engine thread must not hang forever on an
-/// unreachable/unresponsive target. Generous, to allow a KDNET resync (~25s observed).
+/// it to return after this long. Generous, to allow a KDNET resync (~25s observed).
+///
+/// **Bounds less than it appears to.** The watchdog works by `SetInterrupt`, which only
+/// reaches a target that has *connected*, so this caps a connected-but-unresponsive target
+/// and nothing else. One that never dials in — powered off, wrong key, not booted with
+/// `bcdedit /debug on` — blocks past this bound indefinitely (measured: >300s, killed).
+/// See [`DebugEngine::attach_kernel`].
 const KERNEL_ATTACH_WAIT_MS: u32 = 60_000;
 
 /// Carries a raw `IDebugControl` pointer to a watchdog thread solely to call
@@ -540,6 +545,19 @@ impl DebugEngine {
     ///
     /// Returns an error rather than panicking when the connection string is invalid or
     /// the attach fails (e.g. the transport/port is already owned by another debugger).
+    ///
+    /// # Blocks indefinitely if the target never connects
+    ///
+    /// **This call has no effective upper bound.** If the guest does not dial in — powered
+    /// off, unreachable, wrong key, or (most commonly) not booted with `bcdedit /debug on` —
+    /// it blocks in the transport like `kd` does, and the `KERNEL_ATTACH_WAIT_MS` watchdog
+    /// cannot cancel it: `SetInterrupt` only reaches a wait whose target has *connected*.
+    /// Measured at over 300s against a 60s bound before the run was killed.
+    ///
+    /// [`DbgEngError::KernelBreakTimeout`] therefore covers only a target that connects and
+    /// *then* fails to break in — not the far more common case of one that never connects.
+    /// Callers that must stay responsive (a server, an MCP endpoint) should run this on a
+    /// thread they can abandon, since nothing can interrupt it from outside.
     ///
     /// Fuses the attach with the break-in wait, so a failure cannot say which half
     /// failed. Use [`Self::attach_kernel_begin`] when that matters.
@@ -1317,6 +1335,9 @@ impl<'a> PendingTarget<'a> {
     }
 
     /// Waits for the target's initial break, completing the open.
+    ///
+    /// For a kernel attach this can block **without bound** when the target never connects;
+    /// see [`DebugEngine::attach_kernel`]. User-mode waits are bounded by `LIVE_WAIT_MS`.
     pub fn wait(self) -> Result<(), DbgEngError> {
         match self.kind {
             WaitKind::Live => self.engine.wait_for_event(LIVE_WAIT_MS),
