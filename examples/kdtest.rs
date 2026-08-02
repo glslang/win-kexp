@@ -97,11 +97,31 @@ fn check_break_in_bookkeeping(e: &DebugEngine) {
         }
     };
     println!();
-    if out.contains("NtCreateFile") {
-        println!("[ok] stopped at the real breakpoint — INITIAL_BREAK cleared, artifact absorbed");
-    } else if out.contains("DbgBreakPointWithStatus") || out.contains("Break instruction exception")
-    {
+
+    // `g`'s own output is not a reliable witness for *where* the target stopped. A KDNET
+    // breakpoint stop came back as a bare "Breakpoint 0 hit" with no location line, which an
+    // earlier version of this check read as an unrecognized stop and reported a pass as `[??]`.
+    // Ask the engine for the current instruction instead — `u . L1` names the symbol whatever
+    // `g` chose to echo — and keep `g`'s text only as a secondary signal.
+    println!("--- u . L1 (where it actually stopped) ---");
+    let site = match e.execute_command("u . L1") {
+        Ok(site) => {
+            print!("{site}");
+            site
+        }
+        Err(err) => {
+            println!("ERR: {err}");
+            String::new()
+        }
+    };
+    println!();
+
+    // Test for the artifact first: it is the specific failure being ruled out, and a stop
+    // there is unambiguous, whereas "hit a breakpoint" has several spellings.
+    if site.contains("DbgBreakPointWithStatus") || out.contains("Break instruction exception") {
         println!("[FAIL] stopped at the initial-break artifact — wait()'s bookkeeping did not run");
+    } else if site.contains("NtCreateFile") || out.contains("Breakpoint") {
+        println!("[ok] stopped at the real breakpoint — INITIAL_BREAK cleared, artifact absorbed");
     } else {
         println!("[??] unrecognized stop — read the output above");
     }
