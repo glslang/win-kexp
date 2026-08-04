@@ -1530,10 +1530,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cell::Cell,
-        collections::{BTreeMap, HashMap},
-    };
+    use std::{cell::Cell, collections::HashMap};
 
     use super::*;
     use crate::pool::{
@@ -1556,18 +1553,23 @@ mod tests {
 
     /// Sparse synthetic memory, stored as coalesced contiguous runs.
     ///
-    /// Built from a byte-keyed `BTreeMap` — which is the natural way to *write* the fixture,
-    /// and cheap, since setup happens once — then frozen into runs for reading. The naive form
-    /// kept the map and did one `BTreeMap::get` per byte in `read_exact`; native runs absorbed
-    /// that, but under Miri every lookup is interpreted and borrow-checked, and the two pool
-    /// snapshot tests took 18m13s and 5m44s of a ~28 minute CI job. Runs turn each read into a
-    /// binary search plus a `memcpy`, with identical semantics: a byte is readable iff it was
-    /// written, so a read spanning a gap still fails.
+    /// Both the read and the write path are shaped to keep Miri off per-byte work, and the two
+    /// were found in separate rounds.
     ///
-    /// Measured, not assumed: those two tests together run in 366s here versus 731s with the
-    /// byte map, on the same machine — **2.0x**, not the order of magnitude the lookup count
-    /// suggests. Most of what remains is Miri interpreting the walk itself rather than the
-    /// fixture, so this is worth having but is not the whole story.
+    /// Reads resolve through a binary search over runs, not the `BTreeMap<u64, u8>` this began
+    /// as with one `get` per byte. Semantics are unchanged — a byte is readable iff it was
+    /// written, so a read spanning a gap still fails — and that was worth 2.0x.
+    ///
+    /// Writes go through [`Writes`], a log replayed in bulk, rather than building that byte map
+    /// at all. The read fix left the two pool snapshot tests at 398s and 369s of an 849s CI job,
+    /// and the second of them is three assertions over a fixture — so what remained was never
+    /// "Miri interpreting the walk", which is what the previous round of this comment concluded.
+    /// It was the ~22k `BTreeMap` inserts `fill`/`put` performed to build the fixture in the
+    /// first place, each a fully interpreted, borrow-checked trip through `NodeRef` and raw
+    /// pointers. Bulk `copy_from_slice` over a handful of runs is one Miri operation per write.
+    ///
+    /// Measured, not assumed: on one machine that second test alone took 178.4s before the
+    /// write fix; both tests together now take 6.1s.
     struct SyntheticMemory {
         /// `(start, bytes)` for each contiguous written range, sorted by `start` and never
         /// overlapping or abutting.
@@ -1575,18 +1577,49 @@ mod tests {
         holes: Vec<(u64, u64)>,
     }
 
+    /// The fixture's write log: `(address, bytes)` in the order written, later writes winning.
+    ///
+    /// A plain append-only `Vec`, one entry per `put`/`fill` call rather than per byte, so the
+    /// whole fixture is a few dozen pushes and bulk copies instead of ~22k `BTreeMap` inserts.
+    #[derive(Default)]
+    struct Writes(Vec<(u64, Vec<u8>)>);
+
     impl SyntheticMemory {
-        fn new(bytes: BTreeMap<u64, u8>, holes: Vec<(u64, u64)>) -> Self {
+        fn new(writes: Writes, holes: Vec<(u64, u64)>) -> Self {
+            // Extents first: merge every written interval that overlaps or abuts a neighbour,
+            // which yields exactly the runs the byte map used to produce by iterating in key
+            // order. Sorting is safe here because an extent carries no value to be overwritten.
+            let mut extents: Vec<(u64, u64)> = writes
+                .0
+                .iter()
+                .filter(|(_, data)| !data.is_empty())
+                .map(|(address, data)| (*address, address + data.len() as u64))
+                .collect();
+            extents.sort_unstable();
             let mut runs: Vec<(u64, Vec<u8>)> = Vec::new();
-            for (address, byte) in bytes {
+            for (start, end) in extents {
                 match runs.last_mut() {
-                    // `BTreeMap` iterates in key order, so a run extends whenever the next
-                    // address is the one after the last byte written.
-                    Some((start, data)) if *start + data.len() as u64 == address => {
-                        data.push(byte);
+                    Some((run_start, data)) if start <= *run_start + data.len() as u64 => {
+                        let len = (end - *run_start) as usize;
+                        // A contained write leaves the run as it is; only a write reaching past
+                        // the current end grows it.
+                        if len > data.len() {
+                            data.resize(len, 0);
+                        }
                     }
-                    _ => runs.push((address, vec![byte])),
+                    _ => runs.push((start, vec![0; (end - start) as usize])),
                 }
+            }
+            // Then replay in write order, so the last write to an address wins — the property
+            // that re-inserting into the byte map used to provide.
+            for (address, data) in writes.0.into_iter().filter(|(_, data)| !data.is_empty()) {
+                let index = runs
+                    .partition_point(|(start, _)| *start <= address)
+                    .checked_sub(1)
+                    .expect("every non-empty write contributed an extent");
+                let (start, run) = &mut runs[index];
+                let offset = (address - *start) as usize;
+                run[offset..offset + data.len()].copy_from_slice(&data);
             }
             Self { runs, holes }
         }
@@ -1889,27 +1922,23 @@ mod tests {
         }
     }
 
-    fn put(bytes: &mut BTreeMap<u64, u8>, address: u64, data: &[u8]) {
-        bytes.extend(
-            data.iter()
-                .enumerate()
-                .map(|(offset, byte)| (address + offset as u64, *byte)),
-        );
+    fn put(bytes: &mut Writes, address: u64, data: &[u8]) {
+        bytes.0.push((address, data.to_vec()));
     }
 
-    fn fill(bytes: &mut BTreeMap<u64, u8>, address: u64, size: usize) {
-        put(bytes, address, &vec![0; size]);
+    fn fill(bytes: &mut Writes, address: u64, size: usize) {
+        bytes.0.push((address, vec![0; size]));
     }
 
-    fn put_u16(bytes: &mut BTreeMap<u64, u8>, address: u64, value: u16) {
+    fn put_u16(bytes: &mut Writes, address: u64, value: u16) {
         put(bytes, address, &value.to_le_bytes());
     }
 
-    fn put_u32(bytes: &mut BTreeMap<u64, u8>, address: u64, value: u32) {
+    fn put_u32(bytes: &mut Writes, address: u64, value: u32) {
         put(bytes, address, &value.to_le_bytes());
     }
 
-    fn put_u64(bytes: &mut BTreeMap<u64, u8>, address: u64, value: u64) {
+    fn put_u64(bytes: &mut Writes, address: u64, value: u64) {
         put(bytes, address, &value.to_le_bytes());
     }
 
@@ -1917,14 +1946,14 @@ mod tests {
         (entry << 4) | 3
     }
 
-    fn pool_header(bytes: &mut BTreeMap<u64, u8>, address: u64, tag: &[u8; 4]) {
+    fn pool_header(bytes: &mut Writes, address: u64, tag: &[u8; 4]) {
         fill(bytes, address, 0x10);
         put(bytes, address, &[1, 0, 4, 1]);
         put(bytes, address + 8, tag);
     }
 
     fn synthetic_memory() -> SyntheticMemory {
-        let mut bytes = BTreeMap::new();
+        let mut bytes = Writes::default();
         fill(&mut bytes, STATE, 0x200);
         put_u32(&mut bytes, STATE, 1);
         for heap_index in 0..4 {
