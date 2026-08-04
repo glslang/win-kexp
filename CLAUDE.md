@@ -107,7 +107,7 @@ When touching this module, mind the `owns_session` invariant, the stdout-isolati
 Three workflows run on **Windows runners only**:
 - **ci.yml**: fmt check → build → `cargo nextest run` on both `windows-latest` (x64) and `windows-11-arm` (ARM64) with stable Rust
 - **coverage.yml**: grcov + LLVM instrumentation → Codecov upload
-- **miri.yml**: `cargo miri test` on nightly with `MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"`
+- **miri.yml**: `cargo miri nextest run` on nightly with `MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"`, plus a `cargo miri test --doc` step for the doctests nextest cannot run
 
 CI installs MASM/ARMASM tooling via `glslang/setup-masm` (`ci.yml` uses `@v1.4`, `coverage.yml` uses `@v1`, `miri.yml` uses `@v1.2`), so assemblers are always available there. Local builds without assemblers silently activate `shellcode_fallback`.
 
