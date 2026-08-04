@@ -15,7 +15,8 @@ on:
 concurrency:
   # A superseded push or PR update should cancel its predecessor. Without this every push to a
   # PR left its predecessor running to completion — five pushes to one PR meant five concurrent
-  # Miri runs, which for Miri is five times ~28 minutes of runner doing work nobody will read.
+  # Miri runs, which back when a run took ~28 minutes was most of an hour of runner time nobody
+  # would read. The run is far shorter now, but the reasoning does not depend on the duration.
   #
   # Manual dispatches are deliberately excluded. A dispatch shares `github.ref` with the
   # branch's own run, so a shared group would have the two cancel each other, and a repeat
@@ -41,9 +42,30 @@ jobs:
         run: |
           rustup toolchain install nightly --component miri,rust-src
           rustup override set nightly
+      # After the toolchain install, never before: rust-cache derives its key from the active
+      # rustc, so caching earlier would key everything on stable and restore the wrong artifacts.
+      # A nightly bump changes the key and rebuilds, which is what we want — the Miri sysroot in
+      # `cache-directories` is toolchain-specific and must never outlive the toolchain that
+      # produced it. Within one nightly this turns `cargo miri setup` into a no-op.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri
+          cache-directories: "~/AppData/Local/rust-lang/miri/cache"
+      - uses: taiki-e/install-action@nextest
       - name: Setup Miri sysroot
         run: cargo miri setup
+      # nextest, not `cargo miri test`, because libtest's threads all share one interpreter —
+      # Miri interleaves them rather than running them in parallel, so a multi-core runner buys
+      # nothing. nextest puts each test in its own process, which is real parallelism: 27.5s
+      # against 43.7s locally. The cost is ~1.3s of sysroot load per test process, so this is a
+      # win only while the suite is short; revisit if a single test starts to dominate again.
       - name: Run Miri
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks"
-        run: cargo miri test --verbose
+        run: cargo miri nextest run
+      # nextest cannot run doctests, and ci.yml is on nextest too — without this step the crate's
+      # doctests would run nowhere in CI. It is ~0.3s on top of an already-built tree.
+      - name: Run Miri doctests
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks"
+        run: cargo miri test --doc
