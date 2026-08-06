@@ -10,13 +10,15 @@ pub(crate) mod layout;
 pub(crate) mod render;
 pub(crate) mod snapshot;
 
+pub mod query;
+
 pub(crate) use index::PoolIndex;
 pub(crate) use snapshot::PoolSnapshot;
 
 /// Exact allocator identity.  Values are deliberately not collapsed into just
 /// paged/nonpaged because crossing one of these boundaries creates false holes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum PoolKind {
+pub enum PoolKind {
     NonPagedExecutable,
     NonPagedNx,
     Paged,
@@ -28,7 +30,7 @@ pub(crate) enum PoolKind {
 }
 
 impl PoolKind {
-    pub(crate) fn is_paged(self) -> bool {
+    pub fn is_paged(self) -> bool {
         matches!(
             self,
             Self::Paged | Self::PrototypePaged | Self::SpecialPaged | Self::SpecialPrototypePaged
@@ -37,7 +39,7 @@ impl PoolKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum PoolBackend {
+pub enum PoolBackend {
     Lfh,
     Vs,
     Segment,
@@ -45,7 +47,7 @@ pub(crate) enum PoolBackend {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PoolState {
+pub enum PoolState {
     Allocated,
     ReusableFree,
     CachedFree,
@@ -53,14 +55,14 @@ pub(crate) enum PoolState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct HeapIdentity {
+pub struct HeapIdentity {
     pub pool_state: u64,
     pub heap: u64,
     pub special: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PoolSpan {
+pub struct PoolSpan {
     pub header_address: u64,
     pub usable_address: u64,
     pub size: u64,
@@ -76,11 +78,11 @@ pub(crate) struct PoolSpan {
 }
 
 impl PoolSpan {
-    pub(crate) fn end(&self) -> u64 {
+    pub fn end(&self) -> u64 {
         self.usable_address.saturating_add(self.size)
     }
 
-    pub(crate) fn contains_address(&self, address: u64) -> bool {
+    pub fn contains_address(&self, address: u64) -> bool {
         address >= self.header_address && address < self.end()
     }
 
