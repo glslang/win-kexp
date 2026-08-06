@@ -479,6 +479,113 @@ fn discover_pool_regions(
     Ok(discovery)
 }
 
+/// One place carrying VS free-chunk state.
+struct VsRoot {
+    base: u64,
+    tree_offset: usize,
+    delay_offset: Option<usize>,
+}
+
+/// Resolves where a VS context keeps its free-chunk state. Both shapes are supported,
+/// because a debugger host does not get to choose which build it is pointed at:
+///
+/// * **pre-26100** — `FreeChunkTree`/`DelayFreeContext` are inline in `_HEAP_VS_CONTEXT`,
+///   so there is exactly one root: the context itself.
+/// * **26100+** — they moved into `_HEAP_VS_AFFINITY_SLOT`s reached through a slot map.
+///   `SlotMapRef` and each `SlotRef` are offsets *from the context*, scaled by 64 bytes,
+///   and the map holds `AffinityMask + 1` entries. Entries routinely share a slot, so the
+///   result is deduplicated.
+///
+/// Returning an empty vector means neither shape resolved; the caller then walks no VS
+/// evidence rather than guessing at an address.
+fn vs_roots(
+    memory: &impl PoolMemory,
+    layout: &PoolLayout,
+    context: u64,
+    diagnostics: &mut Vec<String>,
+) -> Vec<VsRoot> {
+    // Legacy shape wins when present: a context that still carries the tree has no slots.
+    if let Ok(tree_offset) = layout.field("_HEAP_VS_CONTEXT", "FreeChunkTree") {
+        return vec![VsRoot {
+            base: context,
+            tree_offset,
+            delay_offset: layout.field("_HEAP_VS_CONTEXT", "DelayFreeContext").ok(),
+        }];
+    }
+
+    let (Ok(tree_offset), Ok(back_offset), Ok(slot_map_ref_offset), Ok(affinity_offset)) = (
+        layout.field("_HEAP_VS_AFFINITY_SLOT", "FreeChunkTree"),
+        layout.field("_HEAP_VS_AFFINITY_SLOT", "VsContext"),
+        layout.field("_HEAP_VS_CONTEXT", "SlotMapRef"),
+        layout.field("_HEAP_VS_CONTEXT", "AffinityMask"),
+    ) else {
+        diagnostics
+            .push("VS free-chunk state is in neither the context nor an affinity slot".into());
+        return Vec::new();
+    };
+
+    let (Ok(slot_map_ref), Ok(affinity_mask)) = (
+        scalar(memory, context + slot_map_ref_offset as u64, 2),
+        scalar(memory, context + affinity_offset as u64, 1),
+    ) else {
+        diagnostics.push(format!(
+            "cannot read the VS slot map of context {context:#x}"
+        ));
+        return Vec::new();
+    };
+
+    let entries = affinity_mask as usize + 1;
+    // A zero ref would alias the context, and the entry count is bounded by the affinity
+    // mask; both would otherwise walk arbitrary memory.
+    if slot_map_ref == 0 || entries > 256 {
+        diagnostics.push(format!(
+            "implausible VS slot map for context {context:#x}: ref {slot_map_ref:#x}, {entries} entries"
+        ));
+        return Vec::new();
+    }
+
+    let entry_size = layout
+        .type_layout("_HEAP_VS_SLOT_MAP")
+        .map_or(4, |map| map.size as u64);
+    let slot_ref_offset = layout.field("_HEAP_VS_SLOT_MAP", "SlotRef").unwrap_or(0);
+    let delay_offset = layout
+        .field("_HEAP_VS_AFFINITY_SLOT", "DelayFreeContext")
+        .ok();
+    let slot_map = context + (slot_map_ref << 6);
+
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    for index in 0..entries {
+        let entry = slot_map + index as u64 * entry_size;
+        let Ok(slot_ref) = scalar(memory, entry + slot_ref_offset as u64, 2) else {
+            continue;
+        };
+        if slot_ref == 0 {
+            continue;
+        }
+        let slot = context + (slot_ref << 6);
+        if !seen.insert(slot) {
+            continue;
+        }
+        // Require the slot to name the context we came from. A misdecoded SlotRef would
+        // otherwise point the tree walk at unrelated memory that happens to be readable.
+        match scalar(memory, slot + back_offset as u64, 8) {
+            Ok(owner) if owner == context => roots.push(VsRoot {
+                base: slot,
+                tree_offset,
+                delay_offset,
+            }),
+            Ok(owner) => diagnostics.push(format!(
+                "VS affinity slot {slot:#x} claims context {owner:#x}, not {context:#x}; skipped"
+            )),
+            Err(error) => {
+                diagnostics.push(format!("cannot read VS affinity slot {slot:#x}: {error}"))
+            }
+        }
+    }
+    roots
+}
+
 fn discover_vs_evidence(
     memory: &impl PoolMemory,
     layout: &PoolLayout,
@@ -491,23 +598,28 @@ fn discover_vs_evidence(
         return Ok(Default::default());
     };
     let context = heap_address + vs_context_offset as u64;
-    let Ok(tree_offset) = layout.field("_HEAP_VS_CONTEXT", "FreeChunkTree") else {
+    let roots = vs_roots(memory, layout, context, diagnostics);
+    if roots.is_empty() {
         return Ok(Default::default());
-    };
+    }
     let tree_node_offset = layout
         .field("_HEAP_VS_CHUNK_FREE_HEADER", "TreeNode")
         .unwrap_or(0);
-    let reusable = tree_nodes(
-        memory,
-        layout,
-        context + tree_offset as u64,
-        limit,
-        "VS free tree",
-        diagnostics,
-    )?
-    .into_iter()
-    .map(|node| node.saturating_sub(tree_node_offset as u64))
-    .collect();
+    let mut reusable = HashSet::new();
+    for root in &roots {
+        reusable.extend(
+            tree_nodes(
+                memory,
+                layout,
+                root.base + root.tree_offset as u64,
+                limit,
+                "VS free tree",
+                diagnostics,
+            )?
+            .into_iter()
+            .map(|node| node.saturating_sub(tree_node_offset as u64)),
+        );
+    }
 
     let mut cached = HashSet::new();
     let pool_header_size = layout
@@ -516,19 +628,28 @@ fn discover_vs_evidence(
     let vs_header_size = layout
         .type_layout("_HEAP_VS_CHUNK_HEADER")
         .map_or(0, |value| value.size as u64);
-    if let (Ok(delay_offset), Ok(list_offset)) = (
-        layout.field("_HEAP_VS_CONTEXT", "DelayFreeContext"),
-        layout.field("_HEAP_VS_DELAY_FREE_CONTEXT", "ListHead"),
-    ) {
-        for entry in walk_slist_nodes(
-            memory,
-            layout,
-            context + delay_offset as u64 + list_offset as u64,
-            limit,
-            "VS delay-free",
-            diagnostics,
-        )? {
-            insert_cached_chunk_candidates(&mut cached, entry, pool_header_size, vs_header_size);
+    if let Ok(list_offset) = layout.field("_HEAP_VS_DELAY_FREE_CONTEXT", "ListHead") {
+        for root in &roots {
+            // Pre-26100 the delay-free list sits beside the tree in the context; from
+            // 26100 it is per-slot. Either way it is a known offset from `root.base`.
+            let Some(delay_offset) = root.delay_offset else {
+                continue;
+            };
+            for entry in walk_slist_nodes(
+                memory,
+                layout,
+                root.base + delay_offset as u64 + list_offset as u64,
+                limit,
+                "VS delay-free",
+                diagnostics,
+            )? {
+                insert_cached_chunk_candidates(
+                    &mut cached,
+                    entry,
+                    pool_header_size,
+                    vs_header_size,
+                );
+            }
         }
     }
 
@@ -826,7 +947,15 @@ fn discover_segment_context(
                 descriptor_index += unit_size.max(1);
                 continue;
             }
-            let backend = if decoded.flags & DESCRIPTOR_FLAG_LFH != 0 {
+            // Verifier special pool sets DESCRIPTOR_FLAG_LFH on its page-range descriptors,
+            // but the page holds a pool header plus fill rather than a subsegment. Parsing
+            // it as LFH rejects the range outright ("implausible LFH metadata") *during
+            // region creation*, so the allocation never reaches the walk at all — which is
+            // why classifying it correctly here, and not just at dispatch time, is what
+            // makes special-pool chunks visible. `walk_region` routes on `heap.special`.
+            let backend = if identity.special {
+                PoolBackend::Segment
+            } else if decoded.flags & DESCRIPTOR_FLAG_LFH != 0 {
                 PoolBackend::Lfh
             } else if decoded.flags & DESCRIPTOR_FLAG_VS != 0 {
                 PoolBackend::Vs
@@ -1173,6 +1302,31 @@ pub(crate) struct SnapshotWalker<'a, M> {
     pub traversal_limit: usize,
 }
 
+/// Where a special-pool block sits inside its page, and how big it is.
+///
+/// Free-standing because the 16-byte rounding is both the easiest part to get wrong and
+/// the only part worth pinning in a test: `PAGE_SIZE - size` puts the answer 8 bytes past
+/// the real block for a 0x68 allocation.
+///
+/// Returns `(usable_address, size)`. The fallback — page-sized, starting after the header
+/// — is used whenever `requested` cannot be trusted, which is any time the 8-bit
+/// `PreviousSize` field cannot describe the block (zero, or too large for the page). An
+/// over-broad chunk still answers "was this freed, and which tag owned it"; a confidently
+/// wrong offset does not.
+fn special_pool_placement(
+    page: u64,
+    requested: u64,
+    header_size: u64,
+    available: u64,
+) -> (u64, u64) {
+    let aligned = requested.next_multiple_of(16);
+    if requested != 0 && aligned + header_size <= PAGE_SIZE {
+        (page + PAGE_SIZE - aligned, requested)
+    } else {
+        (page + header_size, available.saturating_sub(header_size))
+    }
+}
+
 impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
     pub(crate) fn walk(&self) -> Result<PoolSnapshot, SnapshotError> {
         let mut snapshot = PoolSnapshot {
@@ -1248,6 +1402,16 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                     continue;
                 }
             };
+            // Verifier special pool is page-granular, and its page-range descriptors still
+            // carry DESCRIPTOR_FLAG_LFH — so this has to come *before* the backend
+            // dispatch. Left to `walk_lfh`, the range's "subsegment header" is really a
+            // pool header plus fill, the block bitmap is nonsense, and every allocation in
+            // the heap silently disappears from the snapshot.
+            if region.heap.special {
+                self.walk_special_pool(region, valid_base, &bytes, snapshot);
+                cursor = valid_end;
+                continue;
+            }
             match region.backend {
                 PoolBackend::Lfh => self.walk_lfh(region, valid_base, &bytes, snapshot),
                 PoolBackend::Vs => self.walk_vs(region, valid_base, &bytes, snapshot),
@@ -1320,6 +1484,65 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 0,
                 PoolState::Unreadable,
             ));
+        }
+    }
+
+    /// Decodes a Driver Verifier special-pool region, one allocation per page.
+    ///
+    /// Special pool gives every allocation its own page: a `_POOL_HEADER` at the page
+    /// start, `0xfd` fill, then the caller's block pushed up against the page end so an
+    /// overrun lands on the following guard page. The guard page is unmapped, which is
+    /// why `valid_region` stops after the data page and why a *freed* allocation simply
+    /// vanishes — both are the mechanism working, not read failures.
+    ///
+    /// The block is placed at `page + PAGE_SIZE - align_up(size, 16)`; the 16-byte
+    /// alignment is easy to miss, and dropping it puts the reported address 8 bytes past
+    /// the real one (`0xf98` instead of `0xf90` for a 0x68 allocation).
+    fn walk_special_pool(
+        &self,
+        region: &PoolRegion,
+        base: u64,
+        bytes: &[u8],
+        snapshot: &mut PoolSnapshot,
+    ) {
+        let header_size = region.pool_header.size as u64;
+        let mut page = base.next_multiple_of(PAGE_SIZE);
+        while let Some(offset) = page.checked_sub(base).map(|delta| delta as usize) {
+            if offset >= bytes.len() {
+                break;
+            }
+            let available = ((bytes.len() - offset) as u64).min(PAGE_SIZE);
+            let Some(header) = decode_pool_header(bytes, offset, region.pool_header) else {
+                break;
+            };
+            // An untagged page is not an allocation. Freed special-pool pages are
+            // unmapped rather than zeroed, so anything readable here should carry a tag.
+            if header.tag != 0 {
+                // `PreviousSize` carries the requested byte count, but it is only 8 bits
+                // wide, so it cannot describe an allocation of 0x100 bytes or more. When
+                // it does not yield a block that fits the page, report the whole page
+                // rather than a confidently wrong sub-range — an over-broad chunk still
+                // answers "was this freed, and what tag owned it", which is the question
+                // being asked, while a wrong offset quietly misleads.
+                let (usable, size) = special_pool_placement(
+                    page,
+                    u64::from(header.previous_size),
+                    header_size,
+                    available,
+                );
+                snapshot.spans.push(self.base_span(
+                    region,
+                    page,
+                    usable,
+                    size,
+                    header.tag,
+                    PoolState::Allocated,
+                ));
+            }
+            let Some(next) = page.checked_add(PAGE_SIZE) else {
+                break;
+            };
+            page = next;
         }
     }
 
@@ -1533,6 +1756,50 @@ mod tests {
     use std::{cell::Cell, collections::HashMap};
 
     use super::*;
+
+    /// The real values read off Server 26100.32995: a 0x68 message in special pool sits at
+    /// page+0xf90, not page+0xf98. Rounding the request up to 16 is what makes the
+    /// difference, and getting it wrong reports an address 8 bytes into the block.
+    #[test]
+    fn special_pool_block_is_pushed_against_the_page_end_with_16_byte_rounding() {
+        let page = 0xffff_8c8f_13a0_2000;
+        assert_eq!(
+            special_pool_placement(page, 0x68, 0x10, PAGE_SIZE),
+            (page + 0xf90, 0x68)
+        );
+        // Already a multiple of 16: no rounding, block ends exactly at the page end.
+        assert_eq!(
+            special_pool_placement(page, 0x40, 0x10, PAGE_SIZE),
+            (page + 0xfc0, 0x40)
+        );
+    }
+
+    /// `PreviousSize` is 8 bits, so it cannot describe every legal special-pool block.
+    /// When it is unusable the whole page is reported rather than a wrong sub-range.
+    #[test]
+    fn special_pool_falls_back_to_the_page_when_the_size_is_untrustworthy() {
+        let page = 0xffff_8c8f_13a0_2000;
+        assert_eq!(
+            special_pool_placement(page, 0, 0x10, PAGE_SIZE),
+            (page + 0x10, PAGE_SIZE - 0x10)
+        );
+        // A request that cannot share the page with its own header is not believable.
+        assert_eq!(
+            special_pool_placement(page, PAGE_SIZE, 0x10, PAGE_SIZE),
+            (page + 0x10, PAGE_SIZE - 0x10)
+        );
+    }
+
+    /// A partially readable page (the guard page truncates the read) must not report a
+    /// size past what was actually read.
+    #[test]
+    fn special_pool_fallback_respects_the_readable_length() {
+        let page = 0xffff_8c8f_13a0_2000;
+        assert_eq!(
+            special_pool_placement(page, 0, 0x10, 0x200),
+            (page + 0x10, 0x1f0)
+        );
+    }
     use crate::pool::{
         decode::DESCRIPTOR_FLAG_COMMITTED,
         layout::{SessionKey, TypeLayout},
