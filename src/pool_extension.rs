@@ -1,34 +1,19 @@
 use std::ffi::{CStr, c_void};
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_UNEXPECTED, S_OK};
-use windows::Win32::System::Diagnostics::Debug::Extensions::{
-    DEBUG_STATUS_BREAK, DEBUG_STATUS_NO_DEBUGGEE,
-};
 use windows::core::{HRESULT, IUnknown, Interface, PCSTR};
 
 use crate::dbgeng::DebugEngine;
 use crate::pool::decode::parse_tag;
-use crate::pool::index::SnapshotCache;
-use crate::pool::layout::{LayoutCache, SessionKey};
+use crate::pool::query;
 use crate::pool::render::{RenderOptions, render_pool_map};
-use crate::pool::snapshot::SnapshotWalker;
 
-const IMAGE_FILE_MACHINE_AMD64: u32 = 0x8664;
 const DEBUG_NOTIFY_SESSION_ACTIVE: u32 = 0x0000_0000;
 const DEBUG_NOTIFY_SESSION_INACTIVE: u32 = 0x0000_0001;
 const DEBUG_NOTIFY_SESSION_ACCESSIBLE: u32 = 0x0000_0002;
 const DEBUG_NOTIFY_SESSION_INACCESSIBLE: u32 = 0x0000_0003;
-
-static SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-fn snapshots() -> &'static SnapshotCache {
-    static CACHE: OnceLock<SnapshotCache> = OnceLock::new();
-    CACHE.get_or_init(SnapshotCache::default)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PoolFilter {
@@ -54,12 +39,6 @@ fn parse_address(text: &str) -> Option<u64> {
     (!digits.is_empty())
         .then(|| u64::from_str_radix(digits, 16).ok())
         .flatten()
-}
-
-fn validate_pool_target(processor: u32) -> Result<(), String> {
-    (processor == IMAGE_FILE_MACHINE_AMD64)
-        .then_some(())
-        .ok_or_else(|| format!("pool walking supports x64 targets only (machine {processor:#x})"))
 }
 
 fn parse_args(args: &str) -> Result<PoolCommand, String> {
@@ -143,41 +122,7 @@ fn args_string(args: PCSTR) -> Result<String, String> {
 
 fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
     let command = parse_args(args)?;
-    if !engine
-        .is_kernel_target()
-        .map_err(|error| error.to_string())?
-    {
-        return Err("poolmap requires a kernel target".into());
-    }
-    let status = engine
-        .execution_status()
-        .map_err(|error| error.to_string())?;
-    if status == DEBUG_STATUS_NO_DEBUGGEE {
-        return Err("no accessible target is attached".into());
-    }
-    if status != DEBUG_STATUS_BREAK {
-        return Err("target is running; break in before taking a pool snapshot".into());
-    }
-    let processor = engine.processor_type().map_err(|error| error.to_string())?;
-    validate_pool_target(processor)?;
-    let kernel_base = engine.kernel_base().map_err(|error| error.to_string())?;
-    let generation = SESSION_GENERATION.load(Ordering::Acquire);
-    let key = SessionKey {
-        kernel_base,
-        session: generation,
-    };
-    let layout = LayoutCache::global()
-        .get_or_resolve(engine, key)
-        .map_err(|error| error.to_string())?;
-    let index = snapshots().get_or_refresh(generation, command.refresh, || {
-        SnapshotWalker {
-            memory: engine,
-            layout: &layout,
-            traversal_limit: 1_000_000,
-        }
-        .walk()
-        .map_err(|error| error.to_string())
-    })?;
+    let index = query::prepare_index(engine, command.refresh).map_err(|error| error.to_string())?;
 
     if let Some(address) = command.address {
         let detail = index
@@ -293,16 +238,14 @@ pub unsafe extern "system" fn DebugExtensionUninitialize() {
 pub unsafe extern "system" fn DebugExtensionNotify(notify: u32, _argument: u64) {
     let _ = catch_unwind(AssertUnwindSafe(|| match notify {
         DEBUG_NOTIFY_SESSION_ACTIVE | DEBUG_NOTIFY_SESSION_INACTIVE => invalidate_session(),
-        DEBUG_NOTIFY_SESSION_INACCESSIBLE => snapshots().invalidate(),
+        DEBUG_NOTIFY_SESSION_INACCESSIBLE => query::snapshots().invalidate(),
         DEBUG_NOTIFY_SESSION_ACCESSIBLE => {}
         _ => {}
     }));
 }
 
 fn invalidate_session() {
-    SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
-    snapshots().invalidate();
-    LayoutCache::global().invalidate();
+    query::invalidate_session();
 }
 
 #[unsafe(no_mangle)]
@@ -351,11 +294,6 @@ mod tests {
         );
         assert!(parse_args("-tag ABCDE").is_err());
         assert!(parse_args("-tag Test -paged -nonpaged").is_err());
-        assert_eq!(validate_pool_target(IMAGE_FILE_MACHINE_AMD64), Ok(()));
-        assert_eq!(
-            validate_pool_target(0xaa64),
-            Err("pool walking supports x64 targets only (machine 0xaa64)".into())
-        );
 
         let mut span = crate::pool::PoolSpan::allocation(
             0x1010,
@@ -377,9 +315,9 @@ mod tests {
         assert!(!span.contains_address(0x0fff));
         assert!(!span.contains_address(0x1030));
 
-        let before = SESSION_GENERATION.load(Ordering::Acquire);
+        let before = query::generation();
         unsafe { DebugExtensionNotify(DEBUG_NOTIFY_SESSION_INACTIVE, 0) };
-        assert!(SESSION_GENERATION.load(Ordering::Acquire) > before);
+        assert!(query::generation() > before);
         assert_eq!(
             unsafe { poolmap(std::ptr::null_mut(), PCSTR::null()) },
             E_FAIL
