@@ -106,12 +106,13 @@ const TYPES: &[TypeSpec] = &[
             ("TreeSignature", &["TreeSignature"]),
         ],
     },
+    // Deliberately no *required* fields. The VS free-chunk state lives inside this
+    // struct on older builds, and from Windows 26100 it moved into a separately
+    // addressed _HEAP_VS_AFFINITY_SLOT. Both shapes are resolved optionally below;
+    // requiring either one here would refuse to walk half the world.
     TypeSpec {
         name: "_HEAP_VS_CONTEXT",
-        fields: &[
-            ("FreeChunkTree", &["FreeChunkTree"]),
-            ("DelayFreeContext", &["DelayFreeContext"]),
-        ],
+        fields: &[],
     },
     TypeSpec {
         name: "_HEAP_VS_DELAY_FREE_CONTEXT",
@@ -174,6 +175,22 @@ const TYPES: &[TypeSpec] = &[
 ];
 
 const OPTIONAL_TYPES: &[TypeSpec] = &[
+    // Windows 26100+: the VS free-chunk tree, subsegment list and delay-free list moved
+    // out of _HEAP_VS_CONTEXT into one of these per-affinity slots. Absent on older
+    // builds, where the same state is inline in the context.
+    TypeSpec {
+        name: "_HEAP_VS_AFFINITY_SLOT",
+        fields: &[
+            ("VsContext", &["VsContext"]),
+            ("FreeChunkTree", &["FreeChunkTree"]),
+            ("DelayFreeContext", &["DelayFreeContext"]),
+        ],
+    },
+    // One entry per affinity; SlotRef locates the slot itself.
+    TypeSpec {
+        name: "_HEAP_VS_SLOT_MAP",
+        fields: &[("SlotRef", &["SlotRef"])],
+    },
     TypeSpec {
         name: "_RTL_DYNAMIC_LOOKASIDE",
         fields: &[("BucketCount", &["BucketCount"]), ("Buckets", &["Buckets"])],
@@ -214,6 +231,17 @@ const OPTIONAL_FIELDS: &[(&str, &str, &[&str])] = &[
         &["AffinitySlots", "AffinitizedInfoArrays"],
     ),
     ("_RTL_LOOKASIDE", "Size", &["Size", "SizeClass"]),
+    // Legacy (pre-26100) in-context VS state.
+    ("_HEAP_VS_CONTEXT", "FreeChunkTree", &["FreeChunkTree"]),
+    (
+        "_HEAP_VS_CONTEXT",
+        "DelayFreeContext",
+        &["DelayFreeContext"],
+    ),
+    // 26100+: locate the affinity slots. Both are self-relative to the VS context and
+    // scaled by 64 bytes; the slot map holds AffinityMask + 1 entries.
+    ("_HEAP_VS_CONTEXT", "SlotMapRef", &["SlotMapRef"]),
+    ("_HEAP_VS_CONTEXT", "AffinityMask", &["AffinityMask"]),
 ];
 
 const GLOBALS: &[(&str, &[&str])] = &[

@@ -96,13 +96,27 @@ pub(crate) fn decode_descriptor_at(
     decode_descriptor(unit_size | (flags << 24))
 }
 
+/// Whether a `_HEAP_PAGE_SEGMENT.Signature` authenticates the segment.
+///
+/// Two mixes exist in the wild and both are accepted, because rejecting a segment is not a
+/// soft failure — it discards every chunk inside it, and rejecting *all* segments makes the
+/// walk quietly return an empty pool:
+///
+/// * older builds fold [`PAGE_SEGMENT_SIGNATURE`] into the mix;
+/// * **Windows 26100** dropped it, leaving `segment ^ context ^ heap_key`.
+///
+/// Accepting either is safe: both are exact 64-bit comparisons against values derived from
+/// the segment's own address and the per-boot heap key, so a false accept is not a practical
+/// risk. Verified on Server 26100.32995, where two independent segments matched the
+/// constant-free form exactly and the constant-bearing form not at all.
 pub(crate) fn valid_page_segment_signature(
     signature: u64,
     segment: u64,
     context: u64,
     heap_key: u64,
 ) -> bool {
-    signature == segment ^ context ^ heap_key ^ PAGE_SEGMENT_SIGNATURE
+    let mixed = segment ^ context ^ heap_key;
+    signature == mixed ^ PAGE_SEGMENT_SIGNATURE || signature == mixed
 }
 
 pub(crate) fn valid_descriptor_tree_signature(signature: u32) -> bool {
@@ -368,6 +382,37 @@ mod tests {
                 .pool_index,
             3
         );
+    }
+
+    /// Windows 26100 dropped the constant from the page-segment signature mix. Both forms
+    /// must authenticate, or the walk rejects every segment on one build family or the
+    /// other and reports an empty pool instead of an error.
+    #[test]
+    fn page_segment_signature_accepts_both_build_families() {
+        let segment = 0xffff_8c8f_0d60_0000;
+        let context = 0xffff_8c8f_0d10_0140;
+        let heap_key = 0x44c4_da45_347b_5d48;
+        let mixed = segment ^ context ^ heap_key;
+
+        // Pre-26100: the constant is folded in.
+        assert!(valid_page_segment_signature(
+            mixed ^ PAGE_SEGMENT_SIGNATURE,
+            segment,
+            context,
+            heap_key
+        ));
+        // 26100: it is not. These are the real values read off Server 26100.32995.
+        assert_eq!(mixed, 0x44c4_da45_340b_5c08);
+        assert!(valid_page_segment_signature(
+            mixed, segment, context, heap_key
+        ));
+        // Anything else is still rejected.
+        assert!(!valid_page_segment_signature(
+            mixed ^ 1,
+            segment,
+            context,
+            heap_key
+        ));
     }
 
     #[test]
