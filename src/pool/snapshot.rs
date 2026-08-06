@@ -1757,6 +1757,188 @@ mod tests {
 
     use super::*;
 
+    // ---- VS roots: legacy in-context shape vs 26100 affinity slots ------------------
+
+    /// Memory backed by one contiguous buffer. Anything outside it fails to read, the way
+    /// an unmapped page does.
+    struct FlatMemory {
+        base: u64,
+        bytes: Vec<u8>,
+    }
+
+    impl FlatMemory {
+        fn new(base: u64, len: usize) -> Self {
+            Self {
+                base,
+                bytes: vec![0; len],
+            }
+        }
+
+        fn put(&mut self, address: u64, data: &[u8]) {
+            let offset = (address - self.base) as usize;
+            self.bytes[offset..offset + data.len()].copy_from_slice(data);
+        }
+
+        fn put_u16(&mut self, address: u64, value: u16) {
+            self.put(address, &value.to_le_bytes());
+        }
+
+        fn put_u64(&mut self, address: u64, value: u64) {
+            self.put(address, &value.to_le_bytes());
+        }
+    }
+
+    impl PoolMemory for FlatMemory {
+        fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
+            let offset = address
+                .checked_sub(self.base)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .ok_or_else(|| SnapshotError::InvalidData {
+                    detail: format!("read below the fixture at {address:#x}"),
+                })?;
+            self.bytes
+                .get(offset..offset + size)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| SnapshotError::InvalidData {
+                    detail: format!("read past the fixture at {address:#x}+{size:#x}"),
+                })
+        }
+
+        fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError> {
+            Ok((address, size))
+        }
+
+        fn interrupted(&self) -> Result<bool, SnapshotError> {
+            Ok(false)
+        }
+    }
+
+    const VS_CONTEXT: u64 = 0x1000;
+
+    /// A layout carrying only what `vs_roots` consults. `affinity` picks the shape: with
+    /// it, the 26100 slot types exist and `_HEAP_VS_CONTEXT` has no `FreeChunkTree`;
+    /// without it, the legacy in-context fields are present instead.
+    fn vs_layout(affinity: bool) -> PoolLayout {
+        let mut types = HashMap::new();
+        types.insert(
+            "_HEAP_VS_CONTEXT",
+            if affinity {
+                type_layout(0x60, &[("SlotMapRef", 0), ("AffinityMask", 2)])
+            } else {
+                type_layout(0x80, &[("FreeChunkTree", 0x10), ("DelayFreeContext", 0x30)])
+            },
+        );
+        if affinity {
+            types.insert(
+                "_HEAP_VS_AFFINITY_SLOT",
+                type_layout(
+                    0x80,
+                    &[
+                        ("VsContext", 0),
+                        ("FreeChunkTree", 0x10),
+                        ("DelayFreeContext", 0x40),
+                    ],
+                ),
+            );
+            types.insert("_HEAP_VS_SLOT_MAP", type_layout(4, &[("SlotRef", 0)]));
+        }
+        PoolLayout {
+            key: crate::pool::layout::SessionKey {
+                kernel_base: 0,
+                session: 1,
+            },
+            globals: HashMap::new(),
+            types,
+        }
+    }
+
+    /// Four affinity entries over three distinct slots: two whose back-pointer agrees (one
+    /// of them referenced twice, so dedup is exercised) and one that names another context.
+    fn affinity_fixture() -> FlatMemory {
+        let mut memory = FlatMemory::new(VS_CONTEXT, 0x1200);
+        memory.put_u16(VS_CONTEXT, 0x10); // SlotMapRef -> map at ctx + 0x10*64
+        memory.put(VS_CONTEXT + 2, &[3]); // AffinityMask -> 4 entries
+        let map = VS_CONTEXT + 0x400;
+        for (index, slot_ref) in [0x20u16, 0x30, 0x20, 0x40].into_iter().enumerate() {
+            memory.put_u16(map + index as u64 * 4, slot_ref);
+        }
+        memory.put_u64(VS_CONTEXT + 0x800, VS_CONTEXT); // 0x20 << 6, owner agrees
+        memory.put_u64(VS_CONTEXT + 0xc00, VS_CONTEXT); // 0x30 << 6, owner agrees
+        memory.put_u64(VS_CONTEXT + 0x1000, 0xdead_beef); // 0x40 << 6, owner disagrees
+        memory
+    }
+
+    /// Pre-26100: the tree is inline in the context, so there is exactly one root and no
+    /// slot map is consulted at all.
+    #[test]
+    fn vs_roots_reads_the_legacy_in_context_shape() {
+        let memory = FlatMemory::new(VS_CONTEXT, 0x100);
+        let mut diagnostics = Vec::new();
+        let roots = vs_roots(&memory, &vs_layout(false), VS_CONTEXT, &mut diagnostics);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].base, VS_CONTEXT);
+        assert_eq!(roots[0].tree_offset, 0x10);
+        assert_eq!(roots[0].delay_offset, Some(0x30));
+        assert!(diagnostics.is_empty());
+    }
+
+    /// 26100: `slot = VsContext + (SlotRef << 6)`, and entries routinely share a slot.
+    #[test]
+    fn vs_roots_walks_the_affinity_slots_and_dedups_them() {
+        let memory = affinity_fixture();
+        let mut diagnostics = Vec::new();
+        let roots = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut diagnostics);
+        let bases: Vec<u64> = roots.iter().map(|root| root.base).collect();
+        // Four entries, one repeat, one rejected -> two roots.
+        assert_eq!(bases, vec![VS_CONTEXT + 0x800, VS_CONTEXT + 0xc00]);
+        assert!(roots.iter().all(|root| root.tree_offset == 0x10));
+        assert!(roots.iter().all(|root| root.delay_offset == Some(0x40)));
+    }
+
+    /// A slot whose back-pointer names a different context is not this context's slot.
+    /// Trusting it would aim the tree walk at unrelated but readable memory.
+    #[test]
+    fn vs_roots_rejects_a_slot_whose_back_pointer_disagrees() {
+        let memory = affinity_fixture();
+        let mut diagnostics = Vec::new();
+        let roots = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut diagnostics);
+        assert!(roots.iter().all(|root| root.base != VS_CONTEXT + 0x1000));
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("claims context"));
+    }
+
+    /// A zero `SlotMapRef` would alias the context itself; refuse rather than walk it.
+    #[test]
+    fn vs_roots_refuses_an_implausible_slot_map() {
+        let mut memory = affinity_fixture();
+        memory.put_u16(VS_CONTEXT, 0);
+        let mut diagnostics = Vec::new();
+        let roots = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut diagnostics);
+        assert!(roots.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("implausible VS slot map"));
+    }
+
+    /// Neither shape resolving is a reportable condition, not a silently empty walk — that
+    /// ambiguity is exactly what made the 26100 breakage so hard to see.
+    #[test]
+    fn vs_roots_reports_when_neither_shape_resolves() {
+        let memory = FlatMemory::new(VS_CONTEXT, 0x100);
+        let layout = PoolLayout {
+            key: crate::pool::layout::SessionKey {
+                kernel_base: 0,
+                session: 1,
+            },
+            globals: HashMap::new(),
+            types: HashMap::new(),
+        };
+        let mut diagnostics = Vec::new();
+        let roots = vs_roots(&memory, &layout, VS_CONTEXT, &mut diagnostics);
+        assert!(roots.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("neither the context nor an affinity slot"));
+    }
+
     /// The real values read off Server 26100.32995: a 0x68 message in special pool sits at
     /// page+0xf90, not page+0xf98. Rounding the request up to 16 is what makes the
     /// difference, and getting it wrong reports an address 8 bytes into the block.
