@@ -1566,11 +1566,16 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             }
             let offset = slot_offset - slice_offset;
             let address = region.address + slot_offset as u64;
+            // A block never straddles a page: the allocator skips the slot that would and
+            // resumes at the next one, leaving the tail of the page as slack. Verified
+            // against `!pool` on Server 26100 — with a 0x1a0 unit, blocks fill a page to
+            // +0xef0 and the next block sits at +0x1090, which is exactly the following
+            // slot, so linear indexing stays correct across the gap.
+            //
+            // Ordinary layout, then, not damage. Reporting it cost ~11.6k diagnostics on
+            // an idle machine — drowning out the ones that meant something — and wrongly
+            // cleared `complete` on essentially every snapshot taken.
             if address / PAGE_SIZE != (address + unit as u64 - 1) / PAGE_SIZE {
-                snapshot.diagnostics.push(format!(
-                    "LFH slot {address:#x}+{unit:#x} would cross a page"
-                ));
-                snapshot.complete = false;
                 slot += 1;
                 continue;
             }
@@ -1756,6 +1761,80 @@ mod tests {
     use std::{cell::Cell, collections::HashMap};
 
     use super::*;
+
+    // ---- LFH slots that would straddle a page ---------------------------------------
+
+    fn lfh_region(address: u64, unit_size: u32) -> PoolRegion {
+        PoolRegion {
+            address,
+            size: 0x1000,
+            pool_kind: PoolKind::NonPagedNx,
+            numa_node: 0,
+            heap: HeapIdentity {
+                pool_state: 0,
+                heap: 0,
+                special: false,
+            },
+            subsegment: None,
+            backend: PoolBackend::Lfh,
+            unit_size,
+            // Two slots' worth, both marked allocated.
+            bitmap: vec![0xff],
+            heap_key: 0,
+            pool_header: PoolHeaderLayout {
+                size: 0x10,
+                previous_size: 0,
+                pool_index: 1,
+                block_size: 2,
+                pool_type: 3,
+                tag: 4,
+            },
+            vs_header_size: 0,
+            vs_sizes_offset: 0,
+            known_tag: None,
+            states: Vec::new(),
+            reusable_chunks: HashSet::new(),
+            cached_chunks: HashSet::new(),
+        }
+    }
+
+    /// The allocator refuses to let a block straddle a page: it skips that slot, leaves the
+    /// page tail as slack, and resumes at the next slot. Confirmed against `!pool` on
+    /// Server 26100. So the straddling slot must be skipped **silently** — it is ordinary
+    /// layout, and reporting it once cost ~11.6k diagnostics on an idle machine.
+    #[test]
+    fn a_page_straddling_lfh_slot_is_skipped_without_complaint() {
+        // Slot 0 at 0x1f80 spans 0x1f80..0x2080 and crosses; slot 1 at 0x2080 does not.
+        let region = lfh_region(0x1f80, 0x100);
+        let memory = FlatMemory::new(0x1f80, 0x200);
+        let layout = vs_layout(false);
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1000,
+        };
+        let mut snapshot = PoolSnapshot {
+            spans: Vec::new(),
+            diagnostics: Vec::new(),
+            complete: true,
+        };
+        walker.walk_lfh(&region, 0x1f80, &memory.bytes, &mut snapshot);
+
+        // The straddling slot is dropped, the following one is still reported: skipping
+        // must not desynchronise the linear slot indexing.
+        assert_eq!(snapshot.spans.len(), 1);
+        assert_eq!(snapshot.spans[0].header_address, 0x2080);
+        // The two properties that were wrong: silence, and an intact `complete`.
+        assert!(
+            snapshot.diagnostics.is_empty(),
+            "normal layout must not be reported: {:?}",
+            snapshot.diagnostics
+        );
+        assert!(
+            snapshot.complete,
+            "a straddling slot is expected layout and must not mark the snapshot incomplete"
+        );
+    }
 
     // ---- VS roots: legacy in-context shape vs 26100 affinity slots ------------------
 
