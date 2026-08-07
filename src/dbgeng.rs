@@ -155,14 +155,6 @@ pub struct RunToResult {
 /// process, so per-engine identity plus a bump on release covers every case.
 static NEXT_TARGET_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
-/// The identity every *borrowed* engine shares.
-///
-/// A borrowed WinDbg client is wrapped afresh for each extension command, so giving each
-/// wrapper its own identity would miss the caches on every invocation — repeating the full
-/// pool walk and leaking a layout entry each time. Those hosts deliver session
-/// notifications instead, which is what invalidates their caches.
-const BORROWED_TARGET_IDENTITY: u64 = 0;
-
 fn next_target_identity() -> u64 {
     NEXT_TARGET_IDENTITY.fetch_add(1, Ordering::Relaxed)
 }
@@ -271,6 +263,11 @@ impl DebugEngine {
             .cast::<IDebugSymbols3>()
             .expect("[-] Failed to get debug symbols interface");
 
+        // Derived from the client rather than a counter: a borrowed engine is wrapped
+        // afresh per extension command, so a per-wrapper counter would miss the caches
+        // every time — while a shared constant would collide across two programmatic
+        // hosts holding unrelated targets that happen to share a kernel base.
+        let identity = client.as_raw() as u64;
         Self {
             client,
             control,
@@ -279,7 +276,7 @@ impl DebugEngine {
             // Default to "borrowed": constructors that wrap an existing WinDbg client
             // go through here, and only `new()` (which calls `DebugCreate`) sets this.
             owns_session: false,
-            target_identity: AtomicU64::new(BORROWED_TARGET_IDENTITY),
+            target_identity: AtomicU64::new(identity),
             deferred_inputs: Mutex::new(Vec::new()),
         }
     }
@@ -304,13 +301,14 @@ impl DebugEngine {
                 operation: "querying IDebugSymbols3".into(),
                 source,
             })?;
+        let identity = client.as_raw() as u64;
         Ok(Self {
             client,
             control,
             dataspaces,
             symbols,
             owns_session: false,
-            target_identity: AtomicU64::new(BORROWED_TARGET_IDENTITY),
+            target_identity: AtomicU64::new(identity),
             deferred_inputs: Mutex::new(Vec::new()),
         })
     }
