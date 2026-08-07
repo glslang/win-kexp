@@ -296,6 +296,7 @@ mod tests {
         let session = |value: u64| super::super::layout::SessionKey {
             kernel_base: 0x1000,
             session: value,
+            target: 1,
         };
         let cache = SnapshotCache::default();
         let builds = AtomicUsize::new(0);
@@ -342,5 +343,18 @@ mod tests {
         assert_eq!(failed_refresh.unwrap_err(), "interrupted");
         cache.get_or_refresh(session(10), false, make).unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 7);
+        // Two targets sharing a kernel base *and* generation — two dumps from one boot,
+        // or a restarted session — must not share a cached snapshot. Nothing bumps the
+        // generation for a purely programmatic host, so the target identity is the only
+        // thing that tells them apart.
+        cache.invalidate();
+        let same_base = |target: u64| super::super::layout::SessionKey {
+            kernel_base: 0x1000,
+            session: 1,
+            target,
+        };
+        cache.get_or_refresh(same_base(100), false, make).unwrap();
+        cache.get_or_refresh(same_base(101), false, make).unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 9);
     }
 }

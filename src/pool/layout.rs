@@ -10,6 +10,10 @@ use crate::dbgeng::{DbgEngError, DebugEngine};
 pub(crate) struct SessionKey {
     pub kernel_base: u64,
     pub session: u64,
+    /// Which target this is, from [crate::dbgeng::DebugEngine::target_identity].
+    /// The kernel base does not distinguish two dumps from the same boot, and the
+    /// generation only moves on debugger notifications a programmatic host never gets.
+    pub target: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,6 +494,7 @@ mod tests {
         SessionKey {
             kernel_base: 0xffff_f800_0000_0000,
             session: 7,
+            target: 1,
         }
     }
 
