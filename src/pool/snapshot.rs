@@ -1810,8 +1810,17 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             check_budget(self.memory)?;
             let take = EXTENT_READ_CHUNK.min(size - bytes.len());
             // A failed chunk fails the extent, which is what a failed whole-extent read did.
-            // Returning the prefix would hand the decoders a short buffer, and they read a
-            // short buffer as "the region ends here".
+            //
+            // A *short* chunk has to fail it too, and that is specific to reading in pieces.
+            // Two things go wrong without this. The next chunk's address comes from how much
+            // has been collected, so a short one shifts every later chunk and assembles a
+            // buffer of contiguous bytes taken from discontiguous addresses — which the
+            // decoders cannot detect, and which makes them report allocations that were never
+            // at those addresses. Worse, the loop then cannot finish: the last chunk asks for
+            // the remainder, comes back short, and `bytes.len()` never reaches `size`.
+            // Deleting this check hangs the walk rather than failing it — verified. Refusing
+            // the extent reports it unreadable, which is true, and is what a short
+            // whole-extent read did before.
             let chunk = self.memory.read_exact(base + bytes.len() as u64, take)?;
             if chunk.len() != take {
                 return Err(SnapshotError::InvalidData {
@@ -3608,6 +3617,82 @@ mod tests {
             ALLOWANCE,
             "the extent was not chunked, so the deadline could not be observed while it \
              transferred"
+        );
+    }
+
+    /// A source that answers every read one byte short.
+    struct ShortChunks {
+        reads: Cell<usize>,
+    }
+
+    impl PoolMemory for ShortChunks {
+        fn read_exact(&self, _address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(vec![0; size.saturating_sub(1)])
+        }
+
+        fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError> {
+            Ok((address, size))
+        }
+
+        fn interrupted(&self) -> Result<bool, SnapshotError> {
+            Ok(false)
+        }
+    }
+
+    /// Reading in pieces makes a short chunk dangerous in a way a short whole-extent read
+    /// never was: the next chunk's address comes from how much has been collected, so
+    /// accepting a short one shifts every later chunk and assembles contiguous bytes out of
+    /// discontiguous addresses. The decoders cannot tell — they would report allocations that
+    /// were never at those addresses. So the extent fails, and stays honestly unreadable.
+    #[test]
+    fn test_a_short_chunk_fails_the_extent_instead_of_misassembling_it() {
+        let memory = ShortChunks {
+            reads: Cell::new(0),
+        };
+        let layout = vs_layout(false);
+        let mut region = lfh_region(0x1000, 0x100);
+        region.size = EXTENT_READ_CHUNK * 3;
+        region.bitmap = vec![0xff; 64];
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1000,
+        };
+
+        assert!(
+            matches!(
+                walker.read_extent(region.address, region.size),
+                Err(SnapshotError::InvalidData { .. })
+            ),
+            "a short chunk has to fail the extent"
+        );
+        assert_eq!(
+            memory.reads.get(),
+            1,
+            "it must not read on after the short chunk"
+        );
+
+        // And through the region walk: reported as unreadable, with nothing decoded out of a
+        // buffer that was never assembled.
+        let mut snapshot = PoolSnapshot::default();
+        walker.walk_region(&region, &mut snapshot).unwrap();
+
+        assert!(
+            snapshot
+                .spans
+                .iter()
+                .all(|span| span.state == PoolState::Unreadable),
+            "a misassembled extent must not yield decoded allocations: {:?}",
+            snapshot.spans
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("cannot read region")),
+            "the failure has to be said out loud: {:?}",
+            snapshot.diagnostics
         );
     }
 
