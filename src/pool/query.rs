@@ -127,6 +127,12 @@ pub struct PoolTagSummary {
 pub struct PoolSnapshotReport {
     pub total_chunks: usize,
     pub allocated_chunks: usize,
+    /// Whether the walk covered everything it set out to.
+    ///
+    /// Not implied by an empty `diagnostics`: a walk can end incomplete without saying
+    /// anything — `walk_vs` clears it when a readable region stops mid-chunk. A caller
+    /// that wants to reject partial results has to consult this, not the diagnostics.
+    pub complete: bool,
     pub diagnostics: Vec<String>,
 }
 
@@ -147,6 +153,7 @@ fn report_of(index: &PoolIndex) -> PoolSnapshotReport {
             .iter()
             .filter(|span| span.state == PoolState::Allocated)
             .count(),
+        complete: index.complete,
         diagnostics: index.diagnostics.clone(),
     }
 }
@@ -174,20 +181,25 @@ pub(crate) fn prepare_index(
         return Err(PoolQueryError::UnsupportedArchitecture { machine });
     }
 
-    if refresh {
-        bump_generation();
-    }
-    let session = generation();
+    // Deliberately *not* bumping the generation on refresh. The generation is part of
+    // `SessionKey`, which keys the layout cache — bumping it per refresh would re-resolve
+    // every PDB symbol and leak a fresh cache entry each time, so a long-lived host that
+    // refreshes regularly would accumulate layouts without bound and pay the symbol
+    // latency over and over. The snapshot cache takes `refresh` directly and invalidates
+    // itself; the generation only has to move when the *target* changes, which is what
+    // `invalidate_session` is for.
     let key = SessionKey {
         kernel_base: engine.kernel_base()?,
-        session,
+        session: generation(),
     };
     let layout = LayoutCache::global()
         .get_or_resolve(engine, key)
         .map_err(|error| PoolQueryError::Layout(error.to_string()))?;
 
+    // Keyed on the whole `SessionKey`: a programmatic host receives no session
+    // notifications, so the generation alone would let a snapshot outlive its target.
     snapshots()
-        .get_or_refresh(session, refresh, || {
+        .get_or_refresh(key, refresh, || {
             SnapshotWalker {
                 memory: engine,
                 layout: &layout,
@@ -250,22 +262,20 @@ fn neighbourhood_at(index: &PoolIndex, address: u64) -> Option<PoolNeighbourhood
         .spans
         .iter()
         .position(|span| span.contains_address(address))?;
-    // Neighbours are only meaningful within the same heap; spans are sorted by
-    // (heap, address), so a differing heap means we walked off the end of this one.
-    let chunk = index.spans[position].clone();
-    let same_heap = |candidate: &PoolSpan| candidate.heap == chunk.heap;
+    // Use the index's own adjacency rather than "the next entry in the vector": matching
+    // only the heap would report a span from a different backend, a different subsegment,
+    // or across unreadable space as though it bordered this chunk. It does not, and for
+    // grooming analysis that is exactly the wrong thing to be told.
     Some(PoolNeighbourhood {
-        previous: position
-            .checked_sub(1)
-            .and_then(|prev| index.spans.get(prev))
-            .filter(|span| same_heap(span))
+        previous: index
+            .predecessor(position)
+            .and_then(|previous| index.spans.get(previous))
             .cloned(),
         next: index
-            .spans
-            .get(position + 1)
-            .filter(|span| same_heap(span))
+            .successor(position)
+            .and_then(|next| index.spans.get(next))
             .cloned(),
-        chunk,
+        chunk: index.spans[position].clone(),
     })
 }
 
