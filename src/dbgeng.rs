@@ -155,6 +155,14 @@ pub struct RunToResult {
 /// process, so per-engine identity plus a bump on release covers every case.
 static NEXT_TARGET_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
+/// The identity every *borrowed* engine shares.
+///
+/// A borrowed WinDbg client is wrapped afresh for each extension command, so giving each
+/// wrapper its own identity would miss the caches on every invocation — repeating the full
+/// pool walk and leaking a layout entry each time. Those hosts deliver session
+/// notifications instead, which is what invalidates their caches.
+const BORROWED_TARGET_IDENTITY: u64 = 0;
+
 fn next_target_identity() -> u64 {
     NEXT_TARGET_IDENTITY.fetch_add(1, Ordering::Relaxed)
 }
@@ -215,6 +223,11 @@ impl DebugEngine {
         // We opened this session, so we own its teardown.
         let mut engine = Self::from_client_interface(client);
         engine.owns_session = true;
+        // Only an engine that opened its own session gets a distinct identity: it is
+        // long-lived, and a host may hold several against targets that share a kernel base.
+        engine
+            .target_identity
+            .store(next_target_identity(), Ordering::Release);
         engine
     }
 
@@ -266,7 +279,7 @@ impl DebugEngine {
             // Default to "borrowed": constructors that wrap an existing WinDbg client
             // go through here, and only `new()` (which calls `DebugCreate`) sets this.
             owns_session: false,
-            target_identity: AtomicU64::new(next_target_identity()),
+            target_identity: AtomicU64::new(BORROWED_TARGET_IDENTITY),
             deferred_inputs: Mutex::new(Vec::new()),
         }
     }
@@ -297,7 +310,7 @@ impl DebugEngine {
             dataspaces,
             symbols,
             owns_session: false,
-            target_identity: AtomicU64::new(next_target_identity()),
+            target_identity: AtomicU64::new(BORROWED_TARGET_IDENTITY),
             deferred_inputs: Mutex::new(Vec::new()),
         })
     }
