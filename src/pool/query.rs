@@ -193,8 +193,12 @@ pub(crate) fn prepare_index(
         session: generation(),
         target: engine.target_identity(),
     };
+    // Layouts describe the *image*, not which target instance is loaded, so they are keyed
+    // without `target`. Including it inserted an entry per engine and per `end_session`
+    // that nothing ever pruned — the same unbounded growth removed above for `refresh`.
+    let layout_key = SessionKey { target: 0, ..key };
     let layout = LayoutCache::global()
-        .get_or_resolve(engine, key)
+        .get_or_resolve(engine, layout_key)
         .map_err(|error| PoolQueryError::Layout(error.to_string()))?;
 
     // Keyed on the whole `SessionKey`: a programmatic host receives no session
@@ -272,7 +276,17 @@ fn neighbourhood_at(index: &PoolIndex, address: u64) -> Option<PoolNeighbourhood
     // the identity check with a gap between them. Reporting those as bordering would
     // misstate the very geometry this API exists to describe.
     let chunk = index.spans[position].clone();
-    let touching = |left: &PoolSpan, right: &PoolSpan| left.end() == right.header_address;
+    // Contiguity is only meaningful where `end()` and the next span's `header_address`
+    // measure the same boundary. LFH and Segment spans report `header_address ==
+    // usable_address`, so they do. A VS span carries a chunk header between the two, so the
+    // comparison is off by its width and would reject *every* genuine VS neighbour. The gap
+    // this guards against — a slot the allocator skipped because it would straddle a page —
+    // only arises in LFH, so restricting the check there loses nothing.
+    let touching = |left: &PoolSpan, right: &PoolSpan| {
+        let comparable = left.header_address == left.usable_address
+            && right.header_address == right.usable_address;
+        !comparable || left.end() == right.header_address
+    };
     Some(PoolNeighbourhood {
         previous: index
             .predecessor(position)
