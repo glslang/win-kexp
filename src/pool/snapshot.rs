@@ -890,6 +890,14 @@ fn discover_heap_regions(
             &cached_chunks,
             discovery,
         ) {
+            // As in `discover_pool_regions`: a halt is about the walk, not about this
+            // context. Absorbed here it would read as "context 1 is unreadable", and on the
+            // *last* context index it would be absorbed entirely — `discover_heap_regions`
+            // would carry on into `discover_large_allocations` and return `Ok`, so even a
+            // Ctrl+C would only stop the walk if some later site happened to raise it again.
+            if error.halts_walk() {
+                return Err(error);
+            }
             discovery.diagnostics.push(format!(
                 "cannot discover segment context {context_index} at {context_address:#x}: {error}"
             ));
@@ -1541,14 +1549,26 @@ const DISCOVERY_BUDGET_SHARE: (u32, u32) = (2, 3);
 
 /// Splits a walk budget into the deadline discovery works to and the one the whole walk
 /// works to. `None` in gives `None` out for both: no budget, no deadlines.
+///
+/// A budget too large for `Instant` to represent — `PoolWalk::within` takes any `Duration`,
+/// so a caller can hand over `Duration::MAX` — also yields `None` for both. Adding it would
+/// panic, and "longer than this machine can measure" is a request to run unbounded, so
+/// answering it that way is the caller's own meaning rather than a substitution for it.
+///
+/// Both halves stand or fall together, keyed on the whole-walk deadline. Deciding them
+/// independently would pass `Duration::MAX` as a *bounded* discovery share (two thirds of it
+/// still fits) against an unbounded walk — a state with no meaning behind it.
 fn budget_deadlines(
     start: Instant,
     budget: Option<Duration>,
 ) -> (Option<Instant>, Option<Instant>) {
     let (numerator, denominator) = DISCOVERY_BUDGET_SHARE;
+    let Some(whole) = budget.and_then(|full| start.checked_add(full)) else {
+        return (None, None);
+    };
     (
-        budget.map(|full| start + full / denominator * numerator),
-        budget.map(|full| start + full),
+        budget.and_then(|full| start.checked_add(full / denominator * numerator)),
+        Some(whole),
     )
 }
 
@@ -1601,20 +1621,23 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         let discovered = discovery.regions.len();
         let mut walked = 0usize;
         for region in discovery.regions {
-            match check_budget(&walk_clock) {
-                Ok(()) => {}
+            let outcome = if region.backend == PoolBackend::Large {
+                // No reads of its own: the span comes from metadata discovery already did.
+                walker.walk_large(&region, &mut snapshot);
+                Ok(())
+            } else {
+                walker.walk_region(&region, &mut snapshot)
+            };
+            match outcome {
+                // Counted only when the region was walked *through*. A region abandoned
+                // part-way is exactly what the caveat below is for.
+                Ok(()) => walked += 1,
                 Err(SnapshotError::BudgetExpired) => {
                     expired = true;
                     break;
                 }
                 Err(error) => return Err(error),
             }
-            if region.backend == PoolBackend::Large {
-                walker.walk_large(&region, &mut snapshot);
-            } else {
-                walker.walk_region(&region, &mut snapshot);
-            }
-            walked += 1;
         }
 
         if expired {
@@ -1637,10 +1660,22 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         Ok(snapshot)
     }
 
-    fn walk_region(&self, region: &PoolRegion, snapshot: &mut PoolSnapshot) {
+    /// Reads one region and decodes its chunks, stopping if the walk's time runs out.
+    ///
+    /// Checked per *extent*, not just per region: a region the allocator left with holes
+    /// costs one `valid_region` and one `read_exact` per committed run, so a fragmented
+    /// region is many round trips and checking only on the way in would let one region
+    /// overrun the deadline by an unbounded amount. The backend decoders below need no such
+    /// check — they run over bytes already in hand, off the wire entirely.
+    fn walk_region(
+        &self,
+        region: &PoolRegion,
+        snapshot: &mut PoolSnapshot,
+    ) -> Result<(), SnapshotError> {
         let requested_end = region.address.saturating_add(region.size as u64);
         let mut cursor = region.address;
         while cursor < requested_end {
+            check_budget(self.memory)?;
             let remaining = requested_end.saturating_sub(cursor).min(usize::MAX as u64) as usize;
             let (reported_base, reported_size) = match self.memory.valid_region(cursor, remaining) {
                 Ok(valid) => valid,
@@ -1700,10 +1735,11 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 PoolBackend::Lfh => self.walk_lfh(region, valid_base, &bytes, snapshot),
                 PoolBackend::Vs => self.walk_vs(region, valid_base, &bytes, snapshot),
                 PoolBackend::Segment => self.walk_page_ranges(region, valid_base, &bytes, snapshot),
-                PoolBackend::Large => return,
+                PoolBackend::Large => return Ok(()),
             }
             cursor = valid_end;
         }
+        Ok(())
     }
 
     fn walk_large(&self, region: &PoolRegion, snapshot: &mut PoolSnapshot) {
@@ -3185,22 +3221,34 @@ mod tests {
         );
     }
 
-    /// Running out of time is about the walk, not about whichever heap happened to be under
-    /// the cursor. Recorded as a per-heap failure it would read as "heap 3 is unreadable"
-    /// and — the real damage — the heap loop would swallow it and carry on to heaps 4..n,
-    /// each stopping the same way, so the deadline would bound one heap instead of the walk.
+    /// Running out of time is about the walk, not about whichever unit happened to be under
+    /// the cursor. Recorded as a per-unit failure it reads as "heap 3 is unreadable", and —
+    /// the real damage — the enclosing loop swallows it and carries on to the next unit,
+    /// each stopping the same way, so the deadline bounds one unit instead of the walk. On
+    /// the *last* iteration it is absorbed outright and the walk simply continues.
+    ///
+    /// Swept over budgets because where the halt lands decides which handler sees it: an
+    /// early one stops inside a heap's VS evidence, a later one inside a segment context.
+    /// Both swallow errors into diagnostics, so both have to re-raise.
     #[test]
-    fn test_running_out_of_budget_is_not_reported_as_a_broken_heap() {
-        let snapshot = walk_impatiently(40);
-
-        assert!(
-            !snapshot
-                .diagnostics
-                .iter()
-                .any(|message| message.contains("cannot fully discover heap")),
-            "the halt was absorbed by the per-heap handler: {:?}",
-            snapshot.diagnostics
-        );
+    fn test_running_out_of_budget_is_never_reported_as_a_broken_unit() {
+        for allowance in [10, 25, 40, 80, 120, 200, 400] {
+            let snapshot = walk_impatiently(allowance);
+            for absorbed in [
+                "cannot fully discover heap",
+                "cannot discover segment context",
+            ] {
+                assert!(
+                    !snapshot
+                        .diagnostics
+                        .iter()
+                        .any(|message| message.contains(absorbed)),
+                    "budget {allowance}: a per-unit handler absorbed the halt as \
+                     `{absorbed}`: {:?}",
+                    snapshot.diagnostics
+                );
+            }
+        }
     }
 
     /// Discovery finds the regions and the walk reads what is in them, so a budget spent
@@ -3251,6 +3299,10 @@ mod tests {
             "discovery must get real time, not a token slice"
         );
         assert_eq!(budget_deadlines(start, None), (None, None));
+        // `PoolWalk::within` accepts any `Duration`, so a budget longer than `Instant` can
+        // represent is reachable from safe public API. Adding it would panic; a budget
+        // beyond measuring is a request to run unbounded, and is answered as one.
+        assert_eq!(budget_deadlines(start, Some(Duration::MAX)), (None, None));
     }
 
     /// A budget and a Ctrl+C both halt the walk, and they must not be confused. Running out
@@ -3290,6 +3342,69 @@ mod tests {
             .walk(Some(Duration::from_secs(600))),
             Err(SnapshotError::Interrupted)
         ));
+    }
+
+    /// Memory that hands back one small extent at a time and runs out of budget after a
+    /// fixed number of them.
+    ///
+    /// This is the shape that makes a per-*region* check insufficient. A region the
+    /// allocator left with holes is read one committed run at a time — a `valid_region` and
+    /// a `read_exact` each, both over the wire on a live target — so checking only on the
+    /// way in lets a single region overrun the deadline by as many round trips as it has
+    /// extents.
+    struct Fragmented {
+        extent: usize,
+        allowance: usize,
+        extents_read: Cell<usize>,
+    }
+
+    impl PoolMemory for Fragmented {
+        fn read_exact(&self, _address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
+            Ok(vec![0; size])
+        }
+
+        fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError> {
+            self.extents_read.set(self.extents_read.get() + 1);
+            Ok((address, size.min(self.extent)))
+        }
+
+        fn interrupted(&self) -> Result<bool, SnapshotError> {
+            Ok(false)
+        }
+
+        fn out_of_budget(&self) -> bool {
+            self.extents_read.get() >= self.allowance
+        }
+    }
+
+    #[test]
+    fn test_a_fragmented_region_checks_the_budget_between_extents() {
+        // 0x1000 of region in 0x400 extents is four round trips; the budget allows three.
+        let memory = Fragmented {
+            extent: 0x400,
+            allowance: 3,
+            extents_read: Cell::new(0),
+        };
+        let layout = vs_layout(false);
+        let mut region = lfh_region(0x1000, 0x100);
+        region.bitmap = vec![0xff; 16];
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1000,
+        };
+
+        let outcome = walker.walk_region(&region, &mut PoolSnapshot::default());
+
+        assert!(
+            matches!(outcome, Err(SnapshotError::BudgetExpired)),
+            "the region walk has to report the halt, not absorb it: {outcome:?}"
+        );
+        assert_eq!(
+            memory.extents_read.get(),
+            3,
+            "the region went on reading past its deadline"
+        );
     }
 
     /// A budget nobody comes close to spending must not change the answer.
