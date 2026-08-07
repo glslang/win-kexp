@@ -1582,6 +1582,16 @@ const DISCOVERY_BUDGET_SHARE: (u32, u32) = (2, 3);
 /// deadline is observed at a useful granularity, large enough that a megabyte-scale extent is
 /// still a handful of transfers rather than hundreds. Extents at or below this are read whole,
 /// so the ordinary small region pays nothing for this.
+///
+/// **This sets the residual overshoot, and that is the guarantee.** Checks sit *before* reads,
+/// never after, so a walk can finish one transfer — at most this many bytes — past its
+/// ceiling. Checking after a successful read would not improve on that: mid-walk the next
+/// iteration's check fires anyway, so the only case it would change is the one where the walk
+/// has just finished everything, and there it would clear `complete` and announce that "what
+/// is missing is unknown, not absent" about a walk with nothing missing. Manufacturing a false
+/// incompleteness is the same class of lie as reporting an unread region as empty, reached
+/// from the other side. The budget is a ceiling on effort, not a promise about return latency:
+/// it exists so the engine cannot run for *minutes* after its caller has given up.
 const EXTENT_READ_CHUNK: usize = 256 * 1024;
 
 /// Splits a walk budget into the deadline discovery works to and the one the whole walk
