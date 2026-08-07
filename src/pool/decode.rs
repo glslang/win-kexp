@@ -388,7 +388,7 @@ mod tests {
     /// must authenticate, or the walk rejects every segment on one build family or the
     /// other and reports an empty pool instead of an error.
     #[test]
-    fn page_segment_signature_accepts_both_build_families() {
+    fn test_page_segment_signature_accepts_both_build_families() {
         let segment = 0xffff_8c8f_0d60_0000;
         let context = 0xffff_8c8f_0d10_0140;
         let heap_key = 0x44c4_da45_347b_5d48;

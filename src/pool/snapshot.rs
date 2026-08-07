@@ -1803,7 +1803,7 @@ mod tests {
     /// Server 26100. So the straddling slot must be skipped **silently** — it is ordinary
     /// layout, and reporting it once cost ~11.6k diagnostics on an idle machine.
     #[test]
-    fn a_page_straddling_lfh_slot_is_skipped_without_complaint() {
+    fn test_page_straddling_lfh_slot_is_skipped_without_complaint() {
         // Slot 0 at 0x1f80 spans 0x1f80..0x2080 and crosses; slot 1 at 0x2080 does not.
         let region = lfh_region(0x1f80, 0x100);
         let memory = FlatMemory::new(0x1f80, 0x200);
@@ -1950,7 +1950,7 @@ mod tests {
     /// Pre-26100: the tree is inline in the context, so there is exactly one root and no
     /// slot map is consulted at all.
     #[test]
-    fn vs_roots_reads_the_legacy_in_context_shape() {
+    fn test_vs_roots_reads_the_legacy_in_context_shape() {
         let memory = FlatMemory::new(VS_CONTEXT, 0x100);
         let mut diagnostics = Vec::new();
         let roots = vs_roots(&memory, &vs_layout(false), VS_CONTEXT, &mut diagnostics);
@@ -1963,7 +1963,7 @@ mod tests {
 
     /// 26100: `slot = VsContext + (SlotRef << 6)`, and entries routinely share a slot.
     #[test]
-    fn vs_roots_walks_the_affinity_slots_and_dedups_them() {
+    fn test_vs_roots_walks_the_affinity_slots_and_dedups_them() {
         let memory = affinity_fixture();
         let mut diagnostics = Vec::new();
         let roots = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut diagnostics);
@@ -1977,7 +1977,7 @@ mod tests {
     /// A slot whose back-pointer names a different context is not this context's slot.
     /// Trusting it would aim the tree walk at unrelated but readable memory.
     #[test]
-    fn vs_roots_rejects_a_slot_whose_back_pointer_disagrees() {
+    fn test_vs_roots_rejects_a_slot_whose_back_pointer_disagrees() {
         let memory = affinity_fixture();
         let mut diagnostics = Vec::new();
         let roots = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut diagnostics);
@@ -1988,7 +1988,7 @@ mod tests {
 
     /// A zero `SlotMapRef` would alias the context itself; refuse rather than walk it.
     #[test]
-    fn vs_roots_refuses_an_implausible_slot_map() {
+    fn test_vs_roots_refuses_an_implausible_slot_map() {
         let mut memory = affinity_fixture();
         memory.put_u16(VS_CONTEXT, 0);
         let mut diagnostics = Vec::new();
@@ -2001,7 +2001,7 @@ mod tests {
     /// Neither shape resolving is a reportable condition, not a silently empty walk — that
     /// ambiguity is exactly what made the 26100 breakage so hard to see.
     #[test]
-    fn vs_roots_reports_when_neither_shape_resolves() {
+    fn test_vs_roots_reports_when_neither_shape_resolves() {
         let memory = FlatMemory::new(VS_CONTEXT, 0x100);
         let layout = PoolLayout {
             key: crate::pool::layout::SessionKey {
@@ -2022,7 +2022,7 @@ mod tests {
     /// page+0xf90, not page+0xf98. Rounding the request up to 16 is what makes the
     /// difference, and getting it wrong reports an address 8 bytes into the block.
     #[test]
-    fn special_pool_block_is_pushed_against_the_page_end_with_16_byte_rounding() {
+    fn test_special_pool_block_is_pushed_against_the_page_end() {
         let page = 0xffff_8c8f_13a0_2000;
         assert_eq!(
             special_pool_placement(page, 0x68, 0x10, PAGE_SIZE),
@@ -2038,7 +2038,7 @@ mod tests {
     /// `PreviousSize` is 8 bits, so it cannot describe every legal special-pool block.
     /// When it is unusable the whole page is reported rather than a wrong sub-range.
     #[test]
-    fn special_pool_falls_back_to_the_page_when_the_size_is_untrustworthy() {
+    fn test_special_pool_falls_back_when_the_size_is_untrustworthy() {
         let page = 0xffff_8c8f_13a0_2000;
         assert_eq!(
             special_pool_placement(page, 0, 0x10, PAGE_SIZE),
@@ -2054,7 +2054,7 @@ mod tests {
     /// A partially readable page (the guard page truncates the read) must not report a
     /// size past what was actually read.
     #[test]
-    fn special_pool_fallback_respects_the_readable_length() {
+    fn test_special_pool_fallback_respects_the_readable_length() {
         let page = 0xffff_8c8f_13a0_2000;
         assert_eq!(
             special_pool_placement(page, 0, 0x10, 0x200),

@@ -356,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_architecture_names_the_machine() {
+    fn test_unsupported_architecture_names_the_machine() {
         // The extension used to own this check; the message is load-bearing for the
         // E_INVALIDARG/E_FAIL mapping, so pin it here now that it lives in the API.
         assert_eq!(
@@ -366,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn find_tag_returns_only_matching_allocations() {
+    fn test_find_tag_returns_only_matching_allocations() {
         let index = index_of(vec![
             allocation(0x1000, 0x68, b"Tgsm", PoolKind::NonPagedNx, 1),
             allocation(0x2000, 0x40, b"Tfub", PoolKind::Paged, 1),
@@ -378,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn page_filter_splits_paged_from_nonpaged() {
+    fn test_page_filter_splits_paged_from_nonpaged() {
         let index = index_of(vec![
             allocation(0x1000, 0x68, b"Tsst", PoolKind::NonPagedNx, 1),
             allocation(0x2000, 0x40, b"Tsst", PoolKind::Paged, 1),
@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tag_yields_no_matches() {
+    fn test_unknown_tag_yields_no_matches() {
         let index = index_of(vec![allocation(
             0x1000,
             0x68,
@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_lookup_reports_neighbours_within_one_heap() {
+    fn test_chunk_lookup_reports_neighbours_within_one_heap() {
         let index = index_of(vec![
             allocation(0x1000, 0x100, b"Aaaa", PoolKind::NonPagedNx, 1),
             allocation(0x1100, 0x100, b"Bbbb", PoolKind::NonPagedNx, 1),
@@ -421,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn neighbours_do_not_cross_a_heap_boundary() {
+    fn test_neighbours_do_not_cross_a_heap_boundary() {
         let index = index_of(vec![
             allocation(0x1000, 0x100, b"Aaaa", PoolKind::NonPagedNx, 1),
             allocation(0x1100, 0x100, b"Bbbb", PoolKind::NonPagedNx, 2),
@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn address_outside_every_span_is_not_found() {
+    fn test_address_outside_every_span_is_not_found() {
         let index = index_of(vec![allocation(
             0x1000,
             0x100,
@@ -448,7 +448,7 @@ mod tests {
     /// The case that motivated the report: a walk that reached nothing must still hand
     /// back its reasons, or an empty result is indistinguishable from an empty pool.
     #[test]
-    fn an_empty_walk_still_reports_why() {
+    fn test_empty_walk_still_reports_why() {
         let index = PoolIndex::build(crate::pool::PoolSnapshot {
             spans: Vec::new(),
             diagnostics: vec!["cannot read pool node 0 heap 2".into()],
@@ -461,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn a_report_counts_allocated_separately_from_total() {
+    fn test_report_counts_allocated_separately_from_total() {
         let index = index_of(vec![
             allocation(0x1000, 0x68, b"Tgsm", PoolKind::NonPagedNx, 1),
             allocation(0x1100, 0x68, b"Tgsm", PoolKind::NonPagedNx, 1),
@@ -473,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn census_totals_by_tag_and_sorts_by_bytes() {
+    fn test_census_totals_by_tag_and_sorts_by_bytes() {
         let index = index_of(vec![
             allocation(0x1000, 0x68, b"Tgsm", PoolKind::NonPagedNx, 1),
             allocation(0x1100, 0x68, b"Tgsm", PoolKind::NonPagedNx, 1),
