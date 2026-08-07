@@ -1555,7 +1555,19 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             let available = (bytes.len() - offset).min(PAGE_SIZE as usize);
             let page_bytes = &bytes[offset..offset + available];
             let Some(header) = decode_pool_header(bytes, offset, region.pool_header) else {
-                break;
+                // Special pool is page-granular: one undecodable page says nothing about
+                // the next, so stopping here would silently drop the rest of the region —
+                // and leaving `complete` set would cache that truncated result and re-serve
+                // it. Every other rejection path in this file reports and continues.
+                snapshot.diagnostics.push(format!(
+                    "special-pool page {page:#x}: pool header did not decode; page skipped"
+                ));
+                snapshot.complete = false;
+                let Some(next) = page.checked_add(PAGE_SIZE) else {
+                    break;
+                };
+                page = next;
+                continue;
             };
             // An untagged page is not an allocation. Freed special-pool pages are
             // unmapped rather than zeroed, so anything readable here should carry a tag.
