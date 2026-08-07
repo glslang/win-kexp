@@ -558,6 +558,11 @@ fn vs_roots(
     for index in 0..entries {
         let entry = slot_map + index as u64 * entry_size;
         let Ok(slot_ref) = scalar(memory, entry + slot_ref_offset as u64, 2) else {
+            // Skipping silently would drop that slot's free tree and delay-free list, so
+            // its chunks get misclassified with nothing to say why.
+            diagnostics.push(format!(
+                "cannot read VS slot map entry {index} at {entry:#x}; its affinity slot is omitted"
+            ));
             continue;
         };
         if slot_ref == 0 {
