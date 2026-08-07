@@ -1,4 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -15,6 +17,11 @@ use super::{
 };
 
 type SnapshotSource = Box<dyn std::error::Error + Send + Sync>;
+
+/// A set of chunk addresses shared by every region one heap's evidence covers.
+///
+/// Shared rather than owned per region: see [`PoolRegion::reusable_chunks`].
+type SharedChunks = Arc<HashSet<u64>>;
 
 #[derive(Debug, Error)]
 pub(crate) enum SnapshotError {
@@ -48,6 +55,8 @@ pub(crate) enum SnapshotError {
     },
     #[error("pool snapshot interrupted by Ctrl+C")]
     Interrupted,
+    #[error("pool snapshot ran out of its walk budget")]
+    BudgetExpired,
     #[error("interrupt-status query failed: {source}")]
     InterruptQuery {
         #[source]
@@ -55,6 +64,22 @@ pub(crate) enum SnapshotError {
     },
     #[error("invalid snapshot data: {detail}")]
     InvalidData { detail: String },
+}
+
+impl SnapshotError {
+    /// Whether this ends the whole walk rather than one step of it.
+    ///
+    /// Every other variant is local — a node that would not read, a region that is not
+    /// committed — so the walk records it and carries on. These two are not: carrying on
+    /// would ignore the operator's Ctrl+C, or run past the deadline that exists precisely
+    /// so nobody is left waiting on a walk they have already given up on.
+    ///
+    /// **Every site that swallows an error into a diagnostic has to re-raise these**, or
+    /// the stop signal is absorbed by the first enclosing loop and the walk keeps going —
+    /// which is the failure this predicate exists to make hard to reintroduce.
+    fn halts_walk(&self) -> bool {
+        matches!(self, Self::Interrupted | Self::BudgetExpired)
+    }
 }
 
 impl From<LayoutError> for SnapshotError {
@@ -86,15 +111,72 @@ pub(crate) struct PoolRegion {
     /// Allocator-derived states for segment/page-range cells.
     pub states: Vec<PoolState>,
     /// VS chunk-header addresses present in the free tree.
-    pub reusable_chunks: HashSet<u64>,
-    /// VS chunk-header addresses present in delay-free/lookaside lists.
-    pub cached_chunks: HashSet<u64>,
+    ///
+    /// Shared, not owned: one region is created per page-range descriptor, so on a real
+    /// kernel there are thousands of them, and they all carry the *same* evidence — the one
+    /// set their heap's free tree produced. Cloning the set per region copied it thousands
+    /// of times over, entirely off the wire and so invisible when the walk was blamed on
+    /// debugger reads.
+    pub reusable_chunks: SharedChunks,
+    /// VS chunk-header addresses present in delay-free/lookaside lists. Shared for the
+    /// reason [`Self::reusable_chunks`] is.
+    pub cached_chunks: SharedChunks,
 }
 
 pub(crate) trait PoolMemory {
     fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError>;
     fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError>;
     fn interrupted(&self) -> Result<bool, SnapshotError>;
+
+    /// Whether this walk's wall-clock deadline has passed.
+    ///
+    /// Defaulted to "never" so a plain memory source carries no clock; [`Budgeted`] is what
+    /// puts one in front of it, and [`SnapshotWalker::walk`] is what wraps it.
+    fn out_of_budget(&self) -> bool {
+        false
+    }
+}
+
+/// A memory source with a deadline attached.
+///
+/// The walk already polled for Ctrl+C, but **only a human at a WinDbg prompt ever sets
+/// that**. A programmatic caller — an MCP server driving the query API — has no way to say
+/// "that is long enough", so its own timeout frees the caller and leaves the engine
+/// walking; since one engine serves one target one call at a time, every later call to that
+/// target queues behind the walk. The session is then wedged until it is killed, which on a
+/// live kernel leaves the guest halted. This is the clock that makes that impossible.
+struct Budgeted<'a, M> {
+    inner: &'a M,
+    /// `None` runs to completion — correct only where something else can stop the walk.
+    deadline: Option<Instant>,
+}
+
+impl<'a, M> Budgeted<'a, M> {
+    fn new(inner: &'a M, deadline: Option<Instant>) -> Self {
+        Self { inner, deadline }
+    }
+}
+
+impl<M: PoolMemory> PoolMemory for Budgeted<'_, M> {
+    fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
+        self.inner.read_exact(address, size)
+    }
+
+    fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError> {
+        self.inner.valid_region(address, size)
+    }
+
+    fn interrupted(&self) -> Result<bool, SnapshotError> {
+        self.inner.interrupted()
+    }
+
+    /// This wrapper *adds* a deadline; it does not replace whatever the source already had,
+    /// so wrapping can only ever make a walk stop sooner.
+    fn out_of_budget(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+            || self.inner.out_of_budget()
+    }
 }
 
 impl PoolMemory for crate::dbgeng::DebugEngine {
@@ -125,12 +207,20 @@ impl PoolMemory for crate::dbgeng::DebugEngine {
     }
 }
 
-fn check_interrupted(memory: &impl PoolMemory) -> Result<(), SnapshotError> {
+/// The one place a walk asks whether it is still allowed to run.
+///
+/// Called from every loop that can iterate an unbounded number of times, so the cost of one
+/// runaway step is a step and not a walk. Both answers halt (see
+/// [`SnapshotError::halts_walk`]); they differ in what the caller does with the halt, which
+/// [`SnapshotWalker::walk`] decides.
+fn check_budget(memory: &impl PoolMemory) -> Result<(), SnapshotError> {
     if memory.interrupted()? {
-        Err(SnapshotError::Interrupted)
-    } else {
-        Ok(())
+        return Err(SnapshotError::Interrupted);
     }
+    if memory.out_of_budget() {
+        return Err(SnapshotError::BudgetExpired);
+    }
+    Ok(())
 }
 
 fn guarded_read(
@@ -200,7 +290,7 @@ fn walk_tree_nodes(
         if node == 0 {
             continue;
         }
-        check_interrupted(memory)?;
+        check_budget(memory)?;
         if !seen.insert(node) {
             diagnostics.push(format!("{label} cycle detected at {node:#x}"));
             continue;
@@ -304,7 +394,7 @@ fn walk_slist_nodes(
         .unwrap_or(0);
     let expected = depth.min(limit);
     while entry != 0 && nodes.len() < expected {
-        check_interrupted(memory)?;
+        check_budget(memory)?;
         if !seen.insert(entry) {
             diagnostics.push(format!("{label} list cycle detected at {entry:#x}"));
             break;
@@ -358,11 +448,18 @@ const SPECIAL_POOL_KINDS: [PoolKind; 4] = [
     PoolKind::SpecialPrototypePaged,
 ];
 
+/// Enumerates every pool region, appending to `discovery`.
+///
+/// Takes `discovery` by reference rather than returning it so that a walk which halts
+/// part-way still hands back the regions it *did* find. Returning `Result<Discovery, _>`
+/// threw them away on the one path where they matter most — the caller can then walk what
+/// discovery reached instead of reporting an empty pool.
 fn discover_pool_regions(
     memory: &impl PoolMemory,
     layout: &PoolLayout,
     traversal_limit: usize,
-) -> Result<Discovery, SnapshotError> {
+    discovery: &mut Discovery,
+) -> Result<(), SnapshotError> {
     let state_address = *layout
         .globals
         .get("ExPoolState")
@@ -384,7 +481,6 @@ fn discover_pool_regions(
             detail: format!("implausible ExPoolState.NumberOfPools {number}"),
         });
     }
-    let mut discovery = Discovery::default();
     let mut heaps = Vec::new();
     for numa_node in 0..number {
         let Some(node_address) = state_address
@@ -468,15 +564,22 @@ fn discover_pool_regions(
             heap_key,
             lfh_key,
             traversal_limit,
-            &mut discovery,
+            discovery,
         ) {
+            // A halt is about the walk, not about this heap. Recorded as a per-heap failure
+            // it would read as "heap 3 is unreadable" and — worse — the loop would carry on
+            // to heaps 4..n, each stopping the same way, so the deadline would bound one
+            // heap instead of the walk.
+            if error.halts_walk() {
+                return Err(error);
+            }
             discovery.diagnostics.push(format!(
                 "cannot fully discover heap {heap_address:#x}: {error}"
             ));
         }
     }
     let _ = state.size;
-    Ok(discovery)
+    Ok(())
 }
 
 /// One place carrying VS free-chunk state.
@@ -598,7 +701,7 @@ fn discover_vs_evidence(
     dynamic_lookaside: Option<u64>,
     limit: usize,
     diagnostics: &mut Vec<String>,
-) -> Result<(HashSet<u64>, HashSet<u64>), SnapshotError> {
+) -> Result<(SharedChunks, SharedChunks), SnapshotError> {
     let Ok(vs_context_offset) = layout.field("_SEGMENT_HEAP", "VsContext") else {
         return Ok(Default::default());
     };
@@ -721,7 +824,7 @@ fn discover_vs_evidence(
             }
         }
     }
-    Ok((reusable, cached))
+    Ok((Arc::new(reusable), Arc::new(cached)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -770,7 +873,7 @@ fn discover_heap_regions(
     }
 
     for context_index in 0..2usize {
-        check_interrupted(memory)?;
+        check_budget(memory)?;
         let context_address =
             heap_address + contexts_offset as u64 + context_index as u64 * context.size as u64;
         if let Err(error) = discover_segment_context(
@@ -818,8 +921,8 @@ fn discover_segment_context(
     heap_key: u64,
     lfh_key: u64,
     traversal_limit: usize,
-    reusable_chunks: &HashSet<u64>,
-    cached_chunks: &HashSet<u64>,
+    reusable_chunks: &SharedChunks,
+    cached_chunks: &SharedChunks,
     discovery: &mut Discovery,
 ) -> Result<(), SnapshotError> {
     let segment = layout.type_layout("_HEAP_PAGE_SEGMENT")?;
@@ -876,7 +979,7 @@ fn discover_segment_context(
     let mut entry = scalar(memory, list_head, 8)? & !0xf;
     let mut seen = HashSet::new();
     while entry != 0 && entry != list_head && seen.len() < traversal_limit {
-        check_interrupted(memory)?;
+        check_budget(memory)?;
         if !seen.insert(entry) {
             discovery
                 .diagnostics
@@ -1078,8 +1181,8 @@ fn discover_segment_context(
                 vs_sizes_offset: layout.field("_HEAP_VS_CHUNK_HEADER", "Sizes")?,
                 known_tag: None,
                 states: vec![state],
-                reusable_chunks: reusable_chunks.clone(),
-                cached_chunks: cached_chunks.clone(),
+                reusable_chunks: Arc::clone(reusable_chunks),
+                cached_chunks: Arc::clone(cached_chunks),
             });
             descriptor_index += unit_size;
         }
@@ -1177,8 +1280,8 @@ fn discover_large_allocations(
             vs_sizes_offset: 0,
             known_tag: Some(tag),
             states: vec![PoolState::Allocated],
-            reusable_chunks: HashSet::new(),
-            cached_chunks: HashSet::new(),
+            reusable_chunks: Arc::default(),
+            cached_chunks: Arc::default(),
         });
     }
     Ok(())
@@ -1234,7 +1337,7 @@ fn lookup_big_page_target(
     })?;
     let mut remaining = count;
     'probe: while let Some(first_index) = probes.next() {
-        check_interrupted(memory)?;
+        check_budget(memory)?;
         let batch_len = BIG_PAGE_PROBE_BATCH.min(remaining).min(count - first_index);
         let byte_len =
             entry_size
@@ -1292,6 +1395,63 @@ fn lookup_big_page_target(
         "no validated big-page entry for large allocation {address:#x}"
     ));
     Ok(None)
+}
+
+/// How many verbatim examples of one kind of diagnostic to keep.
+const DIAGNOSTIC_EXAMPLES: usize = 8;
+
+/// The shape of a diagnostic: the message with every number standing in for itself.
+///
+/// "unreadable VS free tree node 0xffffc00f6ec02f90" and the same complaint about a
+/// different node share a shape; a genuinely different complaint does not.
+fn diagnostic_shape(message: &str) -> String {
+    message
+        .split_whitespace()
+        .map(|token| {
+            if token.contains(|character: char| character.is_ascii_digit()) {
+                "#"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Collapse floods of near-identical diagnostics into examples plus a count.
+///
+/// A live target keeps allocating between the reads that make up one walk, so a single
+/// stale list pointer yields one "unreadable ... node" line per node — 14k of them measured
+/// on a busy kernel. That buries the handful of *distinct* problems a reader needs, and
+/// every consumer truncates the list anyway, so which ones survive is decided by position
+/// rather than by significance.
+///
+/// Nothing is dropped silently: each group keeps its first [`DIAGNOSTIC_EXAMPLES`] verbatim
+/// and the rest become a count, so the volume — the number that says the walk was fighting a
+/// moving target — is still on the page. Summaries go at the end, in the order the groups
+/// first appeared, rather than interleaved where a group's last member happened to land.
+fn collapse_repeats(diagnostics: Vec<String>) -> Vec<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    for message in diagnostics {
+        let shape = diagnostic_shape(&message);
+        let count = counts.entry(shape.clone()).or_insert_with(|| {
+            order.push(shape);
+            0
+        });
+        *count += 1;
+        if *count <= DIAGNOSTIC_EXAMPLES {
+            kept.push(message);
+        }
+    }
+    for shape in order {
+        let total = counts[&shape];
+        if let Some(collapsed) = total.checked_sub(DIAGNOSTIC_EXAMPLES).filter(|n| *n > 0) {
+            kept.push(format!("... and {collapsed} more like `{shape}`"));
+        }
+    }
+    kept
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1368,29 +1528,112 @@ fn special_pool_placement(
     }
 }
 
+/// The share of the budget discovery may spend before the region walk claims the rest.
+///
+/// The two halves are useless apart: discovery finds the regions, the walk reads what is in
+/// them, and a snapshot with neither half finished is an empty pool. Discovery is also the
+/// pointer-chasing half — one read per free-tree node, per list entry, per subsegment — so
+/// on a live link it is the half that runs long, and left unchecked it would spend the whole
+/// budget and leave nothing to walk. Holding it to two thirds means a walk that runs out of
+/// time still reports the chunks in the regions it did reach, which is the answer a caller
+/// asked a pool query for.
+const DISCOVERY_BUDGET_SHARE: (u32, u32) = (2, 3);
+
+/// Splits a walk budget into the deadline discovery works to and the one the whole walk
+/// works to. `None` in gives `None` out for both: no budget, no deadlines.
+fn budget_deadlines(
+    start: Instant,
+    budget: Option<Duration>,
+) -> (Option<Instant>, Option<Instant>) {
+    let (numerator, denominator) = DISCOVERY_BUDGET_SHARE;
+    (
+        budget.map(|full| start + full / denominator * numerator),
+        budget.map(|full| start + full),
+    )
+}
+
 impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
-    pub(crate) fn walk(&self) -> Result<PoolSnapshot, SnapshotError> {
+    /// Walks the pool, giving up after `budget` rather than running as long as it takes.
+    ///
+    /// `None` runs to completion. That is right only where something *else* can stop the
+    /// walk — an operator's Ctrl+C at a WinDbg prompt — and wrong for a programmatic caller,
+    /// where nothing sets that flag; see [`Budgeted`].
+    ///
+    /// Running out of time is **not** an error. It comes back as a snapshot that says what
+    /// it reached, with `complete` cleared and a diagnostic naming the budget, because a
+    /// partial walk still answers "here is a chunk carrying that tag" — and the alternative,
+    /// an error, discards minutes of work to say nothing at all. A Ctrl+C is the opposite
+    /// and still errors: an operator who interrupts is asking for the walk to stop, not for
+    /// whatever it happened to have.
+    pub(crate) fn walk(&self, budget: Option<Duration>) -> Result<PoolSnapshot, SnapshotError> {
+        let (discovery_deadline, walk_deadline) = budget_deadlines(Instant::now(), budget);
         let mut snapshot = PoolSnapshot {
             diagnostics: vec!["per-session paged heaps are not included".into()],
             complete: true,
             ..PoolSnapshot::default()
         };
-        let discovery = discover_pool_regions(self.memory, self.layout, self.traversal_limit)?;
+
+        let discovery_clock = Budgeted::new(self.memory, discovery_deadline);
+        let mut discovery = Discovery::default();
+        let mut expired = match discover_pool_regions(
+            &discovery_clock,
+            self.layout,
+            self.traversal_limit,
+            &mut discovery,
+        ) {
+            Ok(()) => false,
+            Err(SnapshotError::BudgetExpired) => true,
+            Err(error) => return Err(error),
+        };
         if !discovery.diagnostics.is_empty() {
             snapshot.complete = false;
         }
-        snapshot.diagnostics.extend(discovery.diagnostics);
+        snapshot.diagnostics.append(&mut discovery.diagnostics);
+
+        // The full deadline, so regions found before discovery ran out of its share still get
+        // walked with the time discovery did not use.
+        let walk_clock = Budgeted::new(self.memory, walk_deadline);
+        let walker = SnapshotWalker {
+            memory: &walk_clock,
+            layout: self.layout,
+            traversal_limit: self.traversal_limit,
+        };
+        let discovered = discovery.regions.len();
+        let mut walked = 0usize;
         for region in discovery.regions {
-            check_interrupted(self.memory)?;
-            if region.backend == PoolBackend::Large {
-                self.walk_large(&region, &mut snapshot);
-            } else {
-                self.walk_region(&region, &mut snapshot);
+            match check_budget(&walk_clock) {
+                Ok(()) => {}
+                Err(SnapshotError::BudgetExpired) => {
+                    expired = true;
+                    break;
+                }
+                Err(error) => return Err(error),
             }
+            if region.backend == PoolBackend::Large {
+                walker.walk_large(&region, &mut snapshot);
+            } else {
+                walker.walk_region(&region, &mut snapshot);
+            }
+            walked += 1;
+        }
+
+        if expired {
+            snapshot.complete = false;
+            let allowed = match budget {
+                Some(budget) => format!("{budget:?} budget"),
+                None => "walk budget".to_string(),
+            };
+            snapshot.diagnostics.push(format!(
+                "the walk ran out of its {allowed}: {walked} of {discovered} discovered regions \
+                 were walked, and region discovery itself may not have finished. What is \
+                 reported was really there; what is missing is unknown, not absent. Allow a \
+                 longer budget for full coverage."
+            ));
         }
         snapshot
             .spans
             .sort_by_key(|span| (span.heap, span.usable_address));
+        snapshot.diagnostics = collapse_repeats(snapshot.diagnostics);
         Ok(snapshot)
     }
 
@@ -1854,8 +2097,8 @@ mod tests {
             vs_sizes_offset: 0,
             known_tag: None,
             states: Vec::new(),
-            reusable_chunks: HashSet::new(),
-            cached_chunks: HashSet::new(),
+            reusable_chunks: Arc::default(),
+            cached_chunks: Arc::default(),
         }
     }
 
@@ -2781,7 +3024,7 @@ mod tests {
             layout: &layout,
             traversal_limit: 1024,
         };
-        let snapshot = walker.walk().unwrap();
+        let snapshot = walker.walk(None).unwrap();
         for backend in [
             PoolBackend::Lfh,
             PoolBackend::Vs,
@@ -2860,6 +3103,261 @@ mod tests {
         assert_eq!(
             walker.lookup_big_page(&table, 24, address),
             Some((u32::from_le_bytes(*b"NEXT"), 0x7000))
+        );
+    }
+
+    // ---- the walk budget --------------------------------------------------------------
+
+    /// The synthetic fixture, with a budget that runs out after a fixed number of reads.
+    ///
+    /// The real budget is wall-clock, which is untestable without making the test a race
+    /// against the machine it runs on. Reads are the honest stand-in: they are what the
+    /// budget exists to bound — over a live KD link every one crosses the wire — and their
+    /// count is exactly what differs between a dump that walks in a second and a live kernel
+    /// that takes minutes.
+    struct Impatient {
+        inner: SyntheticMemory,
+        reads: Cell<usize>,
+        allowance: usize,
+    }
+
+    impl Impatient {
+        fn new(allowance: usize) -> Self {
+            Self {
+                inner: synthetic_memory(),
+                reads: Cell::new(0),
+                allowance,
+            }
+        }
+    }
+
+    impl PoolMemory for Impatient {
+        fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
+            self.reads.set(self.reads.get() + 1);
+            self.inner.read_exact(address, size)
+        }
+
+        fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError> {
+            self.inner.valid_region(address, size)
+        }
+
+        fn interrupted(&self) -> Result<bool, SnapshotError> {
+            Ok(false)
+        }
+
+        fn out_of_budget(&self) -> bool {
+            self.reads.get() >= self.allowance
+        }
+    }
+
+    fn walk_impatiently(allowance: usize) -> PoolSnapshot {
+        let memory = Impatient::new(allowance);
+        let layout = synthetic_layout();
+        SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1024,
+        }
+        .walk(None)
+        .expect("running out of budget is an outcome, not an error")
+    }
+
+    /// The wedge this budget exists to prevent: with nothing to stop it, the walk ran on
+    /// past the caller's timeout and every later call to that target queued behind it. So
+    /// the deadline has to produce an *answer* — a snapshot that says what it reached and
+    /// admits what it did not. An `Err` would discard the work and say nothing.
+    #[test]
+    fn test_a_walk_that_runs_out_of_budget_reports_what_it_reached() {
+        let snapshot = walk_impatiently(40);
+
+        assert!(
+            !snapshot.complete,
+            "a truncated walk that claims completeness is the lie this whole API guards against"
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("ran out of its")
+                    && message.contains("discovered regions")),
+            "the snapshot has to say why it is short: {:?}",
+            snapshot.diagnostics
+        );
+    }
+
+    /// Running out of time is about the walk, not about whichever heap happened to be under
+    /// the cursor. Recorded as a per-heap failure it would read as "heap 3 is unreadable"
+    /// and — the real damage — the heap loop would swallow it and carry on to heaps 4..n,
+    /// each stopping the same way, so the deadline would bound one heap instead of the walk.
+    #[test]
+    fn test_running_out_of_budget_is_not_reported_as_a_broken_heap() {
+        let snapshot = walk_impatiently(40);
+
+        assert!(
+            !snapshot
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("cannot fully discover heap")),
+            "the halt was absorbed by the per-heap handler: {:?}",
+            snapshot.diagnostics
+        );
+    }
+
+    /// Discovery finds the regions and the walk reads what is in them, so a budget spent
+    /// entirely on the first half yields an empty pool. Two things keep that from happening:
+    /// discovery is held to a share of the budget, and — pinned here — the regions it found
+    /// before stopping survive the halt instead of being dropped with the error.
+    #[test]
+    fn test_regions_found_before_the_halt_are_not_thrown_away() {
+        // Enough reads to get past VS evidence and into the segment walk, not enough to
+        // finish it.
+        let snapshot = walk_impatiently(120);
+        let summary = snapshot
+            .diagnostics
+            .iter()
+            .find(|message| message.contains("discovered regions"))
+            .expect("the walk stopped short and must say so");
+        let tokens: Vec<&str> = summary.split_whitespace().collect();
+        let discovered: usize = tokens
+            .iter()
+            .position(|token| *token == "discovered")
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| tokens[index].parse().ok())
+            .unwrap_or_else(|| panic!("no region count in `{summary}`"));
+
+        assert!(
+            discovered > 0,
+            "discovery's partial results were discarded with the halt: `{summary}`"
+        );
+    }
+
+    /// Neither half of the walk is useful without the other, so discovery gets a share of
+    /// the budget rather than all of it — and the whole walk still stops at the deadline it
+    /// was given.
+    #[test]
+    fn test_discovery_gets_a_share_of_the_budget_and_the_walk_the_rest() {
+        let start = Instant::now();
+        let budget = Duration::from_secs(120);
+        let (discovery, whole) = budget_deadlines(start, Some(budget));
+        let (discovery, whole) = (discovery.unwrap(), whole.unwrap());
+
+        assert_eq!(whole, start + budget);
+        assert!(
+            discovery < whole,
+            "discovery must yield before the deadline"
+        );
+        assert!(
+            discovery > start,
+            "discovery must get real time, not a token slice"
+        );
+        assert_eq!(budget_deadlines(start, None), (None, None));
+    }
+
+    /// A budget and a Ctrl+C both halt the walk, and they must not be confused. Running out
+    /// of time means "here is what I got"; an operator interrupting means "stop" — handing
+    /// them a snapshot they cancelled, which then renders as a full table, is not that.
+    #[test]
+    fn test_an_interrupt_still_stops_the_walk_outright() {
+        struct Interrupting(SyntheticMemory);
+
+        impl PoolMemory for Interrupting {
+            fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
+                self.0.read_exact(address, size)
+            }
+
+            fn valid_region(
+                &self,
+                address: u64,
+                size: usize,
+            ) -> Result<(u64, usize), SnapshotError> {
+                self.0.valid_region(address, size)
+            }
+
+            fn interrupted(&self) -> Result<bool, SnapshotError> {
+                Ok(true)
+            }
+        }
+
+        let memory = Interrupting(synthetic_memory());
+        let layout = synthetic_layout();
+
+        assert!(matches!(
+            SnapshotWalker {
+                memory: &memory,
+                layout: &layout,
+                traversal_limit: 1024,
+            }
+            .walk(Some(Duration::from_secs(600))),
+            Err(SnapshotError::Interrupted)
+        ));
+    }
+
+    /// A budget nobody comes close to spending must not change the answer.
+    #[test]
+    fn test_a_generous_budget_walks_exactly_as_an_unbounded_one_does() {
+        let memory = synthetic_memory();
+        let layout = synthetic_layout();
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1024,
+        };
+
+        let unbounded = walker.walk(None).unwrap();
+        let budgeted = walker.walk(Some(Duration::from_secs(600))).unwrap();
+
+        assert_eq!(budgeted.spans, unbounded.spans);
+        assert_eq!(budgeted.complete, unbounded.complete);
+        assert_eq!(budgeted.diagnostics, unbounded.diagnostics);
+    }
+
+    // ---- diagnostic floods -------------------------------------------------------------
+
+    /// A live target keeps allocating between the reads of one walk, so a single stale list
+    /// pointer yields one complaint per node — 14k of them measured on a busy kernel, which
+    /// buries the few distinct problems and leaves every consumer truncating by position.
+    /// Collapsing keeps examples and, crucially, the *count*: the volume is itself the
+    /// finding, so it must survive.
+    #[test]
+    fn test_a_flood_of_one_complaint_becomes_examples_plus_a_count() {
+        let mut diagnostics: Vec<String> = (0..1000)
+            .map(|node| format!("unreadable VS free tree node {node:#x}: sparse memory"))
+            .collect();
+        diagnostics.push("rejecting implausible LFH unit size 3 at 0x1000".into());
+
+        let collapsed = collapse_repeats(diagnostics);
+
+        assert_eq!(
+            collapsed.len(),
+            DIAGNOSTIC_EXAMPLES + 2,
+            "expected {DIAGNOSTIC_EXAMPLES} examples, the distinct message, and one summary"
+        );
+        assert!(collapsed[0].contains("unreadable VS free tree node 0x0"));
+        assert!(
+            collapsed
+                .iter()
+                .any(|message| message.contains("rejecting implausible LFH unit size")),
+            "a distinct complaint must not be collapsed away by a flood of another"
+        );
+        assert!(
+            collapsed.last().is_some_and(
+                |message| message.contains(&format!("and {} more", 1000 - DIAGNOSTIC_EXAMPLES))
+            ),
+            "the count is the finding and has to survive: {collapsed:?}"
+        );
+    }
+
+    /// Grouping is by shape, so the same complaint about different addresses is one group
+    /// while genuinely different complaints stay apart.
+    #[test]
+    fn test_diagnostic_shape_ignores_numbers_but_not_wording() {
+        assert_eq!(
+            diagnostic_shape("unreadable VS free tree node 0xdeadbeef: sparse"),
+            diagnostic_shape("unreadable VS free tree node 0x41414141: sparse")
+        );
+        assert_ne!(
+            diagnostic_shape("unreadable VS free tree node 0xdeadbeef"),
+            diagnostic_shape("unreadable VS delay-free node 0xdeadbeef")
         );
     }
 
