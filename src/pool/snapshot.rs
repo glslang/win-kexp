@@ -614,21 +614,25 @@ struct VsRoot {
 ///   and the map holds `AffinityMask + 1` entries. Entries routinely share a slot, so the
 ///   result is deduplicated.
 ///
-/// Returning an empty vector means neither shape resolved; the caller then walks no VS
-/// evidence rather than guessing at an address.
+/// An empty vector means neither shape resolved; the caller then walks no VS evidence
+/// rather than guessing at an address. An `Err` means the walk itself is over — the slot
+/// map is up to 256 entries plus an owner read per distinct slot, all over the wire, so it
+/// polls the deadline like every other read-issuing loop (see [`check_budget`]). It cannot
+/// lean on a later poll: invalid slot refs yield no roots, so nothing downstream reads at
+/// all and the next check is a whole segment context away.
 fn vs_roots(
     memory: &impl PoolMemory,
     layout: &PoolLayout,
     context: u64,
     diagnostics: &mut Vec<String>,
-) -> Vec<VsRoot> {
+) -> Result<Vec<VsRoot>, SnapshotError> {
     // Legacy shape wins when present: a context that still carries the tree has no slots.
     if let Ok(tree_offset) = layout.field("_HEAP_VS_CONTEXT", "FreeChunkTree") {
-        return vec![VsRoot {
+        return Ok(vec![VsRoot {
             base: context,
             tree_offset,
             delay_offset: layout.field("_HEAP_VS_CONTEXT", "DelayFreeContext").ok(),
-        }];
+        }]);
     }
 
     let (Ok(tree_offset), Ok(back_offset), Ok(slot_map_ref_offset), Ok(affinity_offset)) = (
@@ -639,7 +643,7 @@ fn vs_roots(
     ) else {
         diagnostics
             .push("VS free-chunk state is in neither the context nor an affinity slot".into());
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let (Ok(slot_map_ref), Ok(affinity_mask)) = (
@@ -649,7 +653,7 @@ fn vs_roots(
         diagnostics.push(format!(
             "cannot read the VS slot map of context {context:#x}"
         ));
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let entries = affinity_mask as usize + 1;
@@ -659,7 +663,7 @@ fn vs_roots(
         diagnostics.push(format!(
             "implausible VS slot map for context {context:#x}: ref {slot_map_ref:#x}, {entries} entries"
         ));
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let entry_size = layout
@@ -674,6 +678,7 @@ fn vs_roots(
     let mut roots = Vec::new();
     let mut seen = HashSet::new();
     for index in 0..entries {
+        check_budget(memory)?;
         let entry = slot_map + index as u64 * entry_size;
         let Ok(slot_ref) = scalar(memory, entry + slot_ref_offset as u64, 2) else {
             // Skipping silently would drop that slot's free tree and delay-free list, so
@@ -706,7 +711,7 @@ fn vs_roots(
             }
         }
     }
-    roots
+    Ok(roots)
 }
 
 fn discover_vs_evidence(
@@ -721,7 +726,7 @@ fn discover_vs_evidence(
         return Ok(Default::default());
     };
     let context = heap_address + vs_context_offset as u64;
-    let roots = vs_roots(memory, layout, context, diagnostics);
+    let roots = vs_roots(memory, layout, context, diagnostics)?;
     if roots.is_empty() {
         return Ok(Default::default());
     }
@@ -1571,6 +1576,14 @@ fn special_pool_placement(
 /// asked a pool query for.
 const DISCOVERY_BUDGET_SHARE: (u32, u32) = (2, 3);
 
+/// How much of one committed extent to ask for per debugger read.
+///
+/// Sized so a chunk is a fraction of a second even on a slow KD link — small enough that the
+/// deadline is observed at a useful granularity, large enough that a megabyte-scale extent is
+/// still a handful of transfers rather than hundreds. Extents at or below this are read whole,
+/// so the ordinary small region pays nothing for this.
+const EXTENT_READ_CHUNK: usize = 256 * 1024;
+
 /// Splits a walk budget into the deadline discovery works to and the one the whole walk
 /// works to. `None` in gives `None` out for both: no budget, no deadlines.
 ///
@@ -1731,11 +1744,12 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 self.unreadable(region, valid_base, requested_end - valid_base, snapshot);
                 break;
             }
-            let bytes = match self
-                .memory
-                .read_exact(valid_base, (valid_end - valid_base) as usize)
-            {
+            let bytes = match self.read_extent(valid_base, (valid_end - valid_base) as usize) {
                 Ok(bytes) => bytes,
+                // Out of time is not "this memory would not read". Left to the arm below it
+                // would be filed as an unreadable span — the walk asserting a fact about the
+                // target out of its own failure to look.
+                Err(error) if error.halts_walk() => return Err(error),
                 Err(error) => {
                     snapshot
                         .diagnostics
@@ -1764,6 +1778,43 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             cursor = valid_end;
         }
         Ok(())
+    }
+
+    /// Reads one committed extent, polling the deadline as the bytes come in.
+    ///
+    /// A single `read_exact` of a whole extent is one synchronous transfer that cannot
+    /// observe the deadline while it runs, so a large committed page range could carry the
+    /// walk past its ceiling however carefully the loops around it polled.
+    ///
+    /// **The chunking is of the transfer, not of the decoding.** Handing each chunk to the
+    /// backend decoders instead would be much simpler and quietly wrong: `walk_lfh` skips any
+    /// slot straddling the end of its slice and `walk_vs` stops at a chunk that runs past it
+    /// and clears `complete`, so every chunk boundary would lose an allocation or invent an
+    /// incomplete walk. The decoders still see one contiguous extent, exactly as before.
+    fn read_extent(&self, base: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
+        if size <= EXTENT_READ_CHUNK {
+            return self.memory.read_exact(base, size);
+        }
+        let mut bytes = Vec::with_capacity(size);
+        while bytes.len() < size {
+            check_budget(self.memory)?;
+            let take = EXTENT_READ_CHUNK.min(size - bytes.len());
+            // A failed chunk fails the extent, which is what a failed whole-extent read did.
+            // Returning the prefix would hand the decoders a short buffer, and they read a
+            // short buffer as "the region ends here".
+            let chunk = self.memory.read_exact(base + bytes.len() as u64, take)?;
+            if chunk.len() != take {
+                return Err(SnapshotError::InvalidData {
+                    detail: format!(
+                        "short extent read at {:#x}: asked {take:#x}, got {:#x}",
+                        base + bytes.len() as u64,
+                        chunk.len()
+                    ),
+                });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
 
     fn walk_large(&self, region: &PoolRegion, snapshot: &mut PoolSnapshot) {
@@ -2312,13 +2363,30 @@ mod tests {
         memory
     }
 
+    /// The slot map is up to 256 entries plus an owner read per distinct slot, all over the
+    /// wire. It cannot lean on a later poll either: invalid slot refs produce no roots, so
+    /// nothing downstream reads at all and the next check is a whole segment context away.
+    #[test]
+    fn test_vs_roots_polls_the_budget_between_slot_map_entries() {
+        // Two reads resolve the slot map itself; the loop below them gets nothing.
+        let memory = Impatient::over(affinity_fixture(), 2);
+
+        let outcome = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut Vec::new());
+
+        assert!(
+            matches!(outcome, Err(SnapshotError::BudgetExpired)),
+            "the slot-map loop read on past the deadline, resolving {} roots",
+            outcome.map_or(0, |roots| roots.len())
+        );
+    }
+
     /// Pre-26100: the tree is inline in the context, so there is exactly one root and no
     /// slot map is consulted at all.
     #[test]
     fn test_vs_roots_reads_the_legacy_in_context_shape() {
         let memory = FlatMemory::new(VS_CONTEXT, 0x100);
         let mut diagnostics = Vec::new();
-        let roots = vs_roots(&memory, &vs_layout(false), VS_CONTEXT, &mut diagnostics);
+        let roots = vs_roots(&memory, &vs_layout(false), VS_CONTEXT, &mut diagnostics).unwrap();
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].base, VS_CONTEXT);
         assert_eq!(roots[0].tree_offset, 0x10);
@@ -2331,7 +2399,7 @@ mod tests {
     fn test_vs_roots_walks_the_affinity_slots_and_dedups_them() {
         let memory = affinity_fixture();
         let mut diagnostics = Vec::new();
-        let roots = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut diagnostics);
+        let roots = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut diagnostics).unwrap();
         let bases: Vec<u64> = roots.iter().map(|root| root.base).collect();
         // Four entries, one repeat, one rejected -> two roots.
         assert_eq!(bases, vec![VS_CONTEXT + 0x800, VS_CONTEXT + 0xc00]);
@@ -2345,7 +2413,7 @@ mod tests {
     fn test_vs_roots_rejects_a_slot_whose_back_pointer_disagrees() {
         let memory = affinity_fixture();
         let mut diagnostics = Vec::new();
-        let roots = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut diagnostics);
+        let roots = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut diagnostics).unwrap();
         assert!(roots.iter().all(|root| root.base != VS_CONTEXT + 0x1000));
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].contains("claims context"));
@@ -2357,7 +2425,7 @@ mod tests {
         let mut memory = affinity_fixture();
         memory.put_u16(VS_CONTEXT, 0);
         let mut diagnostics = Vec::new();
-        let roots = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut diagnostics);
+        let roots = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut diagnostics).unwrap();
         assert!(roots.is_empty());
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].contains("implausible VS slot map"));
@@ -2378,7 +2446,7 @@ mod tests {
             types: HashMap::new(),
         };
         let mut diagnostics = Vec::new();
-        let roots = vs_roots(&memory, &layout, VS_CONTEXT, &mut diagnostics);
+        let roots = vs_roots(&memory, &layout, VS_CONTEXT, &mut diagnostics).unwrap();
         assert!(roots.is_empty());
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].contains("neither the context nor an affinity slot"));
@@ -3175,18 +3243,20 @@ mod tests {
     /// budget exists to bound — over a live KD link every one crosses the wire — and their
     /// count is exactly what differs between a dump that walks in a second and a live kernel
     /// that takes minutes.
-    struct Impatient {
-        inner: SyntheticMemory,
+    struct Impatient<M> {
+        inner: M,
         reads: Cell<usize>,
         allowance: usize,
     }
 
-    impl Impatient {
+    impl Impatient<SyntheticMemory> {
         fn new(allowance: usize) -> Self {
             Self::over(synthetic_memory(), allowance)
         }
+    }
 
-        fn over(inner: SyntheticMemory, allowance: usize) -> Self {
+    impl<M> Impatient<M> {
+        fn over(inner: M, allowance: usize) -> Self {
             Self {
                 inner,
                 reads: Cell::new(0),
@@ -3195,7 +3265,7 @@ mod tests {
         }
     }
 
-    impl PoolMemory for Impatient {
+    impl<M: PoolMemory> PoolMemory for Impatient<M> {
         fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
             self.reads.set(self.reads.get() + 1);
             self.inner.read_exact(address, size)
@@ -3469,6 +3539,89 @@ mod tests {
             "{} reads for a budget of {ALLOWANCE}: the node loop ran on past the deadline",
             memory.reads.get()
         );
+    }
+
+    /// One extent far larger than a single read should be, reported as entirely committed.
+    struct OneHugeExtent {
+        reads: Cell<usize>,
+        allowance: usize,
+    }
+
+    impl PoolMemory for OneHugeExtent {
+        fn read_exact(&self, _address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(vec![0; size])
+        }
+
+        fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError> {
+            Ok((address, size))
+        }
+
+        fn interrupted(&self) -> Result<bool, SnapshotError> {
+            Ok(false)
+        }
+
+        fn out_of_budget(&self) -> bool {
+            self.reads.get() >= self.allowance
+        }
+    }
+
+    /// The loops around a read can poll perfectly and still overrun, because the read itself
+    /// is one synchronous transfer: a large committed page range is megabytes in flight with
+    /// no opportunity to notice the deadline. Chunking the transfer is what makes the ceiling
+    /// hold whatever the pool's geometry turns out to be.
+    #[test]
+    fn test_a_large_extent_is_read_in_chunks_that_observe_the_deadline() {
+        const ALLOWANCE: usize = 2;
+        let memory = OneHugeExtent {
+            reads: Cell::new(0),
+            allowance: ALLOWANCE,
+        };
+        let layout = vs_layout(false);
+        let mut region = lfh_region(0x1000, 0x100);
+        region.size = EXTENT_READ_CHUNK * 8;
+        region.bitmap = vec![0xff; 64];
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1000,
+        };
+
+        let outcome = walker.walk_region(&region, &mut PoolSnapshot::default());
+
+        assert!(
+            matches!(outcome, Err(SnapshotError::BudgetExpired)),
+            "an extent that outlives the deadline has to stop mid-transfer: {outcome:?}"
+        );
+        assert_eq!(
+            memory.reads.get(),
+            ALLOWANCE,
+            "the extent was not chunked, so the deadline could not be observed while it \
+             transferred"
+        );
+    }
+
+    /// The common case must not pay for the uncommon one: an extent that fits in a chunk is
+    /// still exactly one read.
+    #[test]
+    fn test_a_small_extent_is_still_a_single_read() {
+        let memory = OneHugeExtent {
+            reads: Cell::new(0),
+            allowance: usize::MAX,
+        };
+        let layout = vs_layout(false);
+        let region = lfh_region(0x1000, 0x100);
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1000,
+        };
+
+        walker
+            .walk_region(&region, &mut PoolSnapshot::default())
+            .unwrap();
+
+        assert_eq!(memory.reads.get(), 1);
     }
 
     /// Discovery finds the regions and the walk reads what is in them, so a budget spent
