@@ -209,10 +209,22 @@ impl PoolMemory for crate::dbgeng::DebugEngine {
 
 /// The one place a walk asks whether it is still allowed to run.
 ///
-/// Called from every loop that can iterate an unbounded number of times, so the cost of one
-/// runaway step is a step and not a walk. Both answers halt (see
-/// [`SnapshotError::halts_walk`]); they differ in what the caller does with the halt, which
-/// [`SnapshotWalker::walk`] decides.
+/// **The rule: every loop that issues a debugger read calls this, first thing.** Not only the
+/// unbounded ones — a bounded loop is not automatically safe. The descriptor loop in
+/// [`discover_segment_context`] is capped at 4096 iterations and reads twice per LFH
+/// descriptor, so polling one level out in the segment loop still left ~8k reads between the
+/// deadline passing and anything noticing. On a live KD link that is thousands of round
+/// trips, minutes of them: the very failure this budget exists to prevent, reintroduced
+/// inside the fix for it.
+///
+/// Reads themselves deliberately keep working past the deadline rather than failing. Having
+/// [`Budgeted`] reject them would bound the walk with no rule to remember — but nearly every
+/// read here is swallowed into a "cannot read ..." diagnostic, so out-of-time would surface
+/// as *unreadable memory*. That is the one lie this module is built to avoid: what the walk
+/// did not reach must never be reported as what is not there.
+///
+/// Both answers halt (see [`SnapshotError::halts_walk`]); they differ in what the caller does
+/// with the halt, which [`SnapshotWalker::walk`] decides.
 fn check_budget(memory: &impl PoolMemory) -> Result<(), SnapshotError> {
     if memory.interrupted()? {
         return Err(SnapshotError::Interrupted);
@@ -483,6 +495,9 @@ fn discover_pool_regions(
     }
     let mut heaps = Vec::new();
     for numa_node in 0..number {
+        // Four pointer reads per node, up to 256 nodes: bounded, but a thousand round trips
+        // is still seconds on a live link, and the rule is uniform — a loop that reads polls.
+        check_budget(memory)?;
         let Some(node_address) = state_address
             .checked_add(node_offset as u64)
             .and_then(|address| address.checked_add(numa_node as u64 * node.size as u64))
@@ -778,6 +793,7 @@ fn discover_vs_evidence(
             (buckets_offset, lookaside, list_offset)
         {
             for bucket in 0..bucket_count {
+                check_budget(memory)?;
                 let Some(bucket_address) = dynamic
                     .checked_add(buckets_offset as u64)
                     .and_then(|value| value.checked_add(bucket as u64 * u64::from(lookaside.size)))
@@ -1031,6 +1047,10 @@ fn discover_segment_context(
         };
         let mut descriptor_index = first_descriptor;
         while descriptor_index < descriptor_count {
+            // Up to 4096 descriptors per segment, and an LFH one costs a subsegment header
+            // plus a bitmap read apiece. Polling only in the enclosing segment loop left ~8k
+            // reads between the deadline passing and anything noticing.
+            check_budget(memory)?;
             let offset = descriptor_index * descriptor.size as usize;
             let Some(decoded) = decode_descriptor_at(
                 &metadata,
@@ -1236,6 +1256,10 @@ fn discover_large_allocations(
         &mut discovery.diagnostics,
     )?;
     for node in nodes {
+        // One metadata read per node, and `nodes` is bounded only by `traversal_limit`. The
+        // nested poll in `lookup_big_page_target` covers only nodes that get that far; one
+        // whose metadata will not read continues from here, reading and never asking.
+        check_budget(memory)?;
         let allocation_address = node.saturating_sub(tree_node as u64);
         let allocation = match guarded_read(memory, allocation_address, large.size as usize) {
             Ok(bytes) => bytes,
@@ -3159,8 +3183,12 @@ mod tests {
 
     impl Impatient {
         fn new(allowance: usize) -> Self {
+            Self::over(synthetic_memory(), allowance)
+        }
+
+        fn over(inner: SyntheticMemory, allowance: usize) -> Self {
             Self {
-                inner: synthetic_memory(),
+                inner,
                 reads: Cell::new(0),
                 allowance,
             }
@@ -3249,6 +3277,198 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// How many reads a walk may still issue after its budget is spent.
+    ///
+    /// Not zero: the check sits at the top of each read-issuing loop, so the iteration
+    /// already under way finishes and a few of those loops nest. Measured at 3 against this
+    /// fixture, and pinned there rather than rounded up — the number this guards against is
+    /// the thousands a single unpolled loop costs, so slack here buys nothing and hides the
+    /// next missing check.
+    const OVERSHOOT_ALLOWED: usize = 3;
+
+    #[test]
+    fn test_the_walk_stops_reading_promptly_once_its_budget_is_gone() {
+        let overshoots: Vec<(usize, usize)> = [10, 25, 40, 80, 120, 200, 400]
+            .into_iter()
+            .map(|allowance| {
+                let memory = Impatient::new(allowance);
+                let layout = synthetic_layout();
+                SnapshotWalker {
+                    memory: &memory,
+                    layout: &layout,
+                    traversal_limit: 1024,
+                }
+                .walk(None)
+                .expect("running out of budget is an outcome, not an error");
+                (allowance, memory.reads.get().saturating_sub(allowance))
+            })
+            .collect();
+
+        let worst = overshoots.iter().map(|(_, over)| *over).max().unwrap_or(0);
+        assert!(
+            worst <= OVERSHOOT_ALLOWED,
+            "{worst} reads issued after the deadline (limit {OVERSHOOT_ALLOWED}) — some \
+             read-issuing loop is not polling the budget. (budget, overshoot): {overshoots:?}"
+        );
+    }
+
+    /// One page segment whose every descriptor is a committed LFH range.
+    ///
+    /// The shared fixture has five descriptors in a sixteen-slot array and only one of them
+    /// is LFH, so its descriptor loop issues almost no reads — a walk over it stays inside
+    /// the overshoot limit *even with the loop's budget check deleted*, which is exactly how
+    /// that missing check went unnoticed. A real kernel segment is the opposite: descriptors
+    /// packed with committed subsegments, one header read each.
+    ///
+    /// The subsegment bodies are deliberately left unwritten. Reading one still costs the
+    /// round trip this is counting, and what the walk makes of the bytes afterwards is not
+    /// what is under test.
+    fn segment_of_lfh_descriptors(heap_key: u64) -> SyntheticMemory {
+        let mut bytes = Writes::default();
+        let context = HEAP + 0x100;
+
+        fill(&mut bytes, HEAP, 0x800);
+        put_u64(&mut bytes, context, SEGMENT); // SegmentListHead
+        put(&mut bytes, context + 0x20, &[12, 1]); // UnitShift, FirstDescriptorIndex
+        put_u64(&mut bytes, context + 0x28, !0xffffu64); // SegmentMask: 16 descriptors
+
+        fill(&mut bytes, SEGMENT, 0x300);
+        put_u64(&mut bytes, SEGMENT, context); // ListEntry back to the head: one segment
+        put_u64(
+            &mut bytes,
+            SEGMENT + 0x20,
+            SEGMENT ^ context ^ heap_key ^ super::super::decode::PAGE_SEGMENT_SIGNATURE,
+        );
+        for index in 1..16u64 {
+            let descriptor = SEGMENT + 0x100 + index * 0x20;
+            put_u32(
+                &mut bytes,
+                descriptor,
+                super::super::decode::DESCRIPTOR_TREE_SIGNATURE,
+            );
+            put(
+                &mut bytes,
+                descriptor + 0x18,
+                &[DESCRIPTOR_FLAG_LFH | DESCRIPTOR_FLAG_COMMITTED | 0x0c],
+            );
+            put(&mut bytes, descriptor + 0x1f, &[1]);
+        }
+        SyntheticMemory::new(bytes, Vec::new())
+    }
+
+    /// The descriptor loop is bounded — 4096 iterations — and that is precisely why it was
+    /// missed: "bounded" is not "cheap" when each iteration reads. Polling one level out, in
+    /// the segment loop, let a single segment issue thousands of round trips after the
+    /// deadline, which on a live KD link is minutes: the wedge, rebuilt inside its own fix.
+    #[test]
+    fn test_a_segment_full_of_descriptors_polls_the_budget_between_them() {
+        // Enough to get through the context fields, the free-page tree, the segment header
+        // and the descriptor array, so the halt lands *inside* the descriptor loop — which
+        // is the loop under test.
+        const ALLOWANCE: usize = 10;
+        let heap_key = 0x55aa_1234_9876_0000;
+        let memory = Impatient::over(segment_of_lfh_descriptors(heap_key), ALLOWANCE);
+        let layout = synthetic_layout();
+        let mut discovery = Discovery::default();
+
+        let outcome = discover_segment_context(
+            &memory,
+            &layout,
+            HEAP + 0x100,
+            0,
+            PoolKind::NonPagedNx,
+            HeapIdentity {
+                pool_state: STATE,
+                heap: HEAP,
+                special: false,
+            },
+            heap_key,
+            0xa5c3_1357,
+            1024,
+            &SharedChunks::default(),
+            &SharedChunks::default(),
+            &mut discovery,
+        );
+
+        assert!(
+            matches!(outcome, Err(SnapshotError::BudgetExpired)),
+            "the descriptor loop has to report the halt: {outcome:?}"
+        );
+        assert!(
+            memory.reads.get() <= ALLOWANCE + OVERSHOOT_ALLOWED,
+            "{} reads for a budget of {ALLOWANCE}: the descriptor loop ran on past the \
+             deadline instead of polling it",
+            memory.reads.get()
+        );
+    }
+
+    /// A large-allocation tree of `count` nodes whose metadata will not read.
+    ///
+    /// Each node carries only its `_RTL_BALANCED_NODE` links, so the tree walk finds them all
+    /// and the metadata read that follows fails — which is the path under test. A node whose
+    /// metadata *does* read reaches `lookup_big_page_target`, and that polls the budget
+    /// itself, so it could never demonstrate the missing check.
+    fn large_allocation_tree(count: u64) -> SyntheticMemory {
+        let mut bytes = Writes::default();
+        let tree = HEAP + 0x400;
+        let node = |index: u64| LARGE_META + index * 0x40;
+
+        fill(&mut bytes, tree, 0x10);
+        put_u64(&mut bytes, tree, node(0)); // Root
+        for index in 0..count {
+            // Left chains to the next node, Right terminates. Only 0x10 bytes per node, so
+            // the 0x28-byte metadata read spans into a gap and fails.
+            fill(&mut bytes, node(index), 0x10);
+            let next = if index + 1 < count {
+                node(index + 1)
+            } else {
+                0
+            };
+            put_u64(&mut bytes, node(index), next);
+        }
+        SyntheticMemory::new(bytes, Vec::new())
+    }
+
+    /// The large-allocation loop reads once per node and `nodes` is capped only by
+    /// `traversal_limit` — a million. Without a poll here the deadline is not consulted again
+    /// until the enclosing heap.
+    #[test]
+    fn test_the_large_allocation_loop_polls_the_budget_between_nodes() {
+        // The tree walk itself costs a read per node plus the root and encoded flag, so the
+        // budget has to clear that for the halt to land in the node loop below it.
+        const NODES: u64 = 12;
+        const ALLOWANCE: usize = 16;
+        let memory = Impatient::over(large_allocation_tree(NODES), ALLOWANCE);
+        let layout = synthetic_layout();
+        let mut discovery = Discovery::default();
+
+        let outcome = discover_large_allocations(
+            &memory,
+            &layout,
+            HEAP,
+            0,
+            PoolKind::NonPagedNx,
+            HeapIdentity {
+                pool_state: STATE,
+                heap: HEAP,
+                special: false,
+            },
+            0,
+            1024,
+            &mut discovery,
+        );
+
+        assert!(
+            matches!(outcome, Err(SnapshotError::BudgetExpired)),
+            "the node loop has to report the halt: {outcome:?}"
+        );
+        assert!(
+            memory.reads.get() <= ALLOWANCE + OVERSHOOT_ALLOWED,
+            "{} reads for a budget of {ALLOWANCE}: the node loop ran on past the deadline",
+            memory.reads.get()
+        );
     }
 
     /// Discovery finds the regions and the walk reads what is in them, so a budget spent
