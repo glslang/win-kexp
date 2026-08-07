@@ -1,5 +1,5 @@
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -149,6 +149,16 @@ pub struct RunToResult {
     pub output: String,
 }
 
+/// Hands out a fresh identity for every engine, and again whenever one releases its
+/// target. Caches that ask "is this still the same target?" cannot use the kernel base
+/// alone — two dumps from one boot share it — and dbgeng holds one debuggee session per
+/// process, so per-engine identity plus a bump on release covers every case.
+static NEXT_TARGET_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn next_target_identity() -> u64 {
+    NEXT_TARGET_IDENTITY.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct DebugEngine {
     client: IDebugClient6,
     control: IDebugControl4,
@@ -158,6 +168,8 @@ pub struct DebugEngine {
     /// responsible for ending it on `Drop`. False when wrapping a borrowed WinDbg
     /// client, so going out of scope can't stop the host's active session.
     owns_session: bool,
+    /// Identifies the target this engine currently holds; see [`next_target_identity`].
+    target_identity: AtomicU64,
     /// Input buffers handed to DbgEng by a *deferred* call — `CreateProcessWide`, which
     /// spawns at the next `WaitForEvent` and reads the command line then, and the kernel
     /// connection string, whose link is likewise established during the wait.
@@ -254,6 +266,7 @@ impl DebugEngine {
             // Default to "borrowed": constructors that wrap an existing WinDbg client
             // go through here, and only `new()` (which calls `DebugCreate`) sets this.
             owns_session: false,
+            target_identity: AtomicU64::new(next_target_identity()),
             deferred_inputs: Mutex::new(Vec::new()),
         }
     }
@@ -284,8 +297,18 @@ impl DebugEngine {
             dataspaces,
             symbols,
             owns_session: false,
+            target_identity: AtomicU64::new(next_target_identity()),
             deferred_inputs: Mutex::new(Vec::new()),
         })
+    }
+
+    /// A value that identifies the target this engine currently holds.
+    ///
+    /// Changes when the engine is replaced *or* when it releases its target, so a cache
+    /// keyed on it cannot serve data gathered from a previous target. The kernel base is
+    /// not sufficient on its own: two dumps from the same boot share it.
+    pub fn target_identity(&self) -> u64 {
+        self.target_identity.load(Ordering::Acquire)
     }
 
     pub fn read_memory(&self, address: u64, size: usize) -> Result<Vec<u8>, DbgEngError> {
@@ -1193,6 +1216,10 @@ impl DebugEngine {
     /// Ends the current debug session without destroying the client, so it can be
     /// reused for another target.
     pub fn end_session(&self) -> Result<(), DbgEngError> {
+        // The target is going away, so anything cached against it must not be reused for
+        // whatever this engine holds next.
+        self.target_identity
+            .store(next_target_identity(), Ordering::Release);
         // A live kernel left halted (at a break) and detached *passively* stays FROZEN —
         // one CPU halted, the rest spinning — because a passive detach never tells the
         // target to run. Resume it and actively detach instead, leaving it running.

@@ -1302,6 +1302,16 @@ pub(crate) struct SnapshotWalker<'a, M> {
     pub traversal_limit: usize,
 }
 
+/// Where a special-pool block sits, and whether that could be corroborated.
+struct SpecialPlacement {
+    usable: u64,
+    size: u64,
+    /// The size could not be confirmed, so `size` is a conservative upper bound covering
+    /// the rest of the page rather than the allocation's real length. Callers must not
+    /// treat it as a measurement — it inflates byte totals if they do.
+    approximate: bool,
+}
+
 /// The byte Driver Verifier fills unused special-pool space with.
 const SPECIAL_POOL_FILL: u8 = 0xfd;
 
@@ -1330,7 +1340,7 @@ fn special_pool_placement(
     requested: u64,
     header_size: u64,
     page_bytes: &[u8],
-) -> (u64, u64) {
+) -> SpecialPlacement {
     let available = page_bytes.len() as u64;
     let aligned = requested.next_multiple_of(16);
     if requested != 0 && available == PAGE_SIZE && aligned + header_size <= PAGE_SIZE {
@@ -1339,10 +1349,18 @@ fn special_pool_placement(
             .iter()
             .all(|byte| *byte == SPECIAL_POOL_FILL)
         {
-            return (page + PAGE_SIZE - aligned, requested);
+            return SpecialPlacement {
+                usable: page + PAGE_SIZE - aligned,
+                size: requested,
+                approximate: false,
+            };
         }
     }
-    (page + header_size, available.saturating_sub(header_size))
+    SpecialPlacement {
+        usable: page + header_size,
+        size: available.saturating_sub(header_size),
+        approximate: true,
+    }
 }
 
 impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
@@ -1537,12 +1555,25 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             // An untagged page is not an allocation. Freed special-pool pages are
             // unmapped rather than zeroed, so anything readable here should carry a tag.
             if header.tag != 0 {
-                let (usable, size) = special_pool_placement(
+                let placement = special_pool_placement(
                     page,
                     u64::from(header.previous_size),
                     header_size,
                     page_bytes,
                 );
+                // Say so when the size is a bound rather than a measurement. Otherwise a
+                // conservative page-sized range is indistinguishable from a real
+                // allocation: `tag_census` would fold it into `total_bytes` — reporting a
+                // 0x68 block as 0xff0 — while the report still claimed to be complete.
+                if placement.approximate {
+                    snapshot.diagnostics.push(format!(
+                        "special-pool page {page:#x} tag `{}`: size not corroborated by the \
+                         fill pattern; reporting the rest of the page as an upper bound",
+                        super::decode::display_tag(header.tag)
+                    ));
+                    snapshot.complete = false;
+                }
+                let (usable, size) = (placement.usable, placement.size);
                 snapshot.spans.push(self.base_span(
                     region,
                     page,
@@ -1938,6 +1969,7 @@ mod tests {
             key: crate::pool::layout::SessionKey {
                 kernel_base: 0,
                 session: 1,
+                target: 1,
             },
             globals: HashMap::new(),
             types,
@@ -2020,6 +2052,7 @@ mod tests {
             key: crate::pool::layout::SessionKey {
                 kernel_base: 0,
                 session: 1,
+                target: 1,
             },
             globals: HashMap::new(),
             types: HashMap::new(),
@@ -2032,6 +2065,12 @@ mod tests {
     }
 
     const SPECIAL_PAGE: u64 = 0xffff_8c8f_13a0_2000;
+
+    /// `(usable, size, approximate)` — flattened so the assertions below stay readable and
+    /// so every case states whether the size was corroborated or merely bounded.
+    fn placed(placement: SpecialPlacement) -> (u64, u64, bool) {
+        (placement.usable, placement.size, placement.approximate)
+    }
 
     /// A special-pool page holding a block of `requested` bytes: header, then Verifier
     /// fill, then the block itself pushed against the page end.
@@ -2049,13 +2088,23 @@ mod tests {
     #[test]
     fn test_special_pool_block_is_pushed_against_the_page_end() {
         assert_eq!(
-            special_pool_placement(SPECIAL_PAGE, 0x68, 0x10, &special_page(0x68, 0x10)),
-            (SPECIAL_PAGE + 0xf90, 0x68)
+            placed(special_pool_placement(
+                SPECIAL_PAGE,
+                0x68,
+                0x10,
+                &special_page(0x68, 0x10)
+            )),
+            (SPECIAL_PAGE + 0xf90, 0x68, false)
         );
         // Already a multiple of 16: no rounding, block ends exactly at the page end.
         assert_eq!(
-            special_pool_placement(SPECIAL_PAGE, 0x40, 0x10, &special_page(0x40, 0x10)),
-            (SPECIAL_PAGE + 0xfc0, 0x40)
+            placed(special_pool_placement(
+                SPECIAL_PAGE,
+                0x40,
+                0x10,
+                &special_page(0x40, 0x10)
+            )),
+            (SPECIAL_PAGE + 0xfc0, 0x40, false)
         );
     }
 
@@ -2068,14 +2117,14 @@ mod tests {
         // The page really holds 0x140 bytes of data; the header claims 0x40.
         let page = special_page(0x140, 0x10);
         assert_eq!(
-            special_pool_placement(SPECIAL_PAGE, 0x40, 0x10, &page),
-            (SPECIAL_PAGE + 0x10, PAGE_SIZE - 0x10),
+            placed(special_pool_placement(SPECIAL_PAGE, 0x40, 0x10, &page)),
+            (SPECIAL_PAGE + 0x10, PAGE_SIZE - 0x10, true),
             "a truncated PreviousSize must fall back, not report a block at the page end"
         );
         // Sanity: told the truth, the same page resolves precisely.
         assert_eq!(
-            special_pool_placement(SPECIAL_PAGE, 0x140, 0x10, &page),
-            (SPECIAL_PAGE + 0xec0, 0x140)
+            placed(special_pool_placement(SPECIAL_PAGE, 0x140, 0x10, &page)),
+            (SPECIAL_PAGE + 0xec0, 0x140, false)
         );
     }
 
@@ -2088,8 +2137,8 @@ mod tests {
         page[0x10..0x78].fill(0x41); // block immediately after the header
         page[0x78..].fill(SPECIAL_POOL_FILL); // fill trails it
         assert_eq!(
-            special_pool_placement(SPECIAL_PAGE, 0x68, 0x10, &page),
-            (SPECIAL_PAGE + 0x10, PAGE_SIZE - 0x10)
+            placed(special_pool_placement(SPECIAL_PAGE, 0x68, 0x10, &page)),
+            (SPECIAL_PAGE + 0x10, PAGE_SIZE - 0x10, true)
         );
     }
 
@@ -2097,13 +2146,13 @@ mod tests {
     fn test_special_pool_falls_back_when_the_size_is_untrustworthy() {
         let page = special_page(0x68, 0x10);
         assert_eq!(
-            special_pool_placement(SPECIAL_PAGE, 0, 0x10, &page),
-            (SPECIAL_PAGE + 0x10, PAGE_SIZE - 0x10)
+            placed(special_pool_placement(SPECIAL_PAGE, 0, 0x10, &page)),
+            (SPECIAL_PAGE + 0x10, PAGE_SIZE - 0x10, true)
         );
         // A request that cannot share the page with its own header is not believable.
         assert_eq!(
-            special_pool_placement(SPECIAL_PAGE, PAGE_SIZE, 0x10, &page),
-            (SPECIAL_PAGE + 0x10, PAGE_SIZE - 0x10)
+            placed(special_pool_placement(SPECIAL_PAGE, PAGE_SIZE, 0x10, &page)),
+            (SPECIAL_PAGE + 0x10, PAGE_SIZE - 0x10, true)
         );
     }
 
@@ -2113,8 +2162,8 @@ mod tests {
     fn test_special_pool_fallback_respects_the_readable_length() {
         let partial = vec![SPECIAL_POOL_FILL; 0x200];
         assert_eq!(
-            special_pool_placement(SPECIAL_PAGE, 0x68, 0x10, &partial),
-            (SPECIAL_PAGE + 0x10, 0x1f0)
+            placed(special_pool_placement(SPECIAL_PAGE, 0x68, 0x10, &partial)),
+            (SPECIAL_PAGE + 0x10, 0x1f0, true)
         );
     }
     use crate::pool::{
@@ -2493,6 +2542,7 @@ mod tests {
             key: SessionKey {
                 kernel_base: K,
                 session: 1,
+                target: 1,
             },
             globals: [
                 ("ExPoolState", STATE),

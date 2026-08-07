@@ -191,6 +191,7 @@ pub(crate) fn prepare_index(
     let key = SessionKey {
         kernel_base: engine.kernel_base()?,
         session: generation(),
+        target: engine.target_identity(),
     };
     let layout = LayoutCache::global()
         .get_or_resolve(engine, key)
@@ -262,20 +263,28 @@ fn neighbourhood_at(index: &PoolIndex, address: u64) -> Option<PoolNeighbourhood
         .spans
         .iter()
         .position(|span| span.contains_address(address))?;
-    // Use the index's own adjacency rather than "the next entry in the vector": matching
-    // only the heap would report a span from a different backend, a different subsegment,
-    // or across unreadable space as though it bordered this chunk. It does not, and for
-    // grooming analysis that is exactly the wrong thing to be told.
+    // Two conditions, and both are needed. `predecessor`/`successor` enforce allocator
+    // identity — same heap, backend and subsegment, neither side unreadable — which a bare
+    // "next entry in the vector" check does not.
+    //
+    // On top of that the spans must actually touch. The allocator leaves slack wherever a
+    // block would straddle a page, and `walk_lfh` omits that slot, so two spans can pass
+    // the identity check with a gap between them. Reporting those as bordering would
+    // misstate the very geometry this API exists to describe.
+    let chunk = index.spans[position].clone();
+    let touching = |left: &PoolSpan, right: &PoolSpan| left.end() == right.header_address;
     Some(PoolNeighbourhood {
         previous: index
             .predecessor(position)
             .and_then(|previous| index.spans.get(previous))
+            .filter(|previous| touching(previous, &chunk))
             .cloned(),
         next: index
             .successor(position)
             .and_then(|next| index.spans.get(next))
+            .filter(|next| touching(&chunk, next))
             .cloned(),
-        chunk: index.spans[position].clone(),
+        chunk,
     })
 }
 
@@ -428,6 +437,24 @@ mod tests {
         assert_eq!(found.chunk.display_tag, "Bbbb");
         assert_eq!(found.previous.unwrap().display_tag, "Aaaa");
         assert_eq!(found.next.unwrap().display_tag, "Cccc");
+    }
+
+    /// Allocator slack separates these two: `walk_lfh` omits a slot that would straddle a
+    /// page, so spans can share every allocator identity and still not touch. Reporting
+    /// them as bordering would misstate the grooming geometry this API exists to describe.
+    #[test]
+    fn test_neighbours_must_actually_touch() {
+        let index = index_of(vec![
+            allocation(0x1000, 0x100, b"Aaaa", PoolKind::NonPagedNx, 1),
+            // 0x1100..0x1200 is slack the allocator skipped.
+            allocation(0x1200, 0x100, b"Bbbb", PoolKind::NonPagedNx, 1),
+        ]);
+        let found = neighbourhood_at(&index, 0x1250).expect("address is covered");
+        assert_eq!(found.chunk.display_tag, "Bbbb");
+        assert!(
+            found.previous.is_none(),
+            "slack between spans must not count as bordering"
+        );
     }
 
     #[test]
