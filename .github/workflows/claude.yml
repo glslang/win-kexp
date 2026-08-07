@@ -20,8 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
-      issues: read
+      # write, not read: the job goes green either way, but the action silently posts
+      # nothing without it (anthropics/claude-code-action#1562).
+      pull-requests: write
+      issues: write
       id-token: write
       actions: read # Required for Claude to read CI results on PRs
     steps:

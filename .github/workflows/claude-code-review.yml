@@ -21,10 +21,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # write is required so /code-review --comment can publish inline PR feedback
+      # write, not read: the job goes green either way, but the action silently posts
+      # nothing without it (anthropics/claude-code-action#1562).
       pull-requests: write
-      issues: read
+      issues: write
       id-token: write
+      actions: read # Required for Claude to read CI results on PRs
 
     steps:
       - name: Checkout repository
