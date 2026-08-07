@@ -122,7 +122,12 @@ fn args_string(args: PCSTR) -> Result<String, String> {
 
 fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
     let command = parse_args(args)?;
-    let index = query::prepare_index(engine, command.refresh).map_err(|error| error.to_string())?;
+    // Unbounded, unlike the programmatic API. This path has an operator in front of it who
+    // can Ctrl+Break — which the walk already honours — so a deadline here would only
+    // truncate a walk somebody was willing to wait out. The budget exists for callers that
+    // have no such control; see `query::DEFAULT_WALK_BUDGET`.
+    let walk = query::PoolWalk::from(command.refresh).unbounded();
+    let index = query::prepare_index(engine, walk).map_err(|error| error.to_string())?;
 
     if let Some(address) = command.address {
         let detail = index

@@ -97,6 +97,15 @@ allocation breakpoints or reconstruct allocation history. The cache is invalidat
 when execution resumes or the debugger session changes, and incomplete or
 Ctrl+C-interrupted walks are never cached.
 
+A walk is thousands of debugger reads plus every committed pool page, so over a live
+KDNET link it can run for minutes. `!win_kexp.poolmap` lets it run to completion —
+you are at the prompt and can Ctrl+Break. The programmatic API in `pool::query`
+cannot assume that, because nothing else sets that flag, so its walks carry a
+wall-clock budget (`PoolWalk`, defaulting to `DEFAULT_WALK_BUDGET`). A walk that runs
+out of it is not an error: it returns the chunks it reached with `complete` cleared
+and a diagnostic saying how much of the pool it got through. As everywhere else here,
+“the walk did not see it” is reported as exactly that and never as “it is not there”.
+
 When WinDbg accepts DML, map cells have colors and clickable address-detail links.
 The same rows use meaningful ASCII glyphs and include a legend when DML is stripped
 or plain-text output is captured.

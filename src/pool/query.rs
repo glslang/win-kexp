@@ -11,6 +11,7 @@
 //! extension prints would be lossy and brittle.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use thiserror::Error;
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
@@ -89,6 +90,79 @@ pub enum PoolQueryError {
     Engine(#[from] DbgEngError),
 }
 
+/// How long a walk may run before it stops and reports what it reached.
+///
+/// A walk is thousands of debugger reads plus every committed pool page, and over a live
+/// KDNET link each of those crosses the wire; on a busy kernel that is minutes. Nothing used
+/// to stop it. The walk polls for Ctrl+C, but **only a human at a WinDbg prompt ever sets
+/// that flag** — a programmatic caller has no way to say "that is long enough". Its own
+/// timeout frees the caller and leaves the engine walking, and since one engine serves one
+/// target one call at a time, every later call to that target queues behind the walk; the
+/// session is wedged until it is killed, which on a live kernel leaves the guest halted.
+///
+/// 120s is sized to fit inside a typical host's per-call budget with room for the answer to
+/// travel back. A host that knows its own deadline should pass that instead of taking this.
+pub const DEFAULT_WALK_BUDGET: Duration = Duration::from_secs(120);
+
+/// How a query is allowed to reach the pool: reuse or rebuild, and for how long.
+///
+/// `bool` converts into this — `true` meaning refresh — so the ordinary call reads as it
+/// always did and picks up [`DEFAULT_WALK_BUDGET`] without asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolWalk {
+    /// Rebuild rather than reuse the snapshot cached for this target.
+    pub refresh: bool,
+    /// Wall-clock ceiling on a rebuild, or `None` to run to completion.
+    ///
+    /// `None` is correct only where something else can stop the walk — an operator at an
+    /// interactive prompt, who can Ctrl+C. Everywhere else it is the wedge described on
+    /// [`DEFAULT_WALK_BUDGET`].
+    pub budget: Option<Duration>,
+}
+
+impl PoolWalk {
+    /// Reuse the cached snapshot if there is one; otherwise walk under the default budget.
+    pub fn cached() -> Self {
+        Self {
+            refresh: false,
+            budget: Some(DEFAULT_WALK_BUDGET),
+        }
+    }
+
+    /// Discard the cached snapshot and walk again, under the default budget.
+    pub fn refreshed() -> Self {
+        Self {
+            refresh: true,
+            ..Self::cached()
+        }
+    }
+
+    /// Replace the budget with the caller's own deadline.
+    pub fn within(self, budget: Duration) -> Self {
+        Self {
+            budget: Some(budget),
+            ..self
+        }
+    }
+
+    /// Let the walk run to completion. Only for a caller that can interrupt it.
+    pub fn unbounded(self) -> Self {
+        Self {
+            budget: None,
+            ..self
+        }
+    }
+}
+
+impl From<bool> for PoolWalk {
+    fn from(refresh: bool) -> Self {
+        Self {
+            refresh,
+            ..Self::cached()
+        }
+    }
+}
+
 /// Restrict results to one side of the paged/nonpaged split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolPageFilter {
@@ -139,9 +213,9 @@ pub struct PoolSnapshotReport {
 /// Summarises the cached snapshot: how much was walked, and what the walk could not do.
 pub fn snapshot_report(
     engine: &DebugEngine,
-    refresh: bool,
+    walk: impl Into<PoolWalk>,
 ) -> Result<PoolSnapshotReport, PoolQueryError> {
-    let index = prepare_index(engine, refresh)?;
+    let index = prepare_index(engine, walk.into())?;
     Ok(report_of(&index))
 }
 
@@ -160,11 +234,12 @@ fn report_of(index: &PoolIndex) -> PoolSnapshotReport {
 
 /// Validate the target, resolve the layout, and take (or reuse) a pool snapshot.
 ///
-/// `refresh` forces a fresh walk; otherwise a snapshot cached for this session is
+/// `walk.refresh` forces a fresh walk; otherwise a snapshot cached for this session is
 /// reused, because walking every pool page is far too expensive to repeat per query.
+/// `walk.budget` bounds a walk that does happen — see [`DEFAULT_WALK_BUDGET`].
 pub(crate) fn prepare_index(
     engine: &DebugEngine,
-    refresh: bool,
+    walk: PoolWalk,
 ) -> Result<PoolIndex, PoolQueryError> {
     if !engine.is_kernel_target()? {
         return Err(PoolQueryError::NotKernelTarget);
@@ -204,13 +279,13 @@ pub(crate) fn prepare_index(
     // Keyed on the whole `SessionKey`: a programmatic host receives no session
     // notifications, so the generation alone would let a snapshot outlive its target.
     snapshots()
-        .get_or_refresh(key, refresh, || {
+        .get_or_refresh(key, walk.refresh, || {
             SnapshotWalker {
                 memory: engine,
                 layout: &layout,
                 traversal_limit: 1_000_000,
             }
-            .walk()
+            .walk(walk.budget)
             .map_err(|error| error.to_string())
         })
         .map_err(PoolQueryError::Walk)
@@ -225,10 +300,10 @@ pub fn find_tag(
     engine: &DebugEngine,
     tag: &str,
     filter: Option<PoolPageFilter>,
-    refresh: bool,
+    walk: impl Into<PoolWalk>,
 ) -> Result<Vec<PoolSpan>, PoolQueryError> {
     let raw_tag = parse_tag(tag).ok_or(PoolQueryError::InvalidTag)?;
-    let index = prepare_index(engine, refresh)?;
+    let index = prepare_index(engine, walk.into())?;
     Ok(collect_tag(&index, raw_tag, filter))
 }
 
@@ -256,9 +331,9 @@ fn collect_tag(index: &PoolIndex, raw_tag: u32, filter: Option<PoolPageFilter>) 
 pub fn chunk_at(
     engine: &DebugEngine,
     address: u64,
-    refresh: bool,
+    walk: impl Into<PoolWalk>,
 ) -> Result<Option<PoolNeighbourhood>, PoolQueryError> {
-    let index = prepare_index(engine, refresh)?;
+    let index = prepare_index(engine, walk.into())?;
     Ok(neighbourhood_at(&index, address))
 }
 
@@ -308,9 +383,9 @@ fn neighbourhood_at(index: &PoolIndex, address: u64) -> Option<PoolNeighbourhood
 /// taken from our own walk, so it stays consistent with [`find_tag`] and [`chunk_at`].
 pub fn tag_census(
     engine: &DebugEngine,
-    refresh: bool,
+    walk: impl Into<PoolWalk>,
 ) -> Result<Vec<PoolTagSummary>, PoolQueryError> {
-    let index = prepare_index(engine, refresh)?;
+    let index = prepare_index(engine, walk.into())?;
     Ok(summarize_tags(&index))
 }
 
@@ -395,6 +470,33 @@ mod tests {
         assert_eq!(
             PoolQueryError::UnsupportedArchitecture { machine: 0xaa64 }.to_string(),
             "pool walking supports x64 targets only (machine 0xaa64)"
+        );
+    }
+
+    /// The conversion is what keeps a plain `refresh` argument safe: every caller that never
+    /// heard of a budget gets one anyway, which is the whole reason the wedge is closed
+    /// without each of them having to opt in.
+    #[test]
+    fn test_a_bare_refresh_flag_still_carries_a_budget() {
+        assert_eq!(
+            PoolWalk::from(false),
+            PoolWalk {
+                refresh: false,
+                budget: Some(DEFAULT_WALK_BUDGET)
+            }
+        );
+        assert_eq!(PoolWalk::from(true), PoolWalk::refreshed());
+        assert_eq!(
+            PoolWalk::cached().within(Duration::from_secs(5)).budget,
+            Some(Duration::from_secs(5))
+        );
+        // Only for a caller that can interrupt the walk itself — the extension command.
+        assert_eq!(
+            PoolWalk::refreshed().unbounded(),
+            PoolWalk {
+                refresh: true,
+                budget: None
+            }
         );
     }
 
