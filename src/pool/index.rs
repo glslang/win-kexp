@@ -24,6 +24,11 @@ pub(crate) struct PoolIndex {
     pub spans: Vec<PoolSpan>,
     pub postings: HashMap<u32, Vec<usize>>,
     pub diagnostics: Vec<String>,
+    /// Whether the walk covered everything it set out to. Carried through from
+    /// [`PoolSnapshot`] because a walk can end incomplete *without* emitting a
+    /// diagnostic — `walk_vs` clears it when a readable region stops mid-chunk — and a
+    /// caller that sees only counts and diagnostics would read that as a healthy result.
+    pub complete: bool,
     row_postings: HashMap<RowIdentity, Vec<usize>>,
     span_rows: Vec<RowIdentity>,
 }
@@ -71,6 +76,7 @@ impl PoolIndex {
             spans: snapshot.spans,
             postings,
             diagnostics: snapshot.diagnostics,
+            complete: snapshot.complete,
             row_postings,
             span_rows,
         }
@@ -168,7 +174,11 @@ impl PoolIndex {
 
 #[derive(Debug, Clone)]
 struct CachedSnapshot {
-    session: u64,
+    /// The full target identity, not just the generation counter. The generation alone
+    /// is only bumped by debugger session notifications, which a purely programmatic
+    /// host never receives — so a snapshot taken against one target could otherwise be
+    /// handed back for another, silently describing memory that no longer exists.
+    key: super::layout::SessionKey,
     index: PoolIndex,
 }
 
@@ -180,7 +190,7 @@ pub(crate) struct SnapshotCache {
 impl SnapshotCache {
     pub(crate) fn get_or_refresh<F>(
         &self,
-        session: u64,
+        key: super::layout::SessionKey,
         refresh: bool,
         build: F,
     ) -> Result<PoolIndex, String>
@@ -194,7 +204,7 @@ impl SnapshotCache {
         }
         if !refresh
             && let Some(cached) = self.entry.lock().unwrap().as_ref()
-            && cached.session == session
+            && cached.key == key
         {
             return Ok(cached.index.clone());
         }
@@ -203,7 +213,7 @@ impl SnapshotCache {
         let index = PoolIndex::build(snapshot);
         if complete {
             *self.entry.lock().unwrap() = Some(CachedSnapshot {
-                session,
+                key,
                 index: index.clone(),
             });
         } else {
@@ -281,20 +291,26 @@ mod tests {
         assert_eq!(contextual.context_for_tag(tag), vec![0, 1, 2, 3, 4]);
         assert_eq!(contextual.successor(2), None);
 
+        // Distinct targets, not just distinct generations: the cache keys on the whole
+        // SessionKey so a snapshot cannot outlive the target it described.
+        let session = |value: u64| super::super::layout::SessionKey {
+            kernel_base: 0x1000,
+            session: value,
+        };
         let cache = SnapshotCache::default();
         let builds = AtomicUsize::new(0);
         let make = || {
             builds.fetch_add(1, Ordering::SeqCst);
             Ok(snapshot.clone())
         };
-        cache.get_or_refresh(7, false, make).unwrap();
-        cache.get_or_refresh(7, false, make).unwrap();
+        cache.get_or_refresh(session(7), false, make).unwrap();
+        cache.get_or_refresh(session(7), false, make).unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 1);
-        cache.get_or_refresh(7, true, make).unwrap();
+        cache.get_or_refresh(session(7), true, make).unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 2);
         cache.invalidate();
-        cache.get_or_refresh(7, false, make).unwrap();
-        cache.get_or_refresh(8, false, make).unwrap();
+        cache.get_or_refresh(session(7), false, make).unwrap();
+        cache.get_or_refresh(session(8), false, make).unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 4);
 
         let incomplete_builds = AtomicUsize::new(0);
@@ -305,20 +321,26 @@ mod tests {
             Ok(value)
         };
         cache.invalidate();
-        cache.get_or_refresh(9, false, make_incomplete).unwrap();
-        cache.get_or_refresh(9, false, make_incomplete).unwrap();
+        cache
+            .get_or_refresh(session(9), false, make_incomplete)
+            .unwrap();
+        cache
+            .get_or_refresh(session(9), false, make_incomplete)
+            .unwrap();
         assert_eq!(incomplete_builds.load(Ordering::SeqCst), 2);
 
         cache.invalidate();
-        cache.get_or_refresh(10, false, make).unwrap();
-        cache.get_or_refresh(10, true, make_incomplete).unwrap();
-        cache.get_or_refresh(10, false, make).unwrap();
+        cache.get_or_refresh(session(10), false, make).unwrap();
+        cache
+            .get_or_refresh(session(10), true, make_incomplete)
+            .unwrap();
+        cache.get_or_refresh(session(10), false, make).unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 6);
         assert_eq!(incomplete_builds.load(Ordering::SeqCst), 3);
 
-        let failed_refresh = cache.get_or_refresh(10, true, || Err("interrupted".into()));
+        let failed_refresh = cache.get_or_refresh(session(10), true, || Err("interrupted".into()));
         assert_eq!(failed_refresh.unwrap_err(), "interrupted");
-        cache.get_or_refresh(10, false, make).unwrap();
+        cache.get_or_refresh(session(10), false, make).unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 7);
     }
 }
