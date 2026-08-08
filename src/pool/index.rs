@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use super::{PoolSpan, PoolState, snapshot::PoolSnapshot};
+use super::{PoolDiagnostics, PoolSpan, PoolState, snapshot::PoolSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Direction {
@@ -23,7 +23,7 @@ pub(crate) struct Hole {
 pub(crate) struct PoolIndex {
     pub spans: Vec<PoolSpan>,
     pub postings: HashMap<u32, Vec<usize>>,
-    pub diagnostics: Vec<String>,
+    pub diagnostics: PoolDiagnostics,
     /// Whether the walk covered everything it set out to. Carried through from
     /// [`PoolSnapshot`] because a walk can end incomplete *without* emitting a
     /// diagnostic — `walk_vs` clears it when a readable region stops mid-chunk — and a
@@ -264,7 +264,7 @@ mod tests {
                 span(0x1080, tag, PoolState::Allocated, 2),
             ],
             complete: true,
-            diagnostics: vec![],
+            diagnostics: PoolDiagnostics::default(),
         };
         let index = PoolIndex::build(snapshot.clone());
         assert_eq!(index.postings[&tag], vec![1, 4]);
@@ -286,7 +286,7 @@ mod tests {
                 span(0x1080, other, PoolState::Allocated, 1),
             ],
             complete: true,
-            diagnostics: vec![],
+            diagnostics: PoolDiagnostics::default(),
         });
         assert_eq!(contextual.context_for_tag(tag), vec![0, 1, 2, 3, 4]);
         assert_eq!(contextual.successor(2), None);
