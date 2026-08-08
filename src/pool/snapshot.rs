@@ -1435,7 +1435,7 @@ fn lookup_big_page_target(
 }
 
 /// How many verbatim examples of one kind of diagnostic to keep.
-const DIAGNOSTIC_EXAMPLES: usize = 8;
+pub const DIAGNOSTIC_EXAMPLES: usize = 8;
 
 /// The shape of a diagnostic: the message with every number standing in for itself.
 ///
@@ -1455,46 +1455,131 @@ fn diagnostic_shape(message: &str) -> String {
         .join(" ")
 }
 
-/// Collapse floods of near-identical diagnostics into examples plus a count.
+/// One kind of complaint, and how many times the walk made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticShape {
+    /// The message with every number standing in for itself, so that the same complaint
+    /// about different addresses is one shape and a different complaint is not.
+    pub shape: String,
+    /// How many messages of this shape the walk emitted, including any kept verbatim in
+    /// [`PoolDiagnostics::examples`].
+    pub total: usize,
+}
+
+/// What a walk complained about: a bounded verbatim sample, and the per-shape totals that
+/// say what the sample left out.
 ///
 /// A live target keeps allocating between the reads that make up one walk, so a single
 /// stale list pointer yields one "unreadable ... node" line per node — 14k of them measured
-/// on a busy kernel. That buries the handful of *distinct* problems a reader needs, and
-/// every consumer truncates the list anyway, so which ones survive is decided by position
-/// rather than by significance.
+/// on a busy kernel. Keeping them all buries the handful of *distinct* problems a reader
+/// needs, and every consumer truncates the list anyway, so which ones survive gets decided
+/// by position rather than by significance. Hence the cap of [`DIAGNOSTIC_EXAMPLES`] kept
+/// messages per shape.
 ///
-/// Nothing is dropped silently: each group keeps its first [`DIAGNOSTIC_EXAMPLES`] verbatim
-/// and the rest become a count, so the volume — the number that says the walk was fighting a
-/// moving target — is still on the page. Summaries go at the end, in the order the groups
-/// first appeared, rather than interleaved where a group's last member happened to land.
-fn collapse_repeats(diagnostics: Vec<String>) -> Vec<String> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
-    let mut kept: Vec<String> = Vec::new();
-    for message in diagnostics {
+/// The totals are why this is a type rather than a `Vec<String>`. Flattened to text they
+/// survive only as prose inside a summary line, and a consumer that counts the lines it
+/// received is measuring this cap — then printing the answer as a property of the target.
+/// A walk that emitted 7,700 complaints reporting "71 diagnostics" is the specific failure
+/// the module exists to avoid, so the numbers travel as numbers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PoolDiagnostics {
+    examples: Vec<String>,
+    shapes: Vec<DiagnosticShape>,
+    /// Where each seen shape sits in `shapes`. Derived from it, not state of its own.
+    positions: HashMap<String, usize>,
+}
+
+impl PoolDiagnostics {
+    /// Records one complaint, keeping it verbatim only while its shape has room.
+    pub(crate) fn push(&mut self, message: String) {
         let shape = diagnostic_shape(&message);
-        let count = counts.entry(shape.clone()).or_insert_with(|| {
-            order.push(shape);
-            0
-        });
-        *count += 1;
-        if *count <= DIAGNOSTIC_EXAMPLES {
-            kept.push(message);
+        let position = match self.positions.get(&shape) {
+            Some(&position) => position,
+            None => {
+                self.shapes.push(DiagnosticShape {
+                    shape: shape.clone(),
+                    total: 0,
+                });
+                let position = self.shapes.len() - 1;
+                self.positions.insert(shape, position);
+                position
+            }
+        };
+        let seen = &mut self.shapes[position];
+        seen.total += 1;
+        if seen.total <= DIAGNOSTIC_EXAMPLES {
+            self.examples.push(message);
         }
     }
-    for shape in order {
-        let total = counts[&shape];
-        if let Some(collapsed) = total.checked_sub(DIAGNOSTIC_EXAMPLES).filter(|n| *n > 0) {
-            kept.push(format!("... and {collapsed} more like `{shape}`"));
+
+    /// Whether the walk complained at all.
+    pub fn is_empty(&self) -> bool {
+        self.shapes.is_empty()
+    }
+
+    /// How many messages the walk emitted, the ones collapsed away included.
+    ///
+    /// This is the number that describes the *walk*; `examples().len()` and `lines().len()`
+    /// describe this struct, and on a busy target the two differ by two orders of magnitude.
+    pub fn emitted(&self) -> usize {
+        self.shapes.iter().map(|seen| seen.total).sum()
+    }
+
+    /// The messages kept verbatim, in the order the walk emitted them.
+    ///
+    /// Emission order rather than by shape because heaps are walked in order, so the tail is
+    /// the most recently discovered ones — which is what a caller printing "the last few" is
+    /// reaching for.
+    pub fn examples(&self) -> &[String] {
+        &self.examples
+    }
+
+    /// The shapes, in the order they were first seen.
+    pub fn shapes(&self) -> &[DiagnosticShape] {
+        &self.shapes
+    }
+
+    /// The whole thing as text: every kept example, then one summary line per shape that had
+    /// more than the cap.
+    ///
+    /// Summaries go at the end, in the order the shapes first appeared, rather than
+    /// interleaved where a shape's last kept member happened to land. For display only —
+    /// [`Self::emitted`] is the count, and the length of this is not.
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = self.examples.clone();
+        for seen in &self.shapes {
+            if let Some(collapsed) = seen
+                .total
+                .checked_sub(DIAGNOSTIC_EXAMPLES)
+                .filter(|more| *more > 0)
+            {
+                lines.push(format!("... and {collapsed} more like `{}`", seen.shape));
+            }
+        }
+        lines
+    }
+}
+
+impl Extend<String> for PoolDiagnostics {
+    fn extend<T: IntoIterator<Item = String>>(&mut self, messages: T) {
+        for message in messages {
+            self.push(message);
         }
     }
-    kept
+}
+
+impl FromIterator<String> for PoolDiagnostics {
+    fn from_iter<T: IntoIterator<Item = String>>(messages: T) -> Self {
+        let mut diagnostics = Self::default();
+        diagnostics.extend(messages);
+        diagnostics
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PoolSnapshot {
     pub spans: Vec<PoolSpan>,
-    pub diagnostics: Vec<String>,
+    pub diagnostics: PoolDiagnostics,
     pub complete: bool,
 }
 
@@ -1635,7 +1720,9 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
     pub(crate) fn walk(&self, budget: Option<Duration>) -> Result<PoolSnapshot, SnapshotError> {
         let (discovery_deadline, walk_deadline) = budget_deadlines(Instant::now(), budget);
         let mut snapshot = PoolSnapshot {
-            diagnostics: vec!["per-session paged heaps are not included".into()],
+            diagnostics: PoolDiagnostics::from_iter([
+                "per-session paged heaps are not included".to_string()
+            ]),
             complete: true,
             ..PoolSnapshot::default()
         };
@@ -1655,7 +1742,9 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         if !discovery.diagnostics.is_empty() {
             snapshot.complete = false;
         }
-        snapshot.diagnostics.append(&mut discovery.diagnostics);
+        snapshot
+            .diagnostics
+            .extend(std::mem::take(&mut discovery.diagnostics));
 
         // The full deadline, so regions found before discovery ran out of its share still get
         // walked with the time discovery did not use.
@@ -1703,7 +1792,6 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         snapshot
             .spans
             .sort_by_key(|span| (span.heap, span.usable_address));
-        snapshot.diagnostics = collapse_repeats(snapshot.diagnostics);
         Ok(snapshot)
     }
 
@@ -2249,7 +2337,7 @@ mod tests {
         };
         let mut snapshot = PoolSnapshot {
             spans: Vec::new(),
-            diagnostics: Vec::new(),
+            diagnostics: PoolDiagnostics::default(),
             complete: true,
         };
         walker.walk_lfh(&region, 0x1f80, &memory.bytes, &mut snapshot);
@@ -3225,12 +3313,14 @@ mod tests {
         assert!(
             snapshot
                 .diagnostics
+                .examples()
                 .iter()
                 .any(|message| { message.contains("per-session paged heaps are not included") })
         );
         assert!(
             snapshot
                 .diagnostics
+                .examples()
                 .iter()
                 .any(|message| message.contains("only committed through"))
         );
@@ -3330,6 +3420,7 @@ mod tests {
         assert!(
             snapshot
                 .diagnostics
+                .examples()
                 .iter()
                 .any(|message| message.contains("ran out of its")
                     && message.contains("discovered regions")),
@@ -3358,6 +3449,7 @@ mod tests {
                 assert!(
                     !snapshot
                         .diagnostics
+                        .examples()
                         .iter()
                         .any(|message| message.contains(absorbed)),
                     "budget {allowance}: a per-unit handler absorbed the halt as \
@@ -3689,6 +3781,7 @@ mod tests {
         assert!(
             snapshot
                 .diagnostics
+                .examples()
                 .iter()
                 .any(|message| message.contains("cannot read region")),
             "the failure has to be said out loud: {:?}",
@@ -3730,6 +3823,7 @@ mod tests {
         let snapshot = walk_impatiently(120);
         let summary = snapshot
             .diagnostics
+            .examples()
             .iter()
             .find(|message| message.contains("discovered regions"))
             .expect("the walk stopped short and must say so");
@@ -3896,6 +3990,15 @@ mod tests {
 
     // ---- diagnostic floods -------------------------------------------------------------
 
+    /// A thousand of one complaint and one of another, the shape of a real flood.
+    fn flooded() -> PoolDiagnostics {
+        let mut diagnostics: Vec<String> = (0..1000)
+            .map(|node| format!("unreadable VS free tree node {node:#x}: sparse memory"))
+            .collect();
+        diagnostics.push("rejecting implausible LFH unit size 3 at 0x1000".into());
+        PoolDiagnostics::from_iter(diagnostics)
+    }
+
     /// A live target keeps allocating between the reads of one walk, so a single stale list
     /// pointer yields one complaint per node — 14k of them measured on a busy kernel, which
     /// buries the few distinct problems and leaves every consumer truncating by position.
@@ -3903,30 +4006,75 @@ mod tests {
     /// finding, so it must survive.
     #[test]
     fn test_a_flood_of_one_complaint_becomes_examples_plus_a_count() {
-        let mut diagnostics: Vec<String> = (0..1000)
-            .map(|node| format!("unreadable VS free tree node {node:#x}: sparse memory"))
-            .collect();
-        diagnostics.push("rejecting implausible LFH unit size 3 at 0x1000".into());
-
-        let collapsed = collapse_repeats(diagnostics);
+        let diagnostics = flooded();
 
         assert_eq!(
-            collapsed.len(),
-            DIAGNOSTIC_EXAMPLES + 2,
-            "expected {DIAGNOSTIC_EXAMPLES} examples, the distinct message, and one summary"
+            diagnostics.examples().len(),
+            DIAGNOSTIC_EXAMPLES + 1,
+            "expected {DIAGNOSTIC_EXAMPLES} examples of the flood, plus the distinct message"
         );
-        assert!(collapsed[0].contains("unreadable VS free tree node 0x0"));
+        assert!(diagnostics.examples()[0].contains("unreadable VS free tree node 0x0"));
         assert!(
-            collapsed
+            diagnostics
+                .examples()
                 .iter()
                 .any(|message| message.contains("rejecting implausible LFH unit size")),
             "a distinct complaint must not be collapsed away by a flood of another"
         );
+
+        let totals: Vec<usize> = diagnostics.shapes().iter().map(|seen| seen.total).collect();
+        assert_eq!(
+            totals,
+            vec![1000, 1],
+            "shapes carry the whole count each, in the order first seen: {:?}",
+            diagnostics.shapes()
+        );
         assert!(
-            collapsed.last().is_some_and(
-                |message| message.contains(&format!("and {} more", 1000 - DIAGNOSTIC_EXAMPLES))
+            diagnostics.lines().last().is_some_and(
+                |line| line.contains(&format!("and {} more", 1000 - DIAGNOSTIC_EXAMPLES))
             ),
-            "the count is the finding and has to survive: {collapsed:?}"
+            "the rendering owes the reader the count too: {:?}",
+            diagnostics.lines()
+        );
+    }
+
+    /// The count of the *walk* is not the count of what survived the cap, and the gap is two
+    /// orders of magnitude on a real target. Reporting the latter as the former — measured
+    /// once as "71 diagnostics" for a walk that made ~7,700 complaints — describes the
+    /// collapsing as though it were a property of the pool, which is precisely the lie this
+    /// module is built to avoid.
+    #[test]
+    fn test_the_emitted_count_is_the_walk_not_the_sample() {
+        let diagnostics = flooded();
+
+        assert_eq!(diagnostics.emitted(), 1001, "every message is counted");
+        assert!(
+            diagnostics.emitted() > diagnostics.lines().len() * 50,
+            "a caller that counted lines ({}) instead of messages ({}) would be off by two \
+             orders of magnitude and never know",
+            diagnostics.lines().len(),
+            diagnostics.emitted()
+        );
+    }
+
+    /// Merging is by message, not by wholesale concatenation: discovery's complaints join the
+    /// walk's own shapes rather than starting fresh ones, or a flood split across the two
+    /// phases would keep twice the examples and report itself as two findings.
+    #[test]
+    fn test_extending_merges_into_the_shapes_already_seen() {
+        let mut diagnostics = flooded();
+        diagnostics.extend(
+            (1000..1010)
+                .map(|node| format!("unreadable VS free tree node {node:#x}: sparse memory")),
+        );
+
+        assert_eq!(diagnostics.shapes().len(), 2, "no shape was duplicated");
+        assert_eq!(diagnostics.shapes()[0].total, 1010);
+        assert_eq!(diagnostics.emitted(), 1011);
+        assert_eq!(
+            diagnostics.examples().len(),
+            DIAGNOSTIC_EXAMPLES + 1,
+            "the cap holds across the merge"
         );
     }
 

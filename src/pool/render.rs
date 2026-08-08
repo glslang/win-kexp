@@ -189,11 +189,11 @@ pub(crate) fn render_pool_map(index: &PoolIndex, options: RenderOptions) -> Vec<
     }
 
     let mut chunks = Vec::new();
-    for diagnostic in &index.diagnostics {
+    for diagnostic in index.diagnostics.lines() {
         let diagnostic = if options.dml {
-            escape_dml(diagnostic)
+            escape_dml(&diagnostic)
         } else {
-            diagnostic.clone()
+            diagnostic
         };
         push_chunked(
             &mut chunks,
@@ -336,6 +336,7 @@ pub(crate) fn render_advice(index: &PoolIndex, tag: u32, dml: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool::PoolDiagnostics;
     use crate::pool::snapshot::PoolSnapshot;
 
     fn span(
@@ -409,7 +410,9 @@ mod tests {
         let index = PoolIndex::build(PoolSnapshot {
             spans,
             complete: true,
-            diagnostics: vec!["per-session paged heaps are not included".into()],
+            diagnostics: PoolDiagnostics::from_iter([
+                "per-session paged heaps are not included".to_string()
+            ]),
         });
         let plain = render_pool_map(
             &index,
@@ -497,7 +500,7 @@ mod tests {
         let many_index = PoolIndex::build(PoolSnapshot {
             spans: many,
             complete: true,
-            diagnostics: vec![],
+            diagnostics: PoolDiagnostics::default(),
         });
         let dml_chunks = render_pool_map(
             &many_index,

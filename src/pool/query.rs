@@ -22,7 +22,7 @@ use super::decode::parse_tag;
 use super::index::{PoolIndex, SnapshotCache};
 use super::layout::{LayoutCache, SessionKey};
 use super::snapshot::SnapshotWalker;
-use super::{PoolSpan, PoolState};
+use super::{PoolDiagnostics, PoolSpan, PoolState};
 use crate::dbgeng::{DbgEngError, DebugEngine};
 
 const IMAGE_FILE_MACHINE_AMD64: u32 = 0x8664;
@@ -207,7 +207,12 @@ pub struct PoolSnapshotReport {
     /// anything — `walk_vs` clears it when a readable region stops mid-chunk. A caller
     /// that wants to reject partial results has to consult this, not the diagnostics.
     pub complete: bool,
-    pub diagnostics: Vec<String>,
+    /// What the walk complained about, grouped by shape.
+    ///
+    /// Ask it for [`PoolDiagnostics::emitted`] when reporting how much the walk complained:
+    /// the messages it carries verbatim are a capped sample, so counting them measures the
+    /// cap rather than the target.
+    pub diagnostics: PoolDiagnostics,
 }
 
 /// Summarises the cached snapshot: how much was walked, and what the walk could not do.
@@ -441,7 +446,7 @@ mod tests {
     fn index_of(spans: Vec<PoolSpan>) -> PoolIndex {
         PoolIndex::build(crate::pool::PoolSnapshot {
             spans,
-            diagnostics: Vec::new(),
+            diagnostics: PoolDiagnostics::default(),
             complete: true,
         })
     }
@@ -604,13 +609,17 @@ mod tests {
     fn test_empty_walk_still_reports_why() {
         let index = PoolIndex::build(crate::pool::PoolSnapshot {
             spans: Vec::new(),
-            diagnostics: vec!["cannot read pool node 0 heap 2".into()],
+            diagnostics: PoolDiagnostics::from_iter(["cannot read pool node 0 heap 2".to_string()]),
             complete: false,
         });
         let report = report_of(&index);
         assert_eq!(report.total_chunks, 0);
         assert_eq!(report.allocated_chunks, 0);
-        assert_eq!(report.diagnostics, vec!["cannot read pool node 0 heap 2"]);
+        assert_eq!(
+            report.diagnostics.examples(),
+            ["cannot read pool node 0 heap 2"]
+        );
+        assert_eq!(report.diagnostics.emitted(), 1);
     }
 
     #[test]
