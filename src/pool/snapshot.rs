@@ -5,11 +5,11 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::decode::{
-    DESCRIPTOR_FLAG_LFH, DESCRIPTOR_FLAG_VS, PAGE_SIZE, PoolHeaderLayout, adjust_page_end_header,
-    big_page_probe, decode_descriptor_at, decode_large_allocation, decode_lfh_offsets,
-    decode_pool_header, decode_rb_root, decode_slist_header_next, decode_vs_sizes,
-    lfh_bitmap_state, read_u16, read_u32, read_u64, valid_descriptor_tree_signature,
-    valid_page_segment_signature, valid_vs_signature,
+    PAGE_SIZE, PoolHeaderLayout, adjust_page_end_header, big_page_probe, decode_descriptor_at,
+    decode_large_allocation, decode_lfh_subsegment, decode_pool_header, decode_rb_root,
+    decode_slist_header_next, decode_vs_sizes, descriptor_backend, lfh_bitmap_state, read_u16,
+    read_u32, read_u64, valid_descriptor_tree_signature, valid_page_segment_signature,
+    valid_vs_signature,
 };
 use super::{
     HeapIdentity, PoolBackend, PoolKind, PoolSpan, PoolState,
@@ -1067,7 +1067,9 @@ fn discover_segment_context(
                 descriptor_index += 1;
                 continue;
             };
-            if decoded.committed
+            // `TreeSignature` shares its bytes with the range's tree node, so it only means
+            // anything on the descriptor that *is* the range's node — its first.
+            if decoded.first
                 && !read_u32(&metadata, offset + tree_signature_offset)
                     .is_some_and(valid_descriptor_tree_signature)
             {
@@ -1088,20 +1090,17 @@ fn discover_segment_context(
                 descriptor_index += unit_size.max(1);
                 continue;
             }
-            // Verifier special pool sets DESCRIPTOR_FLAG_LFH on its page-range descriptors,
-            // but the page holds a pool header plus fill rather than a subsegment. Parsing
-            // it as LFH rejects the range outright ("implausible LFH metadata") *during
-            // region creation*, so the allocation never reaches the walk at all — which is
-            // why classifying it correctly here, and not just at dispatch time, is what
-            // makes special-pool chunks visible. `walk_region` routes on `heap.special`.
+            // Getting this wrong is expensive in the quietest way available: a range parsed as
+            // the wrong kind of subsegment fails to decode and is dropped *during region
+            // creation*, so its allocations never reach the walk at all and nothing downstream
+            // can tell they existed. Verifier special pool is the one range whose flags cannot
+            // answer the question — a special-pool page range is a plain allocated range
+            // (`0x03`), but it holds a pool header plus fill laid out page-granularly, so it is
+            // routed by the heap it came from. `walk_region` routes the same way.
             let backend = if identity.special {
                 PoolBackend::Segment
-            } else if decoded.flags & DESCRIPTOR_FLAG_LFH != 0 {
-                PoolBackend::Lfh
-            } else if decoded.flags & DESCRIPTOR_FLAG_VS != 0 {
-                PoolBackend::Vs
             } else {
-                PoolBackend::Segment
+                descriptor_backend(decoded.flags)
             };
             let mut region_address = address;
             let mut region_size = size;
@@ -1124,28 +1123,30 @@ fn discover_segment_context(
                     }
                 };
                 let encoded = read_u32(&header, offsets).unwrap_or(0);
-                let (decoded_block_size, decoded_first) =
-                    decode_lfh_offsets(encoded, address, lfh_key as u32);
-                block_size = u32::from(decoded_block_size);
-                let first = usize::from(decoded_first);
                 let blocks = read_u16(&header, count_offset)
                     .map(usize::from)
                     .unwrap_or(0);
-                if block_size < 8
-                    || blocks == 0
-                    || first >= region_size
-                    || blocks.saturating_mul(block_size as usize) > region_size - first
-                {
-                    discovery.diagnostics.push(format!(
-                        "rejecting implausible LFH metadata at {address:#x}"
-                    ));
-                    descriptor_index += unit_size;
-                    continue;
-                }
+                let lfh = match decode_lfh_subsegment(
+                    encoded,
+                    address,
+                    lfh_key as u32,
+                    blocks,
+                    region_size,
+                ) {
+                    Ok(lfh) => lfh,
+                    Err(rejection) => {
+                        discovery.diagnostics.push(format!(
+                            "rejecting LFH subsegment {address:#x}: {rejection}"
+                        ));
+                        descriptor_index += unit_size;
+                        continue;
+                    }
+                };
+                block_size = lfh.block_size;
                 bitmap = match guarded_read(
                     memory,
                     address + bitmap_offset as u64,
-                    blocks.div_ceil(4),
+                    lfh.blocks.div_ceil(4),
                 ) {
                     Ok(bytes) => bytes,
                     Err(error) => {
@@ -1156,8 +1157,8 @@ fn discover_segment_context(
                         continue;
                     }
                 };
-                region_address += first as u64;
-                region_size = blocks * block_size as usize;
+                region_address += lfh.first as u64;
+                region_size = lfh.blocks * block_size as usize;
             } else if backend == PoolBackend::Vs {
                 let vs = layout.type_layout("_HEAP_VS_SUBSEGMENT")?;
                 let header = match guarded_read(memory, address, vs.size as usize) {
@@ -1193,7 +1194,9 @@ fn discover_segment_context(
                 block_size = 0;
             }
             let descriptor_node = metadata_address + offset as u64 + tree_node_offset as u64;
-            let state = if free_nodes.contains(&descriptor_node) || !decoded.committed {
+            // Two independent ways to be free, and either is enough: the range sits in the
+            // segment's free-page tree, or its own flags say it is not in use.
+            let state = if free_nodes.contains(&descriptor_node) || !decoded.allocated() {
                 PoolState::ReusableFree
             } else {
                 PoolState::Allocated
@@ -1857,11 +1860,11 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                     continue;
                 }
             };
-            // Verifier special pool is page-granular, and its page-range descriptors still
-            // carry DESCRIPTOR_FLAG_LFH — so this has to come *before* the backend
-            // dispatch. Left to `walk_lfh`, the range's "subsegment header" is really a
-            // pool header plus fill, the block bitmap is nonsense, and every allocation in
-            // the heap silently disappears from the snapshot.
+            // Verifier special pool is page-granular and its ranges are indistinguishable
+            // from any other plain page range by their flags, so this has to come *before*
+            // the backend dispatch. Walked as page ranges instead, the pool header plus
+            // 0xfd fill decodes as garbage and every allocation in the heap silently
+            // disappears from the snapshot.
             if region.heap.special {
                 self.walk_special_pool(region, valid_base, &bytes, snapshot);
                 cursor = valid_end;
@@ -2662,9 +2665,20 @@ mod tests {
         );
     }
     use crate::pool::{
-        decode::DESCRIPTOR_FLAG_COMMITTED,
+        decode::{
+            DESCRIPTOR_FLAG_ALLOCATED, DESCRIPTOR_FLAG_FIRST, DESCRIPTOR_FLAG_SUBSEGMENT,
+            DESCRIPTOR_FLAG_VS,
+        },
         layout::{SessionKey, TypeLayout},
     };
+
+    /// `RangeFlags` for an in-use page range: allocated, and the range's first descriptor.
+    /// The kernel's own free path insists on both before it looks at anything else.
+    const RANGE_IN_USE: u8 = DESCRIPTOR_FLAG_ALLOCATED | DESCRIPTOR_FLAG_FIRST;
+    /// An LFH subsegment range, as `nt!RtlpHpFreeHeap` requires it: `0x0b`.
+    const RANGE_LFH: u8 = RANGE_IN_USE | DESCRIPTOR_FLAG_SUBSEGMENT;
+    /// A VS subsegment range: `0x0f`.
+    const RANGE_VS: u8 = RANGE_LFH | DESCRIPTOR_FLAG_VS;
 
     const K: u64 = 0xffff_8000_0000_0000;
     const STATE: u64 = K + 0x10_0000;
@@ -3111,18 +3125,14 @@ mod tests {
         );
         fill(&mut bytes, SEGMENT + 0x100, 16 * 0x20);
         for (index, units, flags) in [
-            (
-                1u64,
-                2u8,
-                DESCRIPTOR_FLAG_LFH | DESCRIPTOR_FLAG_COMMITTED | 0x0c,
-            ),
-            (3, 2, DESCRIPTOR_FLAG_VS | DESCRIPTOR_FLAG_COMMITTED | 0x0c),
-            (5, 1, DESCRIPTOR_FLAG_COMMITTED | 0x0c),
+            (1u64, 2u8, RANGE_LFH),
+            (3, 2, RANGE_VS),
+            (5, 1, RANGE_IN_USE),
             (6, 1, 0x00),
-            (7, 1, DESCRIPTOR_FLAG_COMMITTED | 0x0c),
+            (7, 1, RANGE_IN_USE),
         ] {
             let descriptor = SEGMENT + 0x100 + index * 0x20;
-            if flags & DESCRIPTOR_FLAG_COMMITTED != 0 {
+            if flags & DESCRIPTOR_FLAG_FIRST != 0 {
                 put_u32(
                     &mut bytes,
                     descriptor,
@@ -3495,6 +3505,102 @@ mod tests {
         );
     }
 
+    /// A segment holding one plain allocated page range and one free range, and nothing else.
+    ///
+    /// Neither is a subsegment, and that is the point: with `RangeFlags` bit `0x01` read as
+    /// "LFH", both look like LFH subsegment ranges, their page contents decode as a subsegment
+    /// header, and they are discarded before the walk ever sees them. The free range is
+    /// deliberately *not* in the free-page tree, so its state has to come from its own flags.
+    fn segment_of_plain_page_ranges(heap_key: u64) -> SyntheticMemory {
+        let mut bytes = Writes::default();
+        let context = HEAP + 0x100;
+
+        fill(&mut bytes, HEAP, 0x800);
+        put_u64(&mut bytes, context, SEGMENT); // SegmentListHead
+        put(&mut bytes, context + 0x20, &[12, 1]); // UnitShift, FirstDescriptorIndex
+        put_u64(&mut bytes, context + 0x28, !0xffffu64); // SegmentMask: 16 descriptors
+
+        fill(&mut bytes, SEGMENT, 0x300);
+        put_u64(&mut bytes, SEGMENT, context); // ListEntry back to the head: one segment
+        put_u64(
+            &mut bytes,
+            SEGMENT + 0x20,
+            SEGMENT ^ context ^ heap_key ^ super::super::decode::PAGE_SEGMENT_SIGNATURE,
+        );
+        for (index, flags) in [(1u64, RANGE_IN_USE), (2, DESCRIPTOR_FLAG_FIRST)] {
+            let descriptor = SEGMENT + 0x100 + index * 0x20;
+            put_u32(
+                &mut bytes,
+                descriptor,
+                super::super::decode::DESCRIPTOR_TREE_SIGNATURE,
+            );
+            put(&mut bytes, descriptor + 0x18, &[flags]);
+            put(&mut bytes, descriptor + 0x1f, &[1]);
+        }
+        SyntheticMemory::new(bytes, Vec::new())
+    }
+
+    /// A page range that is not a subsegment must be walked as page ranges, not rejected.
+    ///
+    /// This is glslang/win-kexp#90 at the smallest scale that shows it. Every allocated range
+    /// carries `RangeFlags` bit `0x01`, so reading that bit as "this is an LFH subsegment"
+    /// sends plain page-range allocations, VS subsegments and Verifier special pool alike
+    /// through the LFH decoder, which refuses the result and drops the range — silently, and
+    /// before any of its allocations can be indexed.
+    #[test]
+    fn test_a_plain_page_range_is_not_taken_for_an_lfh_subsegment() {
+        let heap_key = 0x55aa_1234_9876_0000;
+        let memory = segment_of_plain_page_ranges(heap_key);
+        let layout = synthetic_layout();
+        let mut discovery = Discovery::default();
+
+        discover_segment_context(
+            &memory,
+            &layout,
+            HEAP + 0x100,
+            0,
+            PoolKind::NonPagedNx,
+            HeapIdentity {
+                pool_state: STATE,
+                heap: HEAP,
+                special: false,
+            },
+            heap_key,
+            0xa5c3_1357,
+            1024,
+            &SharedChunks::default(),
+            &SharedChunks::default(),
+            &mut discovery,
+        )
+        .expect("the fixture is readable throughout");
+
+        assert!(
+            discovery.diagnostics.is_empty(),
+            "nothing here is a subsegment, so nothing should have been decoded as one: {:?}",
+            discovery.diagnostics
+        );
+        let described: Vec<_> = discovery
+            .regions
+            .iter()
+            .map(|region| (region.address, region.backend, region.states.as_slice()))
+            .collect();
+        assert_eq!(
+            described,
+            [
+                (
+                    SEGMENT + 0x1000,
+                    PoolBackend::Segment,
+                    [PoolState::Allocated].as_slice()
+                ),
+                (
+                    SEGMENT + 0x2000,
+                    PoolBackend::Segment,
+                    [PoolState::ReusableFree].as_slice()
+                ),
+            ]
+        );
+    }
+
     /// One page segment whose every descriptor is a committed LFH range.
     ///
     /// The shared fixture has five descriptors in a sixteen-slot array and only one of them
@@ -3529,11 +3635,7 @@ mod tests {
                 descriptor,
                 super::super::decode::DESCRIPTOR_TREE_SIGNATURE,
             );
-            put(
-                &mut bytes,
-                descriptor + 0x18,
-                &[DESCRIPTOR_FLAG_LFH | DESCRIPTOR_FLAG_COMMITTED | 0x0c],
-            );
+            put(&mut bytes, descriptor + 0x18, &[RANGE_LFH]);
             put(&mut bytes, descriptor + 0x1f, &[1]);
         }
         SyntheticMemory::new(bytes, Vec::new())

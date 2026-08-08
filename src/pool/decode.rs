@@ -1,18 +1,65 @@
-use super::PoolState;
+use std::fmt;
+
+use super::{PoolBackend, PoolState};
 
 pub(crate) const PAGE_SIZE: u64 = 0x1000;
 pub(crate) const VS_SIGNATURE: u16 = 0x2bed;
 pub(crate) const PAGE_SEGMENT_SIGNATURE: u64 = 0xa2e6_4ead_a2e6_4ead;
 pub(crate) const DESCRIPTOR_TREE_SIGNATURE: u32 = 0xccdd_ccdd;
-pub(crate) const DESCRIPTOR_FLAG_LFH: u8 = 0x01;
-pub(crate) const DESCRIPTOR_FLAG_COMMITTED: u8 = 0x02;
-pub(crate) const DESCRIPTOR_FLAG_VS: u8 = 0x20;
+
+/// `_HEAP_PAGE_RANGE_DESCRIPTOR.RangeFlags`: the page range is in use.
+///
+/// Set on **every** unit descriptor of the range, not just its first, so on its own it says
+/// nothing about what formats the range's contents — see [`descriptor_backend`].
+pub(crate) const DESCRIPTOR_FLAG_ALLOCATED: u8 = 0x01;
+/// This descriptor is the first of its page range, so its `UnitSize`, `Key` and
+/// `TreeSignature` are the range's own. Interior units carry `UnitOffset` back to it instead.
+pub(crate) const DESCRIPTOR_FLAG_FIRST: u8 = 0x02;
+/// The subsegment is a VS one. Only meaningful together with [`DESCRIPTOR_FLAG_SUBSEGMENT`].
+pub(crate) const DESCRIPTOR_FLAG_VS: u8 = 0x04;
+/// The range holds a subsegment — an `_HEAP_LFH_SUBSEGMENT`, or an `_HEAP_VS_SUBSEGMENT`
+/// when [`DESCRIPTOR_FLAG_VS`] is set too — rather than one plain page-range allocation.
+pub(crate) const DESCRIPTOR_FLAG_SUBSEGMENT: u8 = 0x08;
+
+/// Which allocator formats the contents of a page range, from its descriptor's `RangeFlags`.
+///
+/// These four bits are the kernel's own reading, taken from `nt` on Server 26100:
+/// `nt!RtlpHpFreeHeap` walks back to the range's first descriptor and dispatches on the flags
+/// byte, requiring `0x0b` for the LFH path, exactly `0x0f` for `RtlpHpVsContextFree`, and only
+/// `flags & 3 == 3` for a plain page range. The two producers agree: `RtlpHpSegLfhAllocate`
+/// asks `RtlpHpSegPageRangeAllocate` for `0x08` and `RtlpHpSegVsAllocate` for `0x0c`, and the
+/// allocator masks the caller's request with `0x0c` before adding `0x01` to every unit of the
+/// range.
+///
+/// Reading `0x01` as "LFH" instead — as this did until it was measured — makes *every*
+/// allocated range look like an LFH subsegment: VS subsegments (`0x0f`), page-range and large
+/// allocations (`0x03`) and Verifier special pool (`0x03`) all have it set. Their contents
+/// then fail to decode as a subsegment header and the whole range is dropped, which is the
+/// silent coverage loss behind glslang/win-kexp#90.
+pub(crate) fn descriptor_backend(flags: u8) -> PoolBackend {
+    if flags & DESCRIPTOR_FLAG_SUBSEGMENT == 0 {
+        PoolBackend::Segment
+    } else if flags & DESCRIPTOR_FLAG_VS != 0 {
+        PoolBackend::Vs
+    } else {
+        PoolBackend::Lfh
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Descriptor {
     pub unit_size: u32,
     pub flags: u8,
-    pub committed: bool,
+    /// Whether this descriptor is the first of its page range, and so whether the fields
+    /// decoded from it describe a range at all.
+    pub first: bool,
+}
+
+impl Descriptor {
+    /// Whether the range this descriptor belongs to is in use.
+    pub(crate) fn allocated(&self) -> bool {
+        self.flags & DESCRIPTOR_FLAG_ALLOCATED != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +116,7 @@ pub(crate) fn decode_descriptor(word: u32) -> Option<Descriptor> {
     (unit_size != 0).then_some(Descriptor {
         unit_size,
         flags,
-        committed: flags & DESCRIPTOR_FLAG_COMMITTED != 0,
+        first: flags & DESCRIPTOR_FLAG_FIRST != 0,
     })
 }
 
@@ -144,6 +191,103 @@ pub(crate) fn decode_lfh_offsets(encoded: u32, subsegment: u64, lfh_key: u32) ->
     // the upper half of LfhKey and produces a bogus FirstBlockOffset.
     let decoded = encoded ^ lfh_key ^ (subsegment >> 12) as u32;
     (decoded as u16, (decoded >> 16) as u16)
+}
+
+/// The smallest LFH block the kernel buckets. Anything under it is a misread, not a bucket.
+const LFH_MIN_BLOCK_SIZE: u32 = 8;
+
+/// How an `_HEAP_LFH_SUBSEGMENT` header divides its page range into blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LfhSubsegment {
+    pub block_size: u32,
+    /// Where the first block starts, past the header and block bitmap.
+    pub first: usize,
+    pub blocks: usize,
+}
+
+/// Why an LFH subsegment header was not believed, and the decoded values that say so.
+///
+/// The failing predicate is spelled out in words while the values stay numbers, because
+/// `PoolDiagnostics` collapses messages by shape — numbers fold into `#`, words do not. A walk
+/// therefore reports how many subsegments failed *each* check, and keeps a verbatim sample of
+/// each with its numbers intact. That is what separates the two explanations for a rejection
+/// that a bare count cannot: a header rewritten by the running target between our reads fails
+/// the way a half-built subsegment does and in varying ways, while a field we are decoding
+/// wrongly fails the same way every time, with values that never look like a bucket size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LfhRejection {
+    /// The predicate that failed, as prose with no digits in it.
+    pub reason: &'static str,
+    pub block_size: u32,
+    pub blocks: usize,
+    pub first: usize,
+    pub region_size: usize,
+    /// `BlockOffsets.EncodedData` as read, so a rejected header can be re-decoded by hand
+    /// against another candidate mix without another walk of the target.
+    pub encoded: u32,
+}
+
+impl fmt::Display for LfhRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} (block size {:#x}, {} blocks at offset {:#x} of a {:#x} byte range, encoded {:#010x})",
+            self.reason, self.block_size, self.blocks, self.first, self.region_size, self.encoded
+        )
+    }
+}
+
+/// Decodes an LFH subsegment header, or says which plausibility check it failed.
+///
+/// `region_size` is the byte length the page-range descriptor gave for this range.
+/// `nt!RtlpHpLfhSubsegmentInitialize` picks `BlockCount` by dividing exactly that range by the
+/// bucket's block size after reserving `FirstBlockOffset` for the header and block bitmap, so
+/// `first + blocks * block_size <= region_size` holds by construction. A header that does not
+/// fit is one we misread or one that was mid-rewrite while we read it.
+pub(crate) fn decode_lfh_subsegment(
+    encoded: u32,
+    subsegment: u64,
+    lfh_key: u32,
+    blocks: usize,
+    region_size: usize,
+) -> Result<LfhSubsegment, LfhRejection> {
+    let (decoded_block_size, decoded_first) = decode_lfh_offsets(encoded, subsegment, lfh_key);
+    let block_size = u32::from(decoded_block_size);
+    let first = usize::from(decoded_first);
+    let reject = |reason| {
+        Err(LfhRejection {
+            reason,
+            block_size,
+            blocks,
+            first,
+            region_size,
+            encoded,
+        })
+    };
+
+    // Both fields zero is a range committed but not yet made into a subsegment: the encoding
+    // mixes in the subsegment's own address, so an initialised header practically cannot
+    // encode to zero. Worth its own reason — it is the shape of a race, not of a misdecode.
+    if encoded == 0 && blocks == 0 {
+        return reject("header is not initialised");
+    }
+    if blocks == 0 {
+        return reject("block count is zero");
+    }
+    if block_size < LFH_MIN_BLOCK_SIZE {
+        return reject("block size is below the eight byte minimum");
+    }
+    if first >= region_size {
+        return reject("first block offset is past the end of the range");
+    }
+    if blocks.saturating_mul(block_size as usize) > region_size - first {
+        return reject("the blocks overrun the range");
+    }
+    Ok(LfhSubsegment {
+        block_size,
+        first,
+        blocks,
+    })
 }
 
 /// Each LFH slot uses two bits. Bit 0 is the busy state, while bit 1 records
@@ -301,25 +445,31 @@ mod tests {
     fn test_pool_decoder_bounds_and_shifted_offsets() {
         assert_eq!(read_u32(&[0, 1, 2, 3, 4], 1), Some(0x0403_0201));
         assert_eq!(read_u64(&[0; 7], 0), None);
-        let committed = decode_descriptor(0x0200_0020).unwrap();
-        assert_eq!(committed.unit_size, 0x20);
-        assert!(committed.committed);
-        assert!(!decode_descriptor(0x0100_0020).unwrap().committed);
+        let first = decode_descriptor(0x0200_0020).unwrap();
+        assert_eq!(first.unit_size, 0x20);
+        assert!(first.first);
+        assert!(!first.allocated());
+        let interior = decode_descriptor(0x0100_0020).unwrap();
+        assert!(
+            !interior.first,
+            "0x01 marks a unit in use, not a range start"
+        );
+        assert!(interior.allocated());
         assert_eq!(decode_descriptor(0), None);
         let mut descriptor = [0u8; 12];
         descriptor[7] = 0x20;
-        descriptor[3] = DESCRIPTOR_FLAG_COMMITTED;
+        descriptor[3] = DESCRIPTOR_FLAG_FIRST;
         assert_eq!(
             decode_descriptor_at(&descriptor, 2, 10, 5, 1),
             Some(Descriptor {
                 unit_size: 0x20,
-                flags: DESCRIPTOR_FLAG_COMMITTED,
-                committed: true
+                flags: DESCRIPTOR_FLAG_FIRST,
+                first: true
             })
         );
         let mut wide_descriptor = [0u8; 16];
         wide_descriptor[5..8].copy_from_slice(&[0x56, 0x34, 0x12]);
-        wide_descriptor[2] = DESCRIPTOR_FLAG_COMMITTED;
+        wide_descriptor[2] = DESCRIPTOR_FLAG_FIRST;
         assert_eq!(
             decode_descriptor_at(&wide_descriptor, 0, 8, 5, 2)
                 .unwrap()
@@ -381,6 +531,98 @@ mod tests {
                 .unwrap()
                 .pool_index,
             3
+        );
+    }
+
+    /// The flag combinations the kernel itself dispatches on, as read out of `nt` on Server
+    /// 26100: `0x0b` reaches the LFH free path, exactly `0x0f` reaches `RtlpHpVsContextFree`,
+    /// and `flags & 3 == 3` on its own is a plain page-range allocation. Reading the low bit
+    /// as "LFH" made the last two cases parse as LFH subsegments and vanish.
+    #[test]
+    fn test_range_flags_name_the_allocator_that_owns_the_range() {
+        const ALLOCATED: u8 = DESCRIPTOR_FLAG_ALLOCATED | DESCRIPTOR_FLAG_FIRST;
+        assert_eq!(
+            descriptor_backend(ALLOCATED | DESCRIPTOR_FLAG_SUBSEGMENT),
+            PoolBackend::Lfh
+        );
+        assert_eq!(
+            descriptor_backend(ALLOCATED | DESCRIPTOR_FLAG_SUBSEGMENT | DESCRIPTOR_FLAG_VS),
+            PoolBackend::Vs
+        );
+        assert_eq!(descriptor_backend(ALLOCATED), PoolBackend::Segment);
+        // Verifier special pool: an ordinary allocated page range, told apart by its heap.
+        assert_eq!(descriptor_backend(0x03), PoolBackend::Segment);
+        // An interior unit of an allocated range, and a free range: neither is a subsegment.
+        assert_eq!(
+            descriptor_backend(DESCRIPTOR_FLAG_ALLOCATED),
+            PoolBackend::Segment
+        );
+        assert_eq!(
+            descriptor_backend(DESCRIPTOR_FLAG_FIRST),
+            PoolBackend::Segment
+        );
+    }
+
+    /// Every rejection has to name the check it failed and carry the values that failed it.
+    /// A walk against a live 26100 kernel rejected 5.5k subsegments as one undifferentiated
+    /// "implausible", which cannot distinguish a header rewritten under us from a field we
+    /// decode wrongly — the whole point of glslang/win-kexp#90.
+    #[test]
+    fn test_lfh_rejections_name_their_predicate_and_carry_their_values() {
+        let subsegment = 0xffff_8c8f_0d60_2000;
+        let lfh_key = 0xa5c3_1357u32;
+        let encode = |block_size: u16, first: u16| {
+            (u32::from(block_size) | (u32::from(first) << 16)) ^ lfh_key ^ (subsegment >> 12) as u32
+        };
+        let decode = |encoded, blocks, region_size| {
+            decode_lfh_subsegment(encoded, subsegment, lfh_key, blocks, region_size)
+        };
+
+        assert_eq!(
+            decode(encode(0x70, 0x40), 0x24, 0x1000),
+            Ok(LfhSubsegment {
+                block_size: 0x70,
+                first: 0x40,
+                blocks: 0x24
+            })
+        );
+        // The kernel divides the range exactly, so a header that fills it is not suspicious.
+        assert!(decode(encode(0x40, 0x40), 0x3f, 0x1000).is_ok());
+
+        let reasons = |cases: &[(u32, usize, usize)]| {
+            cases
+                .iter()
+                .map(|&(encoded, blocks, region_size)| {
+                    decode(encoded, blocks, region_size).unwrap_err().reason
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            reasons(&[
+                (0, 0, 0x1000),
+                (encode(0x70, 0x40), 0, 0x1000),
+                (encode(4, 0x40), 0x24, 0x1000),
+                (encode(0x70, 0x2000), 0x24, 0x1000),
+                (encode(0x70, 0x40), 0x100, 0x1000),
+            ]),
+            [
+                "header is not initialised",
+                "block count is zero",
+                "block size is below the eight byte minimum",
+                "first block offset is past the end of the range",
+                "the blocks overrun the range",
+            ]
+        );
+
+        let rejection = decode(encode(0x70, 0x40), 0x100, 0x1000).unwrap_err();
+        let message = rejection.to_string();
+        assert!(
+            message.contains("0x70") && message.contains("256") && message.contains("0x40"),
+            "a rejection has to show what it decoded: {message}"
+        );
+        assert!(
+            message.contains(&format!("{:#010x}", rejection.encoded)),
+            "and the raw word, so it can be re-decoded without another walk: {message}"
         );
     }
 

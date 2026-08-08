@@ -106,6 +106,15 @@ out of it is not an error: it returns the chunks it reached with `complete` clea
 and a diagnostic saying how much of the pool it got through. As everywhere else here,
 “the walk did not see it” is reported as exactly that and never as “it is not there”.
 
+Against a live kernel a walk is **normally incomplete**, and that is the target being
+honest rather than the walker being broken: paged pool is partly out on disk, and a
+page the memory manager has paged out cannot be read through the debugger either. Such
+ranges come back as `sparse virtual range` diagnostics and the chunks inside them are
+absent from the snapshot, so `complete` is cleared. Expect a live walk to carry
+thousands of diagnostics too, and read them by shape (`PoolDiagnostics::shapes`, which
+counts each distinct complaint) rather than by how many lines were kept — one stale
+list pointer or one paged-out region yields one message per node.
+
 When WinDbg accepts DML, map cells have colors and clickable address-detail links.
 The same rows use meaningful ASCII glyphs and include a legend when DML is stripped
 or plain-text output is captured.
