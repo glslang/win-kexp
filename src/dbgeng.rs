@@ -116,12 +116,61 @@ const WAIT_INFINITE: u32 = u32::MAX;
 /// See [`DebugEngine::attach_kernel`].
 const KERNEL_ATTACH_WAIT_MS: u32 = 60_000;
 
-/// Carries a raw `IDebugControl` pointer to a watchdog thread solely to call
-/// `SetInterrupt`, which DbgEng documents as safe to call from any thread (the rest of
-/// the engine is single-thread-affine). Not otherwise dereferenced off-thread.
-struct InterruptHandle(*mut core::ffi::c_void);
-// SAFETY: only used to invoke SetInterrupt, the one cross-thread-safe DbgEng call.
+/// Ctrl+Breaks one engine from another thread.
+///
+/// `SetInterrupt` is the one DbgEng call documented as safe from any thread — the rest of the
+/// engine is single-thread-affine — which is the whole reason this can exist without a second
+/// threading model. It is also the only call this makes.
+///
+/// Two kinds of caller, and the engine cannot tell them apart: the watchdogs below, which raise
+/// an interrupt when a deadline passes, and a **host that has decided to stop waiting** — an
+/// operator abandoning a runaway `s` search, say. The second is why this is public. Everything
+/// about *which* operation an interrupt is meant for belongs to that host: this addresses an
+/// engine, so whatever it is running now is what stops.
+pub struct InterruptHandle {
+    /// An owned reference, not a borrowed pointer. A handle is public now, so it can outlive the
+    /// `DebugEngine` it came from — and a raw pointer would then be a dangling one at exactly the
+    /// moment a host reaches for it. The refcount costs nothing and makes the lifetime a fact
+    /// rather than a convention.
+    control: IDebugControl4,
+    /// Set whenever this handle raises an interrupt, and cleared by the command that finds it.
+    ///
+    /// Shared with the engine so [`DebugEngine::execute_command_bounded`] can tell an aborted
+    /// `Execute` from a failed one *without* being the thread that asked. Without it an interrupt
+    /// on request is indistinguishable from a command error, and the output captured up to the
+    /// break is discarded with it — which is most of what an interrupted search is worth.
+    raised: Arc<AtomicBool>,
+}
+// SAFETY: `control` is only ever handed to SetInterrupt, the one cross-thread-safe DbgEng call.
+// The other cross-thread touch is the `Release` on drop, which rests on the same assumption
+// [`DebugEngine`]'s own `Send`/`Sync` below already make about these interfaces; a handle held for
+// the life of a process (the intended use) never reaches it at all.
 unsafe impl Send for InterruptHandle {}
+// SAFETY: as above — sharing a handle only shares the ability to make that one call.
+unsafe impl Sync for InterruptHandle {}
+
+impl InterruptHandle {
+    /// Asks the engine this came from to break out of whatever it is running.
+    ///
+    /// Returns as soon as the request is lodged, not when the engine acts on it: a long command
+    /// polls for the flag exactly as it does for a human's Ctrl+Break, so the operation ends at
+    /// its next poll and its own caller is who observes that. Two limits carry over from the
+    /// engine, both of them properties of `SetInterrupt` rather than of this: a command that never
+    /// polls is not reached, and neither is a live-kernel wait whose target has not yet connected
+    /// (see [`DebugEngine::wait_for_event_bounded`]).
+    pub fn interrupt(&self) -> Result<(), DbgEngError> {
+        // Stored *before* the call, so the flag can never become visible later than the break it
+        // explains — a bounded command reads it after `Execute` returns, and one that read `false`
+        // there would report the abort it caused as a debugger error.
+        self.raised.store(true, Ordering::SeqCst);
+        unsafe { self.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: "requesting a debugger interrupt".into(),
+                source,
+            }
+        })
+    }
+}
 
 /// Encodes a `&str` as a NUL-terminated UTF-16 buffer for the `*Wide` DbgEng APIs.
 fn to_wide(s: &str) -> Vec<u16> {
@@ -193,6 +242,9 @@ pub struct DebugEngine {
     /// re-read the buffer (drive `.restart` after a `launch_process`) is what would make a
     /// tighter release safe.
     deferred_inputs: Mutex<Vec<TargetInput>>,
+    /// Whether an interrupt has been raised on this engine and not yet accounted for. Shared with
+    /// every [`InterruptHandle`] this engine hands out; see there for what it buys.
+    interrupt_raised: Arc<AtomicBool>,
 }
 
 impl Default for DebugEngine {
@@ -278,6 +330,7 @@ impl DebugEngine {
             owns_session: false,
             target_identity: AtomicU64::new(identity),
             deferred_inputs: Mutex::new(Vec::new()),
+            interrupt_raised: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -310,7 +363,20 @@ impl DebugEngine {
             owns_session: false,
             target_identity: AtomicU64::new(identity),
             deferred_inputs: Mutex::new(Vec::new()),
+            interrupt_raised: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// A handle another thread can use to Ctrl+Break whatever this engine is running.
+    ///
+    /// The engine stays confined to its own thread; this is the one thing about it that may be
+    /// touched from outside, and only because `SetInterrupt` is documented as safe there. See
+    /// [`InterruptHandle`].
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        InterruptHandle {
+            control: self.control.clone(),
+            raised: Arc::clone(&self.interrupt_raised),
+        }
     }
 
     /// A value that identifies the target this engine currently holds.
@@ -731,6 +797,13 @@ impl DebugEngine {
     /// Returns whatever output was captured up to the interrupt; when the watchdog fires it
     /// appends a short note and does **not** surface the resulting `Execute` error (the abort
     /// is expected). `timeout_ms == 0` disables the watchdog (equivalent to `execute_command`).
+    ///
+    /// An interrupt raised through an [`InterruptHandle`] — a host that stopped waiting — is
+    /// treated the same way *minus the note*: the partial output comes back and the `Execute`
+    /// error it caused is not surfaced. No note, because that caller already knows; the watchdog's
+    /// exists only because nobody else can see a deadline pass. Note this is the reason a bounded
+    /// command is the right home for `raised`: without it an abort on request is indistinguishable
+    /// from a command that genuinely failed, and both the output and the explanation are lost.
     pub fn execute_command_bounded(
         &self,
         command: &str,
@@ -738,6 +811,11 @@ impl DebugEngine {
     ) -> Result<String, DbgEngError> {
         let cmd_c = CString::new(command).map_err(|_| DbgEngError::InvalidCommand)?;
         let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
+
+        // Whatever was raised before this command belongs to the last one. A request that arrives
+        // from here on is about what runs below; one left standing from an earlier operation would
+        // otherwise make the *next* command swallow a genuine error as though it had been aborted.
+        self.interrupt_raised.store(false, Ordering::SeqCst);
 
         let mut output_buffer = Vec::<u8>::with_capacity(4096);
         let output_callbacks = OutputCallbacks::new(&mut output_buffer);
@@ -755,7 +833,7 @@ impl DebugEngine {
         let watchdog = (timeout_ms > 0).then(|| {
             let done_watch = Arc::clone(&done);
             let fired_watch = Arc::clone(&fired);
-            let handle = InterruptHandle(self.control.as_raw());
+            let handle = self.interrupt_handle();
             let deadline = Duration::from_millis(timeout_ms as u64);
             thread::spawn(move || {
                 let handle = handle; // move the whole (Send) handle, not just the raw field
@@ -764,11 +842,9 @@ impl DebugEngine {
                     if done_watch.load(Ordering::SeqCst) {
                         return;
                     }
-                    if start.elapsed() >= deadline
-                        && let Some(ctl) = unsafe { IDebugControl4::from_raw_borrowed(&handle.0) }
-                    {
+                    if start.elapsed() >= deadline {
                         // Repeat in case a busy command swallows one interrupt.
-                        let _ = unsafe { ctl.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) };
+                        let _ = handle.interrupt();
                         fired_watch.store(true, Ordering::SeqCst);
                     }
                     thread::sleep(Duration::from_millis(200));
@@ -791,7 +867,11 @@ impl DebugEngine {
             let _ = self.client.SetOutputCallbacks(None);
         }
 
-        let interrupted = fired.load(Ordering::SeqCst);
+        let by_watchdog = fired.load(Ordering::SeqCst);
+        // Either origin aborts the command the same way, so both take the recovery below; only the
+        // note is the watchdog's alone. Swapped rather than read, so a request that arrived while
+        // this command ran is accounted for here and cannot be charged to the next one.
+        let interrupted = by_watchdog | self.interrupt_raised.swap(false, Ordering::SeqCst);
         if interrupted {
             // The watchdog may have raised `SetInterrupt` right as `Execute` finished (or fired
             // once more before we joined it), leaving a Ctrl+Break pending with no command
@@ -821,7 +901,10 @@ impl DebugEngine {
         }
 
         let mut out = String::from_utf8_lossy(&output_buffer).to_string();
-        if interrupted {
+        // The watchdog's alone: it is the one origin whose reader has no idea an interrupt
+        // happened. A host that raised one through an `InterruptHandle` is told nothing here,
+        // because it is the one that asked.
+        if by_watchdog {
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
             }
@@ -868,7 +951,7 @@ impl DebugEngine {
         let fired = Arc::new(AtomicBool::new(false));
         let done_watch = Arc::clone(&done);
         let fired_watch = Arc::clone(&fired);
-        let handle = InterruptHandle(self.control.as_raw());
+        let handle = self.interrupt_handle();
         let deadline = Duration::from_millis(timeout_ms as u64);
         let watchdog = thread::spawn(move || {
             let handle = handle; // capture the whole (Send) handle, not just the raw field
@@ -877,12 +960,10 @@ impl DebugEngine {
                 if done_watch.load(Ordering::SeqCst) {
                     return;
                 }
-                if start.elapsed() >= deadline
-                    && let Some(ctl) = unsafe { IDebugControl4::from_raw_borrowed(&handle.0) }
-                {
+                if start.elapsed() >= deadline {
                     // Ctrl+Break a connected target so the engine thread's WaitForEvent
                     // returns with a stop. Repeat in case a busy target ignores one.
-                    let _ = unsafe { ctl.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) };
+                    let _ = handle.interrupt();
                     fired_watch.store(true, Ordering::SeqCst);
                 }
                 thread::sleep(Duration::from_millis(300));
@@ -1932,6 +2013,70 @@ mod tests {
         assert!(
             command_took_effect(&e, 0x5A5E),
             "next command did not take effect — a stale interrupt aborted it"
+        );
+
+        let _ = e.end_session();
+    }
+
+    /// The same command, cut short by an [`InterruptHandle`] instead of by a deadline: the
+    /// partial output comes back as `Ok`, without the watchdog's note, and the engine is left
+    /// usable.
+    ///
+    /// The `Ok` is the whole point of the shared flag. `SetInterrupt` makes `Execute` fail, so
+    /// without it an abort on request is a `CommandFailed` — the caller loses every line the
+    /// command had already produced, which on an interrupted search is the only thing it was
+    /// ever going to get. The absent note is the other half: a watchdog explains itself because
+    /// nobody saw the deadline pass, whereas this caller is the one who asked.
+    ///
+    /// Ignored: needs a live target; see the note above these tests.
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 test_command_interrupted_on_request`
+    #[cfg(not(miri))]
+    #[test]
+    #[ignore = "needs a live debuggee; run manually with --ignored"]
+    fn test_command_interrupted_on_request_keeps_its_output() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c exit").expect("launch failed");
+
+        // As in the watchdog test above: a genuinely CPU-bound `.for` that polls for the
+        // interrupt and leaves its progress in `$t0`, which is what proves it was cut short.
+        const ITERATIONS: u64 = 0x100_0000;
+        let long = format!(".for (r $t0 = 0; @$t0 < 0x{ITERATIONS:x}; r $t0 = @$t0 + 1) {{ }}");
+
+        // Raised from another thread while the command runs — the arrangement the handle exists
+        // for. A delay rather than a handshake because there is nothing to hand shake with: the
+        // engine thread is inside `Execute` and the only observable it publishes is the loop
+        // counter this test reads afterwards.
+        let handle = e.interrupt_handle();
+        let asker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1_500));
+            handle.interrupt().expect("SetInterrupt failed");
+        });
+
+        // No watchdog of its own (`0`), so anything that stops this command came from the thread
+        // above and the result cannot be credited to the deadline path by accident.
+        let out = e
+            .execute_command_bounded(&long, 0)
+            .expect("an interrupted command must return its partial output, not an error");
+        asker.join().expect("the interrupting thread panicked");
+
+        let t0 = read_pseudo_register(&e, "$t0");
+        println!("command interrupted on request, $t0 = {t0} of {ITERATIONS}");
+        assert!(t0 > 0, "loop never started; $t0 = {t0}");
+        assert!(
+            t0 < ITERATIONS,
+            "loop ran to completion ($t0 = {t0}) — the interrupt never reached it, so the rest \
+             of this test would prove nothing"
+        );
+        assert!(
+            !out.contains("interrupted after"),
+            "an interrupt on request must not carry the watchdog's note — the caller asked for \
+             it and no deadline passed: {out}"
+        );
+
+        // And the next command is unaffected, which is what the drain is for.
+        assert!(
+            command_took_effect(&e, 0x1234),
+            "next command did not take effect — the requested interrupt was left pending"
         );
 
         let _ = e.end_session();
