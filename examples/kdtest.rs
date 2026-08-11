@@ -205,7 +205,7 @@ fn end_session_leaves_target_running(e: &DebugEngine, target: &Target) -> bool {
     run(e, "bp nt!NtCreateFile");
     println!("=== go (to nt!NtCreateFile) ===");
     match e.execute_and_wait("g", 60_000) {
-        Ok(out) => print!("{out}"),
+        Ok(run) => print!("{}", run.output),
         Err(err) => println!("ERR: {err}"),
     }
     println!();

@@ -198,6 +198,40 @@ pub struct RunToResult {
     pub output: String,
 }
 
+/// Why a command stopped before it finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interruption {
+    /// The watchdog's deadline passed and it Ctrl+Broke the engine. Nobody outside this crate can
+    /// see that happen, so a caller rendering for a human should say so — and say what to do about
+    /// it, which is to scope the command and retry.
+    Deadline { after_ms: u32 },
+    /// A host asked, through an [`InterruptHandle`]. Distinct from a deadline because the advice
+    /// is different and mostly unnecessary: that caller knows, having asked.
+    OnRequest,
+}
+
+/// What a command produced, and whether it finished — the same shape as [`RunToResult`], and for
+/// the same reason.
+///
+/// A `String` alone cannot answer "did this run?", and an interrupted command is exactly the case
+/// where the text looks like an answer and is not: a search cut short prints the hits it had
+/// reached and nothing to say there were more. Encoding it as an `Err` is no better — it discards
+/// the output, which is the whole reason to interrupt rather than end the session.
+#[derive(Debug, Clone)]
+pub struct CommandRun {
+    pub output: String,
+    /// `None` when the command ran to completion.
+    pub cut_short: Option<Interruption>,
+}
+
+impl CommandRun {
+    /// The output, for a caller that has already dealt with [`Self::cut_short`] — or one running a
+    /// command it knows cannot be interrupted.
+    pub fn into_output(self) -> String {
+        self.output
+    }
+}
+
 /// Hands out a fresh identity for every engine, and again whenever one releases its
 /// target. Caches that ask "is this still the same target?" cannot use the kernel base
 /// alone — two dumps from one boot share it — and dbgeng holds one debuggee session per
@@ -794,21 +828,24 @@ impl DebugEngine {
     /// as safe from another thread (see [`InterruptHandle`]); a long command polls for it
     /// exactly as WinDbg's Ctrl+Break does.
     ///
-    /// Returns whatever output was captured up to the interrupt; when the watchdog fires it
-    /// appends a short note and does **not** surface the resulting `Execute` error (the abort
-    /// is expected). `timeout_ms == 0` disables the watchdog (equivalent to `execute_command`).
+    /// Returns [`CommandRun`]: whatever output was captured, **and** whether the command finished.
+    /// A break — the watchdog's or a host's, through an [`InterruptHandle`] — is reported in
+    /// `cut_short` rather than as an error, because the output up to it is the point; the `Execute`
+    /// error it provokes is not surfaced. `timeout_ms == 0` disables the watchdog (equivalent to
+    /// [`Self::execute_command`], plus the reporting).
     ///
-    /// An interrupt raised through an [`InterruptHandle`] — a host that stopped waiting — is
-    /// treated the same way *minus the note*: the partial output comes back and the `Execute`
-    /// error it caused is not surfaced. No note, because that caller already knows; the watchdog's
-    /// exists only because nobody else can see a deadline pass. Note this is the reason a bounded
-    /// command is the right home for `raised`: without it an abort on request is indistinguishable
-    /// from a command that genuinely failed, and both the output and the explanation are lost.
+    /// **Both facts, or neither is usable.** Returning the text alone makes an aborted command
+    /// indistinguishable from one that ran, so every caller downstream has to be told through some
+    /// side channel — and each place that is forgotten reports a break as a fact about the target.
+    /// Returning the error alone throws the output away, which on an interrupted search is all
+    /// there was. Callers that want the note a human reads should render it from `cut_short`; it
+    /// deliberately does not go into the text, since prose in a return value is a fact the next
+    /// caller has to string-match for.
     pub fn execute_command_bounded(
         &self,
         command: &str,
         timeout_ms: u32,
-    ) -> Result<String, DbgEngError> {
+    ) -> Result<CommandRun, DbgEngError> {
         let cmd_c = CString::new(command).map_err(|_| DbgEngError::InvalidCommand)?;
         let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
 
@@ -900,20 +937,19 @@ impl DebugEngine {
             result.map_err(DbgEngError::CommandFailed)?;
         }
 
-        let mut out = String::from_utf8_lossy(&output_buffer).to_string();
-        // The watchdog's alone: it is the one origin whose reader has no idea an interrupt
-        // happened. A host that raised one through an `InterruptHandle` is told nothing here,
-        // because it is the one that asked.
-        if by_watchdog {
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str(&format!(
-                "[win-kexp] command interrupted after {timeout_ms} ms (Ctrl+Break) — it was \
-                 taking too long. Scope it (e.g. a bounded memory range) and retry."
-            ));
-        }
-        Ok(out)
+        Ok(CommandRun {
+            output: String::from_utf8_lossy(&output_buffer).to_string(),
+            // Which origin, not merely that one happened: the advice differs. A deadline says
+            // "scope it and retry", a request says "you asked" — and only the caller that renders
+            // for a human needs either.
+            cut_short: match (by_watchdog, interrupted) {
+                (true, _) => Some(Interruption::Deadline {
+                    after_ms: timeout_ms,
+                }),
+                (false, true) => Some(Interruption::OnRequest),
+                (false, false) => None,
+            },
+        })
     }
 
     /// Waits for the target to break
@@ -983,7 +1019,19 @@ impl DebugEngine {
     /// `WaitForEvent` pumps it. This captures output across both the command and the
     /// resulting execution (so e.g. a "Breakpoint N hit" message is included), which is
     /// what makes go/step (and TTD forward/reverse navigation) actually advance.
-    pub fn execute_and_wait(&self, command: &str, timeout_ms: u32) -> Result<String, DbgEngError> {
+    ///
+    /// Reports [`Interruption::OnRequest`] in `cut_short` when a host asked for the break, so a
+    /// caller can tell "the target stopped" from "somebody stopped it". A **deadline**-forced break
+    /// is deliberately not reported: for go/step the watchdog's bound is an ordinary outcome — the
+    /// target simply had not stopped yet — and callers already treat it as one.
+    pub fn execute_and_wait(
+        &self,
+        command: &str,
+        timeout_ms: u32,
+    ) -> Result<CommandRun, DbgEngError> {
+        // Whatever was raised before this belongs to the last operation; see
+        // `execute_command_bounded`, which clears it for the same reason.
+        self.interrupt_raised.store(false, Ordering::SeqCst);
         // Driving execution control (`g`/`t`/`p`/…) into an engine with no live
         // debuggee can push DbgEng into an access violation — a structured exception
         // that Rust's `catch_unwind` cannot trap, which tears down the whole process.
@@ -1034,10 +1082,22 @@ impl DebugEngine {
             let _ = self.client.SetOutputCallbacks(None);
         }
 
-        exec.map_err(DbgEngError::CommandFailed)?;
-        waited.map_err(DbgEngError::CommandFailed)?;
+        // A break the *host* asked for makes both of these fail, exactly as it does in
+        // `execute_command_bounded` — and for the same reason the output must survive it, since a
+        // `go` stopped on request has still moved the target and the caller needs to see where to.
+        let on_request = self.interrupt_raised.swap(false, Ordering::SeqCst);
+        if on_request {
+            // As there: consume anything the engine did not, so the next operation starts clean.
+            let _ = self.interrupted();
+        } else {
+            exec.map_err(DbgEngError::CommandFailed)?;
+            waited.map_err(DbgEngError::CommandFailed)?;
+        }
 
-        Ok(String::from_utf8_lossy(&output_buffer).to_string())
+        Ok(CommandRun {
+            output: String::from_utf8_lossy(&output_buffer).to_string(),
+            cut_short: on_request.then_some(Interruption::OnRequest),
+        })
     }
 
     /// Runs the target until it reaches `address` and reports a **structured** stop reason
@@ -2001,9 +2061,12 @@ mod tests {
             "loop ran to completion ($t0 = {t0}) — the watchdog did not cut it short, so the \
              rest of this test would prove nothing"
         );
-        assert!(
-            out.contains("interrupted after"),
-            "no interruption note despite a loop that stopped short"
+        assert_eq!(
+            out.cut_short,
+            Some(Interruption::Deadline {
+                after_ms: TIMEOUT_MS
+            }),
+            "a loop that stopped short has to say a deadline stopped it"
         );
 
         // The command under test. If a stale interrupt survived, this aborts instead — so the
@@ -2067,10 +2130,11 @@ mod tests {
             "loop ran to completion ($t0 = {t0}) — the interrupt never reached it, so the rest \
              of this test would prove nothing"
         );
-        assert!(
-            !out.contains("interrupted after"),
-            "an interrupt on request must not carry the watchdog's note — the caller asked for \
-             it and no deadline passed: {out}"
+        assert_eq!(
+            out.cut_short,
+            Some(Interruption::OnRequest),
+            "the break came from the handle, not from a deadline — and which it was is what a \
+             caller renders its advice from"
         );
 
         // And the next command is unaffected, which is what the drain is for.
