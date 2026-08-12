@@ -249,6 +249,25 @@ impl WalkCoverage {
     }
 }
 
+/// An answer and the walk it came from.
+///
+/// The two travel together because they have to be *the same walk*. A query that walks and a
+/// caller that then asks for the walk's state are two calls, and between them the snapshot may
+/// not exist: an incomplete walk is deliberately not cached, so the second call finds nothing and
+/// walks again. The caller then holds a count from one walk and a coverage figure from another,
+/// and reports them as if they described each other — which is exactly the mistake coverage
+/// exists to prevent, arriving through the reporting instead of through the walk.
+///
+/// So the pairing is made here, where both come from one `PoolIndex`, and cannot be made anywhere
+/// else.
+#[derive(Debug, Clone)]
+pub struct PoolAnswer<T> {
+    /// What was asked for.
+    pub found: T,
+    /// The state of the walk it was drawn from.
+    pub walk: PoolSnapshotReport,
+}
+
 /// Summarises the cached snapshot: how much was walked, and what the walk could not do.
 pub fn snapshot_report(
     engine: &DebugEngine,
@@ -351,10 +370,13 @@ pub fn find_tag(
     tag: &str,
     filter: Option<PoolPageFilter>,
     walk: impl Into<PoolWalk>,
-) -> Result<Vec<PoolSpan>, PoolQueryError> {
+) -> Result<PoolAnswer<Vec<PoolSpan>>, PoolQueryError> {
     let raw_tag = parse_tag(tag).ok_or(PoolQueryError::InvalidTag)?;
     let index = prepare_index(engine, walk.into())?;
-    Ok(collect_tag(&index, raw_tag, filter))
+    Ok(PoolAnswer {
+        found: collect_tag(&index, raw_tag, filter),
+        walk: report_of(&index),
+    })
 }
 
 fn collect_tag(index: &PoolIndex, raw_tag: u32, filter: Option<PoolPageFilter>) -> Vec<PoolSpan> {
@@ -382,9 +404,12 @@ pub fn chunk_at(
     engine: &DebugEngine,
     address: u64,
     walk: impl Into<PoolWalk>,
-) -> Result<Option<PoolNeighbourhood>, PoolQueryError> {
+) -> Result<PoolAnswer<Option<PoolNeighbourhood>>, PoolQueryError> {
     let index = prepare_index(engine, walk.into())?;
-    Ok(neighbourhood_at(&index, address))
+    Ok(PoolAnswer {
+        found: neighbourhood_at(&index, address),
+        walk: report_of(&index),
+    })
 }
 
 fn neighbourhood_at(index: &PoolIndex, address: u64) -> Option<PoolNeighbourhood> {
@@ -434,9 +459,12 @@ fn neighbourhood_at(index: &PoolIndex, address: u64) -> Option<PoolNeighbourhood
 pub fn tag_census(
     engine: &DebugEngine,
     walk: impl Into<PoolWalk>,
-) -> Result<Vec<PoolTagSummary>, PoolQueryError> {
+) -> Result<PoolAnswer<Vec<PoolTagSummary>>, PoolQueryError> {
     let index = prepare_index(engine, walk.into())?;
-    Ok(summarize_tags(&index))
+    Ok(PoolAnswer {
+        found: summarize_tags(&index),
+        walk: report_of(&index),
+    })
 }
 
 fn summarize_tags(index: &PoolIndex) -> Vec<PoolTagSummary> {
