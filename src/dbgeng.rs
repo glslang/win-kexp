@@ -15,7 +15,7 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_BREAKPOINT_ONE_SHOT, DEBUG_CLASS_KERNEL, DEBUG_ENGOPT_INITIAL_BREAK,
     DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_INTERRUPT_ACTIVE, DEBUG_KERNEL_SMALL_DUMP,
     DEBUG_MODULE_PARAMETERS, DEBUG_MODULE_USER_MODE, DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL,
-    DEBUG_REGISTER_DESCRIPTION, DEBUG_REGISTER_SUB_REGISTER, DEBUG_STATUS_GO,
+    DEBUG_REGISTER_DESCRIPTION, DEBUG_REGISTER_SUB_REGISTER, DEBUG_STACK_FRAME, DEBUG_STATUS_GO,
     DEBUG_STATUS_NO_DEBUGGEE, DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED,
     DEBUG_SYMTYPE_DIA, DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_NONE, DEBUG_SYMTYPE_PDB,
     DEBUG_SYMTYPE_SYM, DEBUG_VALUE, DEBUG_VALUE_FLOAT32, DEBUG_VALUE_FLOAT64, DEBUG_VALUE_FLOAT80,
@@ -23,6 +23,7 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_VALUE_INT32, DEBUG_VALUE_INT64, DEBUG_VALUE_VECTOR64, DEBUG_VALUE_VECTOR128,
     IDebugBreakpoint, IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
     IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugRegisters, IDebugSymbols3,
+    IDebugSystemObjects,
 };
 
 /// Callback type for breakpoint events that receives the breakpoint, context, and flags
@@ -91,6 +92,13 @@ pub enum DbgEngError {
     #[error("debugger text contains an interior NUL")]
     InvalidOutput,
 }
+
+/// Fallback length of `_EPROCESS::ImageFileName` when the field's own size cannot be read.
+///
+/// 15 bytes on every Windows version this can attach to. Only reached when symbols answer the
+/// field's *offset* but not its type, which should not happen — it is here so that a partial
+/// symbol answer produces a slightly short name rather than no name at all.
+const EPROCESS_IMAGE_NAME_LEN: u32 = 15;
 
 /// `CreateProcess` flag: debug only the launched process, not its children.
 const DEBUG_ONLY_THIS_PROCESS: u32 = 0x0000_0002;
@@ -362,6 +370,37 @@ impl Module {
     pub fn end(&self) -> u64 {
         self.base.saturating_add(u64::from(self.size))
     }
+}
+
+/// The bug check a target stopped on, as [`DebugEngine::bug_check`] reports it.
+///
+/// The engine's own five values and nothing else: what each parameter *means* is per-code lore
+/// that lives in `!analyze`'s tables, not in the engine, so it is not invented here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BugCheck {
+    /// The bug check code — `0x9f` for `DRIVER_POWER_STATE_FAILURE`.
+    pub code: u32,
+    /// The four parameters, in the order the bug check screen and `!analyze` print them as
+    /// `Arg1`..`Arg4`.
+    pub parameters: [u64; 4],
+}
+
+/// One frame of a stack walk, as [`DebugEngine::stack_frames`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackFrame {
+    /// Its position in the walk: 0 is the innermost frame, where the target is stopped.
+    pub index: u32,
+    /// The instruction this frame is executing at — the address a symbol or `module+RVA` is
+    /// resolved from.
+    pub instruction_offset: u64,
+    pub return_offset: u64,
+    pub frame_offset: u64,
+    pub stack_offset: u64,
+    /// `module!Symbol` as the engine resolves [`Self::instruction_offset`], or `None` when
+    /// nothing resolves — the normal case for a driver with no PDB.
+    pub symbol: Option<String>,
+    /// How far past [`Self::symbol`] the instruction is; zero when there is no symbol.
+    pub displacement: u64,
 }
 
 /// What kind of event a breakpoint watches for.
@@ -1573,46 +1612,255 @@ impl DebugEngine {
 
         let mut out = Vec::with_capacity(loaded as usize);
         for (index, params) in params.iter().enumerate() {
-            let index = index as u32;
-            let mut name = String::new();
-            let mut image_name = String::new();
-            let mut loaded_image_name = String::new();
-            // Names come back in a single call with three buffers, each optional. Sized from the
-            // parameters above rather than from a guess, because a loaded-image name is a full
-            // path and truncating it silently would be worse than not reporting it.
-            let mut name_buffer = vec![0u8; params.ModuleNameSize.max(1) as usize];
-            let mut image_buffer = vec![0u8; params.ImageNameSize.max(1) as usize];
-            let mut loaded_buffer = vec![0u8; params.LoadedImageNameSize.max(1) as usize];
-            let named = unsafe {
-                self.symbols.GetModuleNames(
-                    index,
-                    0,
-                    Some(&mut image_buffer),
-                    None,
-                    Some(&mut name_buffer),
-                    None,
-                    Some(&mut loaded_buffer),
-                    None,
-                )
-            };
-            if named.is_ok() {
-                name = nul_terminated(&name_buffer);
-                image_name = nul_terminated(&image_buffer);
-                loaded_image_name = nul_terminated(&loaded_buffer);
-            }
-            out.push(Module {
-                base: params.Base,
-                size: params.Size,
-                name,
-                image_name,
-                loaded_image_name,
-                timestamp: params.TimeDateStamp,
-                checksum: params.Checksum,
-                symbols: SymbolKind::from_engine(params.SymbolType),
-                user_mode: params.Flags & DEBUG_MODULE_USER_MODE != 0,
-            });
+            out.push(self.named_module(index as u32, params));
         }
         Ok(out)
+    }
+
+    /// The module holding `address`, or `None` if the address is in no loaded module.
+    ///
+    /// `None` is the ordinary answer, not a failure: a stack frame can point into a driver that
+    /// was unloaded before the dump was written, or into pool. So the engine's "no module here"
+    /// is reported as an absent module rather than as an error, and only a call that actually
+    /// broke comes back as one.
+    ///
+    /// Asked of the engine (`GetModuleByOffset`) rather than answered by scanning
+    /// [`Self::modules`], because these are not the same question: the engine's own containment
+    /// test is what `module!Symbol` is resolved with, and a scan would additionally have to
+    /// decide what to do about the modules whose ranges overlap. It is also much less work when
+    /// the caller has a handful of addresses rather than a need for the whole table.
+    pub fn module_at(&self, address: u64) -> Result<Option<Module>, DbgEngError> {
+        let mut index = 0u32;
+        let found = unsafe {
+            self.symbols
+                .GetModuleByOffset(address, 0, Some(&mut index), None)
+        }
+        .is_ok();
+        if !found {
+            return Ok(None);
+        }
+        let mut params = DEBUG_MODULE_PARAMETERS::default();
+        // `Count = 1, Start = index`: the parameters for that one module.
+        unsafe {
+            self.symbols
+                .GetModuleParameters(1, None, index, &mut params)
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: format!("reading the parameters of the module at {address:#x}"),
+            source,
+        })?;
+        Ok(Some(self.named_module(index, &params)))
+    }
+
+    /// Fills in a [`Module`]'s names from the engine, given parameters already read for it.
+    ///
+    /// Infallible by design: the parameters carry everything structural (base, size, symbol
+    /// state), so a module whose *names* cannot be read is still a module, reported with empty
+    /// name fields rather than dropped from the table or turned into an error.
+    fn named_module(&self, index: u32, params: &DEBUG_MODULE_PARAMETERS) -> Module {
+        let mut name = String::new();
+        let mut image_name = String::new();
+        let mut loaded_image_name = String::new();
+        // Names come back in a single call with three buffers, each optional. Sized from the
+        // parameters above rather than from a guess, because a loaded-image name is a full
+        // path and truncating it silently would be worse than not reporting it.
+        let mut name_buffer = vec![0u8; params.ModuleNameSize.max(1) as usize];
+        let mut image_buffer = vec![0u8; params.ImageNameSize.max(1) as usize];
+        let mut loaded_buffer = vec![0u8; params.LoadedImageNameSize.max(1) as usize];
+        let named = unsafe {
+            self.symbols.GetModuleNames(
+                index,
+                0,
+                Some(&mut image_buffer),
+                None,
+                Some(&mut name_buffer),
+                None,
+                Some(&mut loaded_buffer),
+                None,
+            )
+        };
+        if named.is_ok() {
+            name = nul_terminated(&name_buffer);
+            image_name = nul_terminated(&image_buffer);
+            loaded_image_name = nul_terminated(&loaded_buffer);
+        }
+        Module {
+            base: params.Base,
+            size: params.Size,
+            name,
+            image_name,
+            loaded_image_name,
+            timestamp: params.TimeDateStamp,
+            checksum: params.Checksum,
+            symbols: SymbolKind::from_engine(params.SymbolType),
+            user_mode: params.Flags & DEBUG_MODULE_USER_MODE != 0,
+        }
+    }
+
+    /// The bug check this target stopped on, or `None` if it did not stop on one.
+    ///
+    /// `None` covers the two ordinary cases together — a live kernel simply broken into, and a
+    /// kernel dump that is not a crash dump — because the engine reports both the same way: code
+    /// zero, which is not a bug check code. Distinguishing them is a question about the *target*,
+    /// not about this call.
+    ///
+    /// Fails on a user-mode target, where the engine has no bug check data to read at all. That
+    /// is deliberately an error rather than `None`: "this process did not bug check" is not a
+    /// fact about a process, and a caller that treats it as one is asking the wrong tool.
+    pub fn bug_check(&self) -> Result<Option<BugCheck>, DbgEngError> {
+        let mut code = 0u32;
+        let mut parameters = [0u64; 4];
+        let [arg1, arg2, arg3, arg4] = &mut parameters;
+        unsafe {
+            self.control
+                .ReadBugCheckData(&mut code, arg1, arg2, arg3, arg4)
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: "reading the target's bug check data".into(),
+            source,
+        })?;
+        if code == 0 {
+            return Ok(None);
+        }
+        Ok(Some(BugCheck { code, parameters }))
+    }
+
+    /// The current thread's stack, read through `IDebugControl` — what `k` renders, as data.
+    ///
+    /// Walked from the current context (`GetStackTrace` with zero offsets), so on a crash dump
+    /// this is the stack of the thread the dump was written for, and on a live target the stack
+    /// of whatever the engine is stopped in.
+    ///
+    /// Each frame carries the symbol the engine resolves its instruction pointer to, split into
+    /// the `module!Symbol` name and the displacement past it. Both are `None`/zero rather than
+    /// invented when nothing resolves — a driver with no PDB is exactly the case a caller needs
+    /// to detect, so that it can fall back to `module+RVA` from [`Self::module_at`].
+    ///
+    /// `max_frames` bounds the walk. Zero frames is a legitimate ask and returns an empty stack
+    /// without touching the engine.
+    pub fn stack_frames(&self, max_frames: usize) -> Result<Vec<StackFrame>, DbgEngError> {
+        if max_frames == 0 {
+            return Ok(Vec::new());
+        }
+        let mut raw = vec![DEBUG_STACK_FRAME::default(); max_frames];
+        let mut filled = 0u32;
+        // Zero for all three offsets means "walk from the current register context", which is
+        // what `k` does. Supplying them explicitly is for walking a stack that is not the
+        // current one, which is a different question than this answers.
+        unsafe {
+            self.control
+                .GetStackTrace(0, 0, 0, &mut raw, Some(&mut filled))
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: "walking the current thread's stack".into(),
+            source,
+        })?;
+        // Clamped to the buffer as well as to what the engine says it filled: `filled` is the
+        // engine's own count, and trusting it past the allocation would be a trust decision this
+        // does not need to make.
+        raw.truncate((filled as usize).min(max_frames));
+        Ok(raw
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let (symbol, displacement) = self.symbol_at(frame.InstructionOffset);
+                StackFrame {
+                    index: index as u32,
+                    instruction_offset: frame.InstructionOffset,
+                    return_offset: frame.ReturnOffset,
+                    frame_offset: frame.FrameOffset,
+                    stack_offset: frame.StackOffset,
+                    symbol,
+                    displacement,
+                }
+            })
+            .collect())
+    }
+
+    /// The `module!Symbol` an address resolves to and how far past it the address is.
+    ///
+    /// Infallible: an address that resolves to nothing is the normal case for a module without
+    /// symbols, and reporting it as a failure would make every unsymbolised frame fail a stack
+    /// walk that is otherwise perfectly good.
+    fn symbol_at(&self, address: u64) -> (Option<String>, u64) {
+        let mut displacement = 0u64;
+        let name = read_engine_string(|buffer, size| unsafe {
+            self.symbols
+                .GetNameByOffset(address, buffer, size, Some(&mut displacement))
+        });
+        match name {
+            Ok(name) if !name.is_empty() => (Some(name), displacement),
+            _ => (None, 0),
+        }
+    }
+
+    /// The image name of the process the engine's context is currently in — what a bug check
+    /// screen and `!analyze` call `PROCESS_NAME`.
+    ///
+    /// **Two different reads, because "the current process" means two different things.** On a
+    /// user-mode target it is the debuggee, and the engine names it directly. On a kernel target
+    /// `GetCurrentProcessExecutableName` answers with the *kernel image* — `ntkrnlmp.exe`, for
+    /// every process there has ever been — which is not an answer, so the name is read out of the
+    /// current `_EPROCESS` instead, exactly where `!analyze` reads it.
+    ///
+    /// The kernel path therefore needs symbols for `nt`. Without them it fails rather than
+    /// falling back to the executable name: `ntkrnlmp.exe` presented as the crashing process is
+    /// worse than no answer, because it looks like one.
+    pub fn current_process_name(&self) -> Result<String, DbgEngError> {
+        let system: IDebugSystemObjects =
+            self.client.cast().map_err(|source| DbgEngError::Context {
+                operation: "querying IDebugSystemObjects".into(),
+                source,
+            })?;
+        if !self.is_kernel_target()? {
+            return read_engine_string(|buffer, size| unsafe {
+                system.GetCurrentProcessExecutableName(buffer, size)
+            })
+            .map_err(|source| DbgEngError::Context {
+                operation: "reading the current process's image name".into(),
+                source,
+            });
+        }
+        // On a kernel target the "process data offset" is the current `_EPROCESS`.
+        let process = unsafe { system.GetCurrentProcessDataOffset() }.map_err(|source| {
+            DbgEngError::Context {
+                operation: "locating the current process's EPROCESS".into(),
+                source,
+            }
+        })?;
+        let nt = self.kernel_base()?;
+        let eprocess = self.type_id(nt, "_EPROCESS")?;
+        let offset = self.field_offset(nt, eprocess, "ImageFileName")?;
+        // `ImageFileName` is a fixed 15-byte array, NUL-padded rather than NUL-terminated: a name
+        // that fills it has no terminator at all, which is why the length is read from the type
+        // and the result cut at the first NUL rather than parsed as a C string.
+        let size = self
+            .field_size(nt, eprocess, "ImageFileName")
+            .unwrap_or(EPROCESS_IMAGE_NAME_LEN) as usize;
+        let raw = self.read_memory(process.saturating_add(u64::from(offset)), size)?;
+        Ok(nul_terminated(&raw))
+    }
+
+    /// The size of one field of a type, for a field whose length is part of its meaning.
+    ///
+    /// Best-effort — `None` rather than an error — because every caller has something sensible to
+    /// do without it, and a type this build cannot measure is not a reason to fail a read whose
+    /// offset resolved fine.
+    fn field_size(&self, module: u64, type_id: u32, field: &str) -> Option<u32> {
+        let name = CString::new(field).ok()?;
+        let mut field_type = 0u32;
+        let mut offset = 0u32;
+        unsafe {
+            self.symbols.GetFieldTypeAndOffset(
+                module,
+                type_id,
+                PCSTR::from_raw(name.as_ptr().cast()),
+                Some(&mut field_type),
+                Some(&mut offset),
+            )
+        }
+        .ok()?;
+        self.type_size(module, field_type).ok()
     }
 
     /// Every breakpoint the engine holds, read through `IDebugControl` — what `bl` renders, as
