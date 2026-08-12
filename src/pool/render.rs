@@ -410,6 +410,7 @@ mod tests {
         let index = PoolIndex::build(PoolSnapshot {
             spans,
             complete: true,
+            budget_expired: false,
             diagnostics: PoolDiagnostics::from_iter([
                 "per-session paged heaps are not included".to_string()
             ]),
@@ -500,6 +501,7 @@ mod tests {
         let many_index = PoolIndex::build(PoolSnapshot {
             spans: many,
             complete: true,
+            budget_expired: false,
             diagnostics: PoolDiagnostics::default(),
         });
         let dml_chunks = render_pool_map(

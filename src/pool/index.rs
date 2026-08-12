@@ -29,6 +29,10 @@ pub(crate) struct PoolIndex {
     /// diagnostic — `walk_vs` clears it when a readable region stops mid-chunk — and a
     /// caller that sees only counts and diagnostics would read that as a healthy result.
     pub complete: bool,
+    /// Carried through from [`PoolSnapshot::budget_expired`] for the same reason `complete` is:
+    /// an index that outlives the walk is the only thing a caller ever sees, so a reason left
+    /// behind here is a reason nobody can recover.
+    pub budget_expired: bool,
     row_postings: HashMap<RowIdentity, Vec<usize>>,
     span_rows: Vec<RowIdentity>,
 }
@@ -77,6 +81,7 @@ impl PoolIndex {
             postings,
             diagnostics: snapshot.diagnostics,
             complete: snapshot.complete,
+            budget_expired: snapshot.budget_expired,
             row_postings,
             span_rows,
         }
@@ -188,14 +193,17 @@ pub(crate) struct SnapshotCache {
 }
 
 impl SnapshotCache {
-    pub(crate) fn get_or_refresh<F>(
+    /// Generic over the builder's error so a walk's failure reaches the caller as itself.
+    /// Pinning it to `String` here is what flattened an *interrupt* into "walking the pool
+    /// failed" — a cache has no business deciding how a failure reads.
+    pub(crate) fn get_or_refresh<F, E>(
         &self,
         key: super::layout::SessionKey,
         refresh: bool,
         build: F,
-    ) -> Result<PoolIndex, String>
+    ) -> Result<PoolIndex, E>
     where
-        F: FnOnce() -> Result<PoolSnapshot, String>,
+        F: FnOnce() -> Result<PoolSnapshot, E>,
     {
         // A forced refresh supersedes the cached view even if rebuilding fails or
         // is interrupted. Never fall back to geometry the user explicitly replaced.
@@ -264,6 +272,7 @@ mod tests {
                 span(0x1080, tag, PoolState::Allocated, 2),
             ],
             complete: true,
+            budget_expired: false,
             diagnostics: PoolDiagnostics::default(),
         };
         let index = PoolIndex::build(snapshot.clone());
@@ -286,6 +295,7 @@ mod tests {
                 span(0x1080, other, PoolState::Allocated, 1),
             ],
             complete: true,
+            budget_expired: false,
             diagnostics: PoolDiagnostics::default(),
         });
         assert_eq!(contextual.context_for_tag(tag), vec![0, 1, 2, 3, 4]);
@@ -300,7 +310,10 @@ mod tests {
         };
         let cache = SnapshotCache::default();
         let builds = AtomicUsize::new(0);
-        let make = || {
+        // The error type is never produced here, only named: `get_or_refresh` is generic
+        // over it now, so a builder that cannot fail still has to say what failing would look
+        // like.
+        let make = || -> Result<PoolSnapshot, String> {
             builds.fetch_add(1, Ordering::SeqCst);
             Ok(snapshot.clone())
         };
@@ -315,7 +328,7 @@ mod tests {
         assert_eq!(builds.load(Ordering::SeqCst), 4);
 
         let incomplete_builds = AtomicUsize::new(0);
-        let make_incomplete = || {
+        let make_incomplete = || -> Result<PoolSnapshot, String> {
             incomplete_builds.fetch_add(1, Ordering::SeqCst);
             let mut value = snapshot.clone();
             value.complete = false;
@@ -339,7 +352,8 @@ mod tests {
         assert_eq!(builds.load(Ordering::SeqCst), 6);
         assert_eq!(incomplete_builds.load(Ordering::SeqCst), 3);
 
-        let failed_refresh = cache.get_or_refresh(session(10), true, || Err("interrupted".into()));
+        let failed_refresh: Result<PoolIndex, String> =
+            cache.get_or_refresh(session(10), true, || Err("interrupted".into()));
         assert_eq!(failed_refresh.unwrap_err(), "interrupted");
         cache.get_or_refresh(session(10), false, make).unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 7);

@@ -21,7 +21,7 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
 use super::decode::parse_tag;
 use super::index::{PoolIndex, SnapshotCache};
 use super::layout::{LayoutCache, SessionKey};
-use super::snapshot::SnapshotWalker;
+use super::snapshot::{SnapshotError, SnapshotWalker};
 use super::{PoolDiagnostics, PoolSpan, PoolState};
 use crate::dbgeng::{DbgEngError, DebugEngine};
 
@@ -82,6 +82,14 @@ pub enum PoolQueryError {
 
     #[error("resolving pool layout failed: {0}")]
     Layout(String),
+
+    /// The walk was stopped on request (Ctrl+C / `SetInterrupt`) and its snapshot discarded.
+    ///
+    /// Its own variant rather than a [`Self::Walk`] string because it is not a failure of the
+    /// walk at all: somebody asked for it to stop, and a host that reports "walking the pool
+    /// failed" for an interrupt it raised itself is telling its user the target is broken.
+    #[error("the pool walk was interrupted on request")]
+    Interrupted,
 
     #[error("walking the pool failed: {0}")]
     Walk(String),
@@ -201,18 +209,44 @@ pub struct PoolTagSummary {
 pub struct PoolSnapshotReport {
     pub total_chunks: usize,
     pub allocated_chunks: usize,
-    /// Whether the walk covered everything it set out to.
-    ///
-    /// Not implied by an empty `diagnostics`: a walk can end incomplete without saying
-    /// anything — `walk_vs` clears it when a readable region stops mid-chunk. A caller
-    /// that wants to reject partial results has to consult this, not the diagnostics.
-    pub complete: bool,
+    /// How much of the pool the walk actually covered, and — when it fell short — what stopped
+    /// it. See [`WalkCoverage`]; [`WalkCoverage::complete`] is the plain bool.
+    pub coverage: WalkCoverage,
     /// What the walk complained about, grouped by shape.
     ///
     /// Ask it for [`PoolDiagnostics::emitted`] when reporting how much the walk complained:
     /// the messages it carries verbatim are a capped sample, so counting them measures the
     /// cap rather than the target.
     pub diagnostics: PoolDiagnostics,
+}
+
+/// How much of the pool a walk covered.
+///
+/// A count taken from a partial walk is a floor, not a total, so every answer built on a
+/// snapshot has to be able to say which of these it came from — and "not complete" alone is not
+/// enough, because the two ways of falling short need opposite responses from the caller.
+///
+/// Not implied by the diagnostics: a walk can end incomplete without saying anything (`walk_vs`
+/// clears completeness when a readable region stops mid-chunk), so a caller that wants to reject
+/// partial results consults this and not the message list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkCoverage {
+    /// The walk covered everything it set out to.
+    Complete,
+    /// It stopped early because its **deadline** passed. What it reached was really there;
+    /// what is missing is unknown rather than absent, and a longer budget reaches more of it.
+    BudgetExpired,
+    /// It ran to the end without covering all of it — unreadable regions, a region that stopped
+    /// mid-chunk, a traversal cap. The diagnostics say which. Unlike [`Self::BudgetExpired`],
+    /// more time changes nothing.
+    Partial,
+}
+
+impl WalkCoverage {
+    /// Whether the walk covered everything it set out to.
+    pub fn complete(self) -> bool {
+        self == Self::Complete
+    }
 }
 
 /// Summarises the cached snapshot: how much was walked, and what the walk could not do.
@@ -232,7 +266,13 @@ fn report_of(index: &PoolIndex) -> PoolSnapshotReport {
             .iter()
             .filter(|span| span.state == PoolState::Allocated)
             .count(),
-        complete: index.complete,
+        // Computed in one place, from the walk's own two bits, so no caller has to know that
+        // "incomplete" has more than one cause — or invent the distinction from the diagnostics.
+        coverage: match (index.complete, index.budget_expired) {
+            (true, _) => WalkCoverage::Complete,
+            (false, true) => WalkCoverage::BudgetExpired,
+            (false, false) => WalkCoverage::Partial,
+        },
         diagnostics: index.diagnostics.clone(),
     }
 }
@@ -291,9 +331,14 @@ pub(crate) fn prepare_index(
                 traversal_limit: 1_000_000,
             }
             .walk(walk.budget)
-            .map_err(|error| error.to_string())
         })
-        .map_err(PoolQueryError::Walk)
+        // Mapped from the walk's own error type rather than from a string it was flattened
+        // into: an interrupt is the one stop here that is not a failure, and a `to_string()`
+        // at the cache boundary is where that used to be lost.
+        .map_err(|error| match error {
+            SnapshotError::Interrupted => PoolQueryError::Interrupted,
+            other => PoolQueryError::Walk(other.to_string()),
+        })
 }
 
 /// Every *allocated* chunk carrying `tag` (1..4 ASCII bytes, e.g. `"Tgsm"`).
@@ -448,6 +493,7 @@ mod tests {
             spans,
             diagnostics: PoolDiagnostics::default(),
             complete: true,
+            budget_expired: false,
         })
     }
 
@@ -611,6 +657,7 @@ mod tests {
             spans: Vec::new(),
             diagnostics: PoolDiagnostics::from_iter(["cannot read pool node 0 heap 2".to_string()]),
             complete: false,
+            budget_expired: false,
         });
         let report = report_of(&index);
         assert_eq!(report.total_chunks, 0);
@@ -620,6 +667,33 @@ mod tests {
             ["cannot read pool node 0 heap 2"]
         );
         assert_eq!(report.diagnostics.emitted(), 1);
+    }
+
+    /// The three ways a walk can end are three values, and the two that fall short are not
+    /// the same answer.
+    ///
+    /// A caller reads them for opposite reasons: `BudgetExpired` says "ask again with more
+    /// time and you will see more"; `Partial` says "this is all there is to see, however long
+    /// you wait". Collapsing both into `complete: false` — which is what this replaced — makes
+    /// the difference unrecoverable, because by the time anyone holds the snapshot both look
+    /// like a short list.
+    #[test]
+    fn test_coverage_says_which_way_a_walk_fell_short() {
+        let walked = |complete, budget_expired| {
+            report_of(&PoolIndex::build(crate::pool::PoolSnapshot {
+                spans: Vec::new(),
+                diagnostics: PoolDiagnostics::default(),
+                complete,
+                budget_expired,
+            }))
+            .coverage
+        };
+        assert_eq!(walked(true, false), WalkCoverage::Complete);
+        assert_eq!(walked(false, true), WalkCoverage::BudgetExpired);
+        assert_eq!(walked(false, false), WalkCoverage::Partial);
+        assert!(WalkCoverage::Complete.complete());
+        assert!(!WalkCoverage::BudgetExpired.complete());
+        assert!(!WalkCoverage::Partial.complete());
     }
 
     #[test]

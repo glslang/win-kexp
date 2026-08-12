@@ -1584,6 +1584,15 @@ pub(crate) struct PoolSnapshot {
     pub spans: Vec<PoolSpan>,
     pub diagnostics: PoolDiagnostics,
     pub complete: bool,
+    /// Whether what stopped this walk short was its **deadline** rather than anything it found.
+    ///
+    /// `complete` says a walk did not cover the pool; this says why, and the two answers need
+    /// opposite responses. A walk that ran out of time reaches more of the pool if it is given
+    /// more of it; one that hit unreadable regions or a traversal cap will report the same gaps
+    /// however long it runs. Only the walk itself can tell them apart — by the time a caller has
+    /// the snapshot, both look like a short list — so the reason travels as a field rather than
+    /// being inferred downstream from the diagnostic it also writes.
+    pub budget_expired: bool,
 }
 
 pub(crate) struct SnapshotWalker<'a, M> {
@@ -1781,6 +1790,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
 
         if expired {
             snapshot.complete = false;
+            snapshot.budget_expired = true;
             let allowed = match budget {
                 Some(budget) => format!("{budget:?} budget"),
                 None => "walk budget".to_string(),
@@ -2342,6 +2352,7 @@ mod tests {
             spans: Vec::new(),
             diagnostics: PoolDiagnostics::default(),
             complete: true,
+            budget_expired: false,
         };
         walker.walk_lfh(&region, 0x1f80, &memory.bytes, &mut snapshot);
 

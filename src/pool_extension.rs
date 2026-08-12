@@ -160,11 +160,14 @@ fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
             PoolFilter::Paged => span.pool_kind.is_paged(),
             PoolFilter::NonPaged => !span.pool_kind.is_paged(),
         });
-        // Rebuild postings after retaining spans while keeping their local context.
+        // Rebuild postings after retaining spans while keeping their local context — and
+        // keeping how much of the pool the walk covered, which is a property of the walk and
+        // not of the filter applied to its result.
         let snapshot = crate::pool::PoolSnapshot {
+            complete: filtered.complete,
+            budget_expired: filtered.budget_expired,
             spans: filtered.spans,
             diagnostics: filtered.diagnostics,
-            complete: true,
         };
         filtered = crate::pool::PoolIndex::build(snapshot);
     }
