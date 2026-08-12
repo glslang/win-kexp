@@ -11,9 +11,16 @@ use windows::core::{HRESULT, IUnknown, Interface, PCSTR, PCWSTR, PWSTR};
 // Import the necessary Windows Debug Engine interfaces
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_ANY_ID, DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_ATTACH_LOCAL_KERNEL, DEBUG_BREAKPOINT_CODE,
-    DEBUG_BREAKPOINT_ENABLED, DEBUG_CLASS_KERNEL, DEBUG_ENGOPT_INITIAL_BREAK,
+    DEBUG_BREAKPOINT_DATA, DEBUG_BREAKPOINT_DEFERRED, DEBUG_BREAKPOINT_ENABLED,
+    DEBUG_BREAKPOINT_ONE_SHOT, DEBUG_CLASS_KERNEL, DEBUG_ENGOPT_INITIAL_BREAK,
     DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_INTERRUPT_ACTIVE, DEBUG_KERNEL_SMALL_DUMP,
-    DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL, DEBUG_STATUS_GO, DEBUG_STATUS_NO_DEBUGGEE,
+    DEBUG_MODULE_PARAMETERS, DEBUG_MODULE_USER_MODE, DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL,
+    DEBUG_REGISTER_DESCRIPTION, DEBUG_REGISTER_SUB_REGISTER, DEBUG_STATUS_GO,
+    DEBUG_STATUS_NO_DEBUGGEE, DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED,
+    DEBUG_SYMTYPE_DIA, DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_NONE, DEBUG_SYMTYPE_PDB,
+    DEBUG_SYMTYPE_SYM, DEBUG_VALUE, DEBUG_VALUE_FLOAT32, DEBUG_VALUE_FLOAT64, DEBUG_VALUE_FLOAT80,
+    DEBUG_VALUE_FLOAT82, DEBUG_VALUE_FLOAT128, DEBUG_VALUE_INT8, DEBUG_VALUE_INT16,
+    DEBUG_VALUE_INT32, DEBUG_VALUE_INT64, DEBUG_VALUE_VECTOR64, DEBUG_VALUE_VECTOR128,
     IDebugBreakpoint, IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
     IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugRegisters, IDebugSymbols3,
 };
@@ -230,6 +237,207 @@ impl CommandRun {
     pub fn into_output(self) -> String {
         self.output
     }
+}
+
+/// `DEBUG_INVALID_OFFSET` from `dbgeng.h`: the engine's "there is no address here".
+///
+/// Spelled out because the `windows` crate does not generate it, and the value matters — a
+/// breakpoint reporting it is one that has not resolved, which is not the same as one at zero.
+const DEBUG_INVALID_OFFSET: u64 = u64::MAX;
+
+/// What one register holds, decoded from the engine's tagged union.
+///
+/// `DEBUG_VALUE` is a union plus a `Type` discriminant, and reading the wrong arm is not a
+/// compile error or even a runtime one — it is a plausible-looking number. So the tag is read
+/// once, here, and each arm keeps a shape it can hold losslessly: the wide floats and the vector
+/// registers stay as bytes rather than being squeezed into an `f64` that cannot represent them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RegisterValue {
+    /// An integer register, zero-extended to 64 bits from whatever width the engine reported.
+    Int(u64),
+    /// A floating-point register narrow enough to be exact in an `f64` (`f32`/`f64`).
+    Float(f64),
+    /// An x87 (80/82/128-bit) or vector (`xmm`/`ymm`) register, in the engine's byte order.
+    /// Kept raw because there is no scalar to narrow it to without losing part of it.
+    Bytes(Vec<u8>),
+    /// The engine holds no value for this register in this target — a minidump without
+    /// floating-point state reads this way — or reported a type this build does not decode.
+    Unavailable,
+}
+
+impl RegisterValue {
+    /// Decodes one `DEBUG_VALUE` by its own tag.
+    fn decode(value: &DEBUG_VALUE) -> Self {
+        // SAFETY: every read below is of the arm `value.Type` names, which is the contract
+        // `DEBUG_VALUE` is defined by, and the engine fills the whole struct. An unrecognised
+        // tag reads no arm at all.
+        unsafe {
+            match value.Type {
+                DEBUG_VALUE_INT8 => Self::Int(u64::from(value.Anonymous.I8)),
+                DEBUG_VALUE_INT16 => Self::Int(u64::from(value.Anonymous.I16)),
+                DEBUG_VALUE_INT32 => Self::Int(u64::from(value.Anonymous.I32)),
+                DEBUG_VALUE_INT64 => Self::Int(value.Anonymous.Anonymous.I64),
+                DEBUG_VALUE_FLOAT32 => Self::Float(f64::from(value.Anonymous.F32)),
+                DEBUG_VALUE_FLOAT64 => Self::Float(value.Anonymous.F64),
+                DEBUG_VALUE_FLOAT80 => Self::Bytes(value.Anonymous.F80Bytes.to_vec()),
+                DEBUG_VALUE_FLOAT82 => Self::Bytes(value.Anonymous.F82Bytes.to_vec()),
+                DEBUG_VALUE_FLOAT128 => Self::Bytes(value.Anonymous.F128Bytes.to_vec()),
+                DEBUG_VALUE_VECTOR64 => Self::Bytes(value.Anonymous.VI8[..8].to_vec()),
+                DEBUG_VALUE_VECTOR128 => Self::Bytes(value.Anonymous.VI8.to_vec()),
+                _ => Self::Unavailable,
+            }
+        }
+    }
+}
+
+/// One register of the target's context, as [`DebugEngine::register_values`] reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Register {
+    /// The engine's own name for it, lowercase (`rax`, `xmm0`, `cs`, `efl`).
+    pub name: String,
+    pub value: RegisterValue,
+    /// Whether this register is a *view* of another rather than storage of its own — `eax`
+    /// within `rax`, `al` within `ax`. Reported rather than filtered because which of the two a
+    /// caller wants depends entirely on what they are doing.
+    pub subregister: bool,
+}
+
+/// How much symbol information the engine has for a module — the `lm` "symbols" column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolKind {
+    /// No symbols at all.
+    None,
+    /// Symbols have not been loaded yet; the engine will fetch them when something needs them.
+    /// The most consequential value here, because it is *not* a statement that symbols are
+    /// missing — a `deferred` module usually resolves fine on first use.
+    Deferred,
+    Coff,
+    CodeView,
+    Pdb,
+    /// Names taken from the image's export table: enough for `module!Export`, nothing more.
+    Export,
+    Sym,
+    Dia,
+    /// A symbol type this build does not name, kept as the engine's own code rather than
+    /// flattened into `None` — which would read as "no symbols" for something that has them.
+    Other(u32),
+}
+
+impl SymbolKind {
+    fn from_engine(code: u32) -> Self {
+        match code {
+            DEBUG_SYMTYPE_NONE => Self::None,
+            DEBUG_SYMTYPE_COFF => Self::Coff,
+            DEBUG_SYMTYPE_CODEVIEW => Self::CodeView,
+            DEBUG_SYMTYPE_PDB => Self::Pdb,
+            DEBUG_SYMTYPE_EXPORT => Self::Export,
+            DEBUG_SYMTYPE_DEFERRED => Self::Deferred,
+            DEBUG_SYMTYPE_SYM => Self::Sym,
+            DEBUG_SYMTYPE_DIA => Self::Dia,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// One loaded module, as [`DebugEngine::modules`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Module {
+    pub base: u64,
+    pub size: u32,
+    /// The name symbols are qualified by — the `nt` in `nt!KeBugCheckEx`.
+    pub name: String,
+    /// The image's own name (`ntkrnlmp.exe`).
+    pub image_name: String,
+    /// The path the engine loaded the image from, where it has one.
+    pub loaded_image_name: String,
+    pub timestamp: u32,
+    pub checksum: u32,
+    pub symbols: SymbolKind,
+    /// Whether this is a user-mode module. On a kernel target both kinds can be present.
+    pub user_mode: bool,
+}
+
+impl Module {
+    /// One past the last byte of the image — the end of the `start end` pair `lm` prints.
+    pub fn end(&self) -> u64 {
+        self.base.saturating_add(u64::from(self.size))
+    }
+}
+
+/// What kind of event a breakpoint watches for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakpointKind {
+    /// Execution reaching an address (`bp`).
+    Code,
+    /// Access to a range of memory (`ba`).
+    Data,
+    /// A type this build does not name, kept as the engine's own code.
+    Other(u32),
+}
+
+impl BreakpointKind {
+    fn from_engine(code: u32) -> Self {
+        match code {
+            DEBUG_BREAKPOINT_CODE => Self::Code,
+            DEBUG_BREAKPOINT_DATA => Self::Data,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// One breakpoint the engine holds, as [`DebugEngine::breakpoints`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakpointInfo {
+    /// The id the debugger prints and `bc`/`bd`/`be` take.
+    pub id: u32,
+    pub kind: BreakpointKind,
+    /// Where it will fire, or `None` while it is [deferred](Self::deferred) — its module is not
+    /// loaded, so it has no address yet. Never zero for "unknown".
+    pub address: Option<u64>,
+    /// The expression the engine is still holding this breakpoint as — in practice a deferred
+    /// one (`hevd!Trigger+0x40` for a driver that has not loaded). A breakpoint that resolved
+    /// when it was set keeps its [address](Self::address) instead and the engine no longer holds
+    /// the text, so `None` here is the normal case for a live breakpoint, not a gap.
+    pub expression: Option<String>,
+    /// The command string the debugger runs each time it fires, where it has one.
+    pub command: Option<String>,
+    /// The thread it is restricted to, or `None` for any thread.
+    pub thread: Option<u32>,
+    pub enabled: bool,
+    /// Waiting for its module to load, and therefore not yet resolved to an address.
+    pub deferred: bool,
+    /// Removes itself the first time it fires.
+    pub one_shot: bool,
+    /// How many times it must be reached before it stops the target (1 = every time).
+    pub pass_count: u32,
+    /// How many of those passes are still to go.
+    pub passes_remaining: u32,
+}
+
+/// Reads a string out of one of DbgEng's two-call string getters.
+///
+/// They all take the same shape — a buffer, its length, and an out-parameter for the size the
+/// engine wanted — and they all truncate silently when the buffer is short. So the size is asked
+/// for first with no buffer at all, and the read that follows is exactly big enough; a name that
+/// grew between the two calls (it cannot here — nothing is running) would still be NUL-terminated
+/// rather than clipped mid-way.
+fn read_engine_string(
+    mut get: impl FnMut(Option<&mut [u8]>, Option<*mut u32>) -> windows::core::Result<()>,
+) -> windows::core::Result<String> {
+    let mut needed = 0u32;
+    get(None, Some(&mut needed))?;
+    if needed <= 1 {
+        return Ok(String::new());
+    }
+    let mut buffer = vec![0u8; needed as usize];
+    get(Some(&mut buffer), None)?;
+    Ok(nul_terminated(&buffer))
+}
+
+/// The text up to the first NUL in an engine-filled buffer.
+fn nul_terminated(buffer: &[u8]) -> String {
+    let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+    String::from_utf8_lossy(&buffer[..end]).into_owned()
 }
 
 /// Hands out a fresh identity for every engine, and again whenever one releases its
@@ -1219,13 +1427,6 @@ impl DebugEngine {
         Ok(RunToResult { outcome, output })
     }
 
-    /// The current instruction pointer, read typed via `IDebugRegisters` (no text parse).
-    fn instruction_pointer(&self) -> Result<u64, DbgEngError> {
-        let registers: IDebugRegisters =
-            self.client.cast().map_err(DbgEngError::OperationFailed)?;
-        unsafe { registers.GetInstructionOffset() }.map_err(DbgEngError::OperationFailed)
-    }
-
     pub fn create_debug_event_context_callbacks(
         callback: Option<BreakpointCallback>,
     ) -> IDebugEventContextCallbacks {
@@ -1262,6 +1463,231 @@ impl DebugEngine {
     /// Returns the current register set as formatted text (`r`).
     pub fn registers(&self) -> Result<String, DbgEngError> {
         self.execute_command("r")
+    }
+
+    /// The current register set as **values**, read through `IDebugRegisters`.
+    ///
+    /// The same registers [`Self::registers`] prints, minus the printing. `r` renders a target's
+    /// context as a paragraph — `rax=0000000000000000 rbx=…`, the flags as mnemonics, the current
+    /// instruction disassembled on the end — and a host that needs `rsp` as a number has to find
+    /// it in there. That parse is the thing this exists to delete: the widths, the grouping and
+    /// the flag spelling are all presentation, and they differ by processor, by target kind and by
+    /// engine build.
+    ///
+    /// Every register the engine knows is returned, subregisters included (`eax` as well as
+    /// `rax`), because which of those a caller wants depends on what they are doing —
+    /// [`Register::subregister`] is how they narrow it.
+    ///
+    /// A register the engine cannot produce a value for is reported as
+    /// [`RegisterValue::Unavailable`] rather than failing the call: a minidump carrying no
+    /// floating-point state answers exactly that way for `st0`–`st7`, and losing the general
+    /// registers over it would be absurd. An `Err` here means the *set* could not be read at all.
+    pub fn register_values(&self) -> Result<Vec<Register>, DbgEngError> {
+        let registers: IDebugRegisters =
+            self.client.cast().map_err(|source| DbgEngError::Context {
+                operation: "obtaining the register interface".into(),
+                source,
+            })?;
+        let count =
+            unsafe { registers.GetNumberRegisters() }.map_err(|source| DbgEngError::Context {
+                operation: "counting the target's registers".into(),
+                source,
+            })?;
+        let mut out = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let mut description = DEBUG_REGISTER_DESCRIPTION::default();
+            let name = read_engine_string(|buffer, size| unsafe {
+                registers.GetDescription(index, buffer, size, Some(&mut description))
+            })
+            .map_err(|source| DbgEngError::Context {
+                operation: format!("describing register {index}"),
+                source,
+            })?;
+            // Read one at a time rather than through `GetValues`, which fetches the whole bank in
+            // one call: a bank read fails as a unit, and the failures worth surviving here are
+            // per-register (the absent x87/vector state of a minidump). One call per register buys
+            // the granularity that makes `Unavailable` an answer instead of an error.
+            let mut value = DEBUG_VALUE::default();
+            let value = match unsafe { registers.GetValue(index, &mut value) } {
+                Ok(()) => RegisterValue::decode(&value),
+                Err(_) => RegisterValue::Unavailable,
+            };
+            out.push(Register {
+                name,
+                value,
+                subregister: description.Flags & DEBUG_REGISTER_SUB_REGISTER != 0,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The current instruction pointer, read typed via `IDebugRegisters` (no text parse).
+    ///
+    /// Public because "where is the target stopped?" is the question every host asks after
+    /// resuming one, and the alternatives are all text: `r` to be parsed, or `? @$ip` to be read
+    /// back out of `Evaluate expression:`.
+    pub fn instruction_pointer(&self) -> Result<u64, DbgEngError> {
+        let registers: IDebugRegisters =
+            self.client.cast().map_err(|source| DbgEngError::Context {
+                operation: "obtaining the register interface".into(),
+                source,
+            })?;
+        unsafe { registers.GetInstructionOffset() }.map_err(|source| DbgEngError::Context {
+            operation: "reading the instruction pointer".into(),
+            source,
+        })
+    }
+
+    /// The loaded modules, read through `IDebugSymbols3` — what `lm` renders, as data.
+    ///
+    /// Ordered as the engine holds them (by load order), and **loaded modules only**: the
+    /// engine also keeps a tail of unloaded ones, which `lm` does not show either and which
+    /// answer a different question.
+    ///
+    /// [`Module::symbols`] is the column hosts most often reach into `lm` for — "does this
+    /// module have real symbols, or is it deferred / export-only?" — and it is a value here
+    /// rather than a parenthesised word.
+    pub fn modules(&self) -> Result<Vec<Module>, DbgEngError> {
+        let mut loaded = 0u32;
+        let mut unloaded = 0u32;
+        unsafe { self.symbols.GetNumberModules(&mut loaded, &mut unloaded) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: "counting the target's modules".into(),
+                source,
+            }
+        })?;
+        if loaded == 0 {
+            return Ok(Vec::new());
+        }
+        // One call for the whole table: the parameters are the engine's own bookkeeping and
+        // cannot fail per-module the way a register read can.
+        let mut params = vec![DEBUG_MODULE_PARAMETERS::default(); loaded as usize];
+        unsafe {
+            self.symbols
+                .GetModuleParameters(loaded, None, 0, params.as_mut_ptr())
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: "reading module parameters".into(),
+            source,
+        })?;
+
+        let mut out = Vec::with_capacity(loaded as usize);
+        for (index, params) in params.iter().enumerate() {
+            let index = index as u32;
+            let mut name = String::new();
+            let mut image_name = String::new();
+            let mut loaded_image_name = String::new();
+            // Names come back in a single call with three buffers, each optional. Sized from the
+            // parameters above rather than from a guess, because a loaded-image name is a full
+            // path and truncating it silently would be worse than not reporting it.
+            let mut name_buffer = vec![0u8; params.ModuleNameSize.max(1) as usize];
+            let mut image_buffer = vec![0u8; params.ImageNameSize.max(1) as usize];
+            let mut loaded_buffer = vec![0u8; params.LoadedImageNameSize.max(1) as usize];
+            let named = unsafe {
+                self.symbols.GetModuleNames(
+                    index,
+                    0,
+                    Some(&mut image_buffer),
+                    None,
+                    Some(&mut name_buffer),
+                    None,
+                    Some(&mut loaded_buffer),
+                    None,
+                )
+            };
+            if named.is_ok() {
+                name = nul_terminated(&name_buffer);
+                image_name = nul_terminated(&image_buffer);
+                loaded_image_name = nul_terminated(&loaded_buffer);
+            }
+            out.push(Module {
+                base: params.Base,
+                size: params.Size,
+                name,
+                image_name,
+                loaded_image_name,
+                timestamp: params.TimeDateStamp,
+                checksum: params.Checksum,
+                symbols: SymbolKind::from_engine(params.SymbolType),
+                user_mode: params.Flags & DEBUG_MODULE_USER_MODE != 0,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every breakpoint the engine holds, read through `IDebugControl` — what `bl` renders, as
+    /// data.
+    ///
+    /// The distinction `bl` makes with a `u`/`e` letter and a blank address column is a typed one
+    /// here: a deferred breakpoint has [`BreakpointInfo::address`] `None`, because its module is
+    /// not loaded and it therefore *has* no address yet. Reporting that as zero would invent a
+    /// breakpoint on the null page.
+    pub fn breakpoints(&self) -> Result<Vec<BreakpointInfo>, DbgEngError> {
+        let count = unsafe { self.control.GetNumberBreakpoints() }.map_err(|source| {
+            DbgEngError::Context {
+                operation: "counting breakpoints".into(),
+                source,
+            }
+        })?;
+        let mut out = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let breakpoint =
+                unsafe { self.control.GetBreakpointByIndex(index) }.map_err(|source| {
+                    DbgEngError::Context {
+                        operation: format!("reading breakpoint at index {index}"),
+                        source,
+                    }
+                })?;
+            // Never released, exactly as in [`Breakpoint`]: DbgEng owns breakpoint objects and
+            // hands out borrowed interfaces, so letting the generated wrapper `Release()` one is
+            // a call on an object this code does not own. There is nothing to leak — the engine
+            // frees them with the session.
+            let breakpoint = std::mem::ManuallyDrop::new(breakpoint);
+            let id = unsafe { breakpoint.GetId() }.map_err(|source| DbgEngError::Context {
+                operation: format!("reading the id of breakpoint {index}"),
+                source,
+            })?;
+            let mut kind = 0u32;
+            let mut _processor = 0u32;
+            let kind = match unsafe { breakpoint.GetType(&mut kind, &mut _processor) } {
+                Ok(()) => BreakpointKind::from_engine(kind),
+                Err(_) => BreakpointKind::Other(DEBUG_ANY_ID),
+            };
+            let flags = unsafe { breakpoint.GetFlags() }.unwrap_or(0);
+            // A deferred breakpoint answers `GetOffset` with an error, and one whose expression
+            // resolved to nothing answers with `DEBUG_INVALID_OFFSET`. Both mean "no address
+            // yet", and neither means address zero.
+            let address = match unsafe { breakpoint.GetOffset() } {
+                Ok(offset) if offset != DEBUG_INVALID_OFFSET => Some(offset),
+                _ => None,
+            };
+            let expression = read_engine_string(|buffer, size| unsafe {
+                breakpoint.GetOffsetExpression(buffer, size)
+            })
+            .ok()
+            .filter(|text| !text.is_empty());
+            let command =
+                read_engine_string(|buffer, size| unsafe { breakpoint.GetCommand(buffer, size) })
+                    .ok()
+                    .filter(|text| !text.is_empty());
+            let thread = unsafe { breakpoint.GetMatchThreadId() }
+                .ok()
+                .filter(|id| *id != DEBUG_ANY_ID);
+            out.push(BreakpointInfo {
+                id,
+                kind,
+                address,
+                expression,
+                command,
+                thread,
+                enabled: flags & DEBUG_BREAKPOINT_ENABLED != 0,
+                deferred: flags & DEBUG_BREAKPOINT_DEFERRED != 0,
+                one_shot: flags & DEBUG_BREAKPOINT_ONE_SHOT != 0,
+                pass_count: unsafe { breakpoint.GetPassCount() }.unwrap_or(0),
+                passes_remaining: unsafe { breakpoint.GetCurrentPassCount() }.unwrap_or(0),
+            });
+        }
+        Ok(out)
     }
 
     /// Ensures the engine breaks at the initial (loader) breakpoint. A bare
@@ -1698,7 +2124,132 @@ impl<'a> Breakpoint<'a> {
 
 #[cfg(test)]
 mod tests {
+    use windows::Win32::System::Diagnostics::Debug::Extensions::{
+        DEBUG_VALUE_0, DEBUG_VALUE_INVALID, DEBUG_VALUE_TYPES,
+    };
+
     use super::*;
+
+    /// A `DEBUG_VALUE` carrying a value in the arm `type_code` names.
+    fn tagged(type_code: u32, fill: impl FnOnce(&mut DEBUG_VALUE_0)) -> DEBUG_VALUE {
+        let mut anonymous = DEBUG_VALUE_0::default();
+        fill(&mut anonymous);
+        DEBUG_VALUE {
+            Anonymous: anonymous,
+            TailOfRawBytes: 0,
+            Type: type_code,
+        }
+    }
+
+    /// The tag decides which arm is read, and nothing else does.
+    ///
+    /// Worth a test precisely because getting it wrong is invisible: every arm of the union
+    /// occupies the same bytes, so a 32-bit register read as `I64` yields a number that looks
+    /// like an answer. Each case below stores one arm and asserts the *other* interpretations do
+    /// not leak into the result.
+    #[test]
+    fn a_register_value_is_read_by_the_arm_its_tag_names() {
+        let int32 = tagged(DEBUG_VALUE_INT32, |v| v.I32 = 0xdead_beef);
+        assert_eq!(
+            RegisterValue::decode(&int32),
+            RegisterValue::Int(0xdead_beef)
+        );
+
+        // The 64-bit arm of a value whose low half is the same bytes: read as I32 this would
+        // silently drop the high half, which is the failure mode on every kernel pointer.
+        let int64 = tagged(DEBUG_VALUE_INT64, |v| {
+            v.Anonymous.I64 = 0xffff_8000_dead_beef
+        });
+        assert_eq!(
+            RegisterValue::decode(&int64),
+            RegisterValue::Int(0xffff_8000_dead_beef)
+        );
+
+        let byte = tagged(DEBUG_VALUE_INT8, |v| v.I8 = 0xff);
+        assert_eq!(RegisterValue::decode(&byte), RegisterValue::Int(0xff));
+
+        let float = tagged(DEBUG_VALUE_FLOAT64, |v| v.F64 = 1.5);
+        assert_eq!(RegisterValue::decode(&float), RegisterValue::Float(1.5));
+    }
+
+    /// A vector register keeps all of its bytes, and an x87 one keeps its ten.
+    ///
+    /// The alternative — narrowing them to a scalar — is the one decoding choice that cannot be
+    /// undone by the caller, so the width is pinned here.
+    #[test]
+    fn a_wide_register_keeps_every_byte() {
+        let mut bytes = [0u8; 16];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let vector = tagged(DEBUG_VALUE_VECTOR128, |v| v.VI8 = bytes);
+        assert_eq!(
+            RegisterValue::decode(&vector),
+            RegisterValue::Bytes(bytes.to_vec())
+        );
+
+        let half = tagged(DEBUG_VALUE_VECTOR64, |v| v.VI8 = bytes);
+        assert_eq!(
+            RegisterValue::decode(&half),
+            RegisterValue::Bytes(bytes[..8].to_vec())
+        );
+
+        let x87 = tagged(DEBUG_VALUE_FLOAT80, |v| v.F80Bytes = [7u8; 10]);
+        assert_eq!(
+            RegisterValue::decode(&x87),
+            RegisterValue::Bytes(vec![7u8; 10])
+        );
+    }
+
+    /// A type this build does not decode is reported as having no value, never as a number.
+    #[test]
+    fn an_undecodable_register_is_unavailable_rather_than_zero() {
+        let unknown = tagged(DEBUG_VALUE_TYPES + 1, |v| {
+            v.Anonymous.I64 = 0xdead_beef_dead_beef
+        });
+        assert_eq!(RegisterValue::decode(&unknown), RegisterValue::Unavailable);
+
+        let invalid = tagged(DEBUG_VALUE_INVALID, |v| v.Anonymous.I64 = 1);
+        assert_eq!(RegisterValue::decode(&invalid), RegisterValue::Unavailable);
+    }
+
+    /// A symbol type this build does not name keeps the engine's code instead of collapsing
+    /// into `None` — which a caller would read as "this module has no symbols".
+    #[test]
+    fn an_unknown_symbol_type_is_not_reported_as_having_no_symbols() {
+        assert_eq!(SymbolKind::from_engine(DEBUG_SYMTYPE_PDB), SymbolKind::Pdb);
+        assert_eq!(
+            SymbolKind::from_engine(DEBUG_SYMTYPE_DEFERRED),
+            SymbolKind::Deferred
+        );
+        assert_eq!(
+            SymbolKind::from_engine(DEBUG_SYMTYPE_NONE),
+            SymbolKind::None
+        );
+        assert_eq!(SymbolKind::from_engine(4242), SymbolKind::Other(4242));
+    }
+
+    #[test]
+    fn a_breakpoint_type_keeps_an_unknown_code() {
+        assert_eq!(
+            BreakpointKind::from_engine(DEBUG_BREAKPOINT_CODE),
+            BreakpointKind::Code
+        );
+        assert_eq!(
+            BreakpointKind::from_engine(DEBUG_BREAKPOINT_DATA),
+            BreakpointKind::Data
+        );
+        assert_eq!(BreakpointKind::from_engine(9), BreakpointKind::Other(9));
+    }
+
+    /// Engine buffers are fixed-size and NUL-terminated, so the tail past the NUL is whatever
+    /// was there before — never part of the name.
+    #[test]
+    fn a_name_stops_at_the_nul_the_engine_wrote() {
+        assert_eq!(nul_terminated(b"nt\0junkjunk"), "nt");
+        assert_eq!(nul_terminated(b"\0"), "");
+        assert_eq!(nul_terminated(b"no terminator"), "no terminator");
+    }
 
     #[cfg(not(miri))]
     #[test]
