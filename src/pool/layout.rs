@@ -4,14 +4,24 @@ use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 
 use super::decode::PoolHeaderLayout;
-use crate::dbgeng::{DbgEngError, DebugEngine};
+use crate::dbgeng::{DbgEngError, DebugEngine, KernelImage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SessionKey {
-    pub kernel_base: u64,
+    /// Where the kernel is loaded **and which build it is**, from
+    /// [crate::dbgeng::DebugEngine::kernel_image].
+    ///
+    /// The base alone is not enough for the layout cache, which is keyed on this and not on
+    /// `target`. A programmatic host that switches to a different Windows build whose kernel
+    /// happens to load at the same address receives no notification, so a base-keyed lookup
+    /// hands back the previous build's type offsets and globals and the walker decodes the new
+    /// target with them — silently, and confidently. Keyed on the image, entries are shared
+    /// across engines looking at the same build, which is what keeps the cache from growing one
+    /// entry per engine, and never shared across two builds.
+    pub image: KernelImage,
     pub session: u64,
     /// Which target this is, from [crate::dbgeng::DebugEngine::target_identity].
-    /// The kernel base does not distinguish two dumps from the same boot, and the
+    /// The kernel image does not distinguish two dumps from the same boot, and the
     /// generation only moves on debugger notifications a programmatic host never gets.
     pub target: u64,
 }
@@ -22,9 +32,31 @@ pub(crate) struct TypeLayout {
     pub fields: HashMap<&'static str, u32>,
 }
 
+/// What a resolved [`PoolLayout`] actually depends on: the kernel image it was read out of.
+///
+/// Deliberately not a whole [`SessionKey`]. A layout describes the *image*, not which target
+/// instance happens to be loaded, and keying it on the target inserted an entry per engine and
+/// per `end_session` that nothing ever pruned (glslang/win-kexp#84). Deriving the key here
+/// rather than asking each caller to blank a field is what keeps that from being one call
+/// site's discipline — there is no key a caller can hand this cache that reintroduces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct LayoutKey {
+    pub image: KernelImage,
+    pub session: u64,
+}
+
+impl From<SessionKey> for LayoutKey {
+    fn from(key: SessionKey) -> Self {
+        Self {
+            image: key.image,
+            session: key.session,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PoolLayout {
-    pub key: SessionKey,
+    pub key: LayoutKey,
     pub globals: HashMap<&'static str, u64>,
     pub types: HashMap<&'static str, TypeLayout>,
 }
@@ -315,7 +347,7 @@ impl PoolLayout {
         })
     }
 
-    pub(crate) fn resolve(symbols: &impl Symbols, key: SessionKey) -> Result<Self, LayoutError> {
+    pub(crate) fn resolve(symbols: &impl Symbols, key: LayoutKey) -> Result<Self, LayoutError> {
         let mut globals = HashMap::new();
         for &(canonical, aliases) in GLOBALS {
             let value = aliases
@@ -333,10 +365,10 @@ impl PoolLayout {
         }
         let mut types = HashMap::new();
         for spec in TYPES {
-            types.insert(spec.name, resolve_type(symbols, key.kernel_base, spec)?);
+            types.insert(spec.name, resolve_type(symbols, key.image.base, spec)?);
         }
         for spec in OPTIONAL_TYPES {
-            if let Ok(layout) = resolve_type(symbols, key.kernel_base, spec) {
+            if let Ok(layout) = resolve_type(symbols, key.image.base, spec) {
                 types.insert(spec.name, layout);
             }
         }
@@ -344,12 +376,12 @@ impl PoolLayout {
             let Some(layout) = types.get_mut(type_name) else {
                 continue;
             };
-            let Ok(type_id) = symbols.type_id(key.kernel_base, type_name) else {
+            let Ok(type_id) = symbols.type_id(key.image.base, type_name) else {
                 continue;
             };
             if let Some(offset) = aliases
                 .iter()
-                .find_map(|field| symbols.field(key.kernel_base, type_id, field).ok())
+                .find_map(|field| symbols.field(key.image.base, type_id, field).ok())
             {
                 layout.fields.insert(canonical, offset);
             }
@@ -364,7 +396,7 @@ impl PoolLayout {
 
 #[derive(Default)]
 pub(crate) struct LayoutCache {
-    entries: Mutex<HashMap<SessionKey, PoolLayout>>,
+    entries: Mutex<HashMap<LayoutKey, PoolLayout>>,
 }
 
 impl LayoutCache {
@@ -376,8 +408,9 @@ impl LayoutCache {
     pub(crate) fn get_or_resolve(
         &self,
         symbols: &impl Symbols,
-        key: SessionKey,
+        key: impl Into<LayoutKey>,
     ) -> Result<PoolLayout, LayoutError> {
+        let key = key.into();
         if let Some(layout) = self.entries.lock().unwrap().get(&key).cloned() {
             return Ok(layout);
         }
@@ -393,10 +426,15 @@ impl LayoutCache {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     #[derive(Default)]
     struct FakeSymbols {
+        /// How many times a layout has actually been resolved through these symbols, so a
+        /// cache hit can be told from a re-resolution rather than inferred from equal results.
+        resolutions: Cell<usize>,
         fallback_aliases: bool,
         optional_fields: bool,
         missing_global: Option<&'static str>,
@@ -453,6 +491,7 @@ mod tests {
 
     impl Symbols for FakeSymbols {
         fn symbol(&self, name: &str) -> Result<u64, DbgEngError> {
+            self.resolutions.set(self.resolutions.get() + 1);
             if self.missing_global == Some(name) {
                 return Self::error();
             }
@@ -490,12 +529,67 @@ mod tests {
         }
     }
 
-    fn key() -> SessionKey {
-        SessionKey {
-            kernel_base: 0xffff_f800_0000_0000,
+    fn key() -> LayoutKey {
+        LayoutKey {
+            image: KernelImage {
+                base: 0xffff_f800_0000_0000,
+                size: 0x145_0000,
+                timestamp: 0x65f5_7999,
+                checksum: 0xc6f_ee6,
+            },
             session: 7,
-            target: 1,
         }
+    }
+
+    /// glslang/win-kexp#84 and #87 are the two ways one key can be wrong, and the image
+    /// answers both. Keyed on the target, the cache grew an entry per engine and per
+    /// `end_session` that nothing ever pruned. Keyed on the base alone — which is what fixing
+    /// that left — two Windows builds whose kernels load at the same address share a layout,
+    /// and nothing tells a programmatic host the target changed, so the walker decodes one
+    /// build with the other's type offsets and globals and says nothing about it.
+    #[test]
+    fn test_layouts_are_shared_by_image_and_never_across_builds() {
+        let symbols = FakeSymbols::default();
+        let cache = LayoutCache::default();
+        let resolve = |key: LayoutKey| {
+            let layout = cache.get_or_resolve(&symbols, key).unwrap();
+            (symbols.resolutions.get(), layout.key.image)
+        };
+        let through_an_engine = |key: SessionKey| {
+            let layout = cache.get_or_resolve(&symbols, key).unwrap();
+            (symbols.resolutions.get(), layout.key.image)
+        };
+
+        let (first, image) = resolve(key());
+        assert!(first > 0);
+        assert_eq!(image, key().image);
+
+        // The same image reached through a second engine, whose `SessionKey` carries a target
+        // of its own. One entry, shared: keying on the target is the growth #84 was about, and
+        // the narrowing that prevents it is the cache's, not the caller's.
+        assert_eq!(
+            through_an_engine(SessionKey {
+                image: key().image,
+                session: key().session,
+                target: 99,
+            }),
+            (first, key().image)
+        );
+
+        // The same *address*, a different build.
+        let other_build = KernelImage {
+            timestamp: 0x1122_3344,
+            ..key().image
+        };
+        let (again, resolved) = resolve(LayoutKey {
+            image: other_build,
+            ..key()
+        });
+        assert!(
+            again > first,
+            "a second build at one base must not be served the first build's layout"
+        );
+        assert_eq!(resolved, other_build);
     }
 
     fn missing_item(result: Result<PoolLayout, LayoutError>) -> String {

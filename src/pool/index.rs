@@ -309,7 +309,10 @@ mod tests {
         // Distinct targets, not just distinct generations: the cache keys on the whole
         // SessionKey so a snapshot cannot outlive the target it described.
         let session = |value: u64| super::super::layout::SessionKey {
-            kernel_base: 0x1000,
+            image: crate::dbgeng::KernelImage {
+                base: 0x1000,
+                ..Default::default()
+            },
             session: value,
             target: 1,
         };
@@ -368,7 +371,10 @@ mod tests {
         // thing that tells them apart.
         cache.invalidate();
         let same_base = |target: u64| super::super::layout::SessionKey {
-            kernel_base: 0x1000,
+            image: crate::dbgeng::KernelImage {
+                base: 0x1000,
+                ..Default::default()
+            },
             session: 1,
             target,
         };
