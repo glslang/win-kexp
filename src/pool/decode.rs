@@ -346,6 +346,97 @@ pub(crate) fn decode_pool_header(
     (header.block_size != 0 && header.pool_type <= 0x7f).then_some(header)
 }
 
+/// The low bits of a special-pool page's `Ulong1` that hold the requested byte count.
+///
+/// Thirteen, not the eight of `_POOL_HEADER.PreviousSize` — which is why a size below 0x100
+/// used to read correctly and everything above it wrapped. 0x1fff spans any allocation a page
+/// can hold several times over, so nothing a special-pool page can describe truncates.
+const SPECIAL_POOL_SIZE_MASK: u32 = 0x1fff;
+/// Set in the same word when Verifier is tracking the allocation, which puts eight more bytes
+/// of its own between the pool header and where the fill starts.
+const SPECIAL_POOL_TRACKED: u32 = 0x4000;
+
+/// What a Driver Verifier special-pool page records about the one allocation it holds.
+///
+/// Special pool reuses `_POOL_HEADER`'s bytes for its own fields, so the ordinary
+/// [`decode_pool_header`] reading of them is meaningless here: `BlockSize`'s byte holds the
+/// fill pattern, and the size spans `PreviousSize` *and* the low bits of `PoolIndex`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpecialPoolHeader {
+    pub tag: u32,
+    /// The byte count the caller asked `ExAllocatePool` for. The block occupies
+    /// `next_multiple_of(16)` of that.
+    pub requested: u32,
+    /// Where the fill starts: past the pool header, and past Verifier's tracking block when
+    /// [`SPECIAL_POOL_TRACKED`] says there is one.
+    pub header_size: usize,
+    /// The byte the unused space either side of the block is filled with.
+    ///
+    /// Read from the page rather than assumed to be `0xfd`, because that is what the kernel
+    /// itself compares against — see [`decode_special_pool_header`].
+    pub fill: u8,
+}
+
+/// Decodes a special-pool page header the way `nt!ExpFreeHeapSpecialPool` does.
+///
+/// That function is the authority worth copying: it is handed the block pointer and
+/// **bug checks** (`0xc1`, subcode `0x21`) unless the page's own fields place the block exactly
+/// where the pointer says it is, so its reading *defines* a well-formed special-pool page.
+/// Measured on Server 26100.32995 (`nt` 0x65f57999), where it does, in order:
+///
+/// ```text
+///   movzx edx, word ptr [rbx]        ; the first half of Ulong1
+///   and   edx, 1FFFh                 ; ... is the requested size, in thirteen bits
+///   lea   r14, [rdx+0Fh]
+///   and   r14, 0FFFFFFFFFFFFFFF0h    ; the block occupies that, rounded up to 16
+///   cmp   r14, rbp                   ; rbp = 0x1000 - (block & 0xfff): or bug check 0xc1/0x21
+///   ...
+///   mov   ecx, dword ptr [rbx]
+///   lea   r8, [rbx+10h]
+///   and   r10d, 4000h                ; tracked by Verifier?
+///   je    ...
+///   lea   r8, [rbx+18h]              ; ... then its tracking block sits after the header
+///   ...
+///   mov   al, byte ptr [rbx+2]       ; the fill byte is recorded on the page, not assumed
+///   cmp   byte ptr [r8], al          ; and checked from the header's end up to the block
+/// ```
+///
+/// `Ulong1` overlays the bitfields from `PreviousSize` on, and the fill byte occupies
+/// `BlockSize`'s, so both are located from the PDB layout rather than from the constant
+/// offsets the kernel compiles in.
+///
+/// `None` means the page does not describe an allocation that could fit in it — an unreadable
+/// or garbage page, not a special-pool one.
+pub(crate) fn decode_special_pool_header(
+    bytes: &[u8],
+    offset: usize,
+    layout: PoolHeaderLayout,
+) -> Option<SpecialPoolHeader> {
+    range(bytes, offset, layout.size)?;
+    let word = read_u32(bytes, offset.checked_add(layout.previous_size)?)?;
+    let requested = word & SPECIAL_POOL_SIZE_MASK;
+    // The extra eight bytes are Verifier's, and on x64 `_POOL_HEADER` is 0x10, which is the
+    // `[rbx+10h]`/`[rbx+18h]` pair above.
+    let header_size = layout.size
+        + if word & SPECIAL_POOL_TRACKED != 0 {
+            8
+        } else {
+            0
+        };
+    let aligned = u64::from(requested).next_multiple_of(16);
+    // The kernel's own placement identity, which is the check it bug checks on. A page whose
+    // block could not share it with its own header is not a special-pool page we read correctly.
+    if requested == 0 || aligned + header_size as u64 > PAGE_SIZE {
+        return None;
+    }
+    Some(SpecialPoolHeader {
+        tag: read_u32(bytes, offset.checked_add(layout.tag)?)?,
+        requested,
+        header_size,
+        fill: *bytes.get(offset.checked_add(layout.block_size)?)?,
+    })
+}
+
 pub(crate) fn decode_rb_root(root: u64, tree_address: u64, encoded: bool) -> Option<u64> {
     let pointer = if encoded { root ^ tree_address } else { root } & !0xf;
     (pointer == 0 || is_kernel_pointer(pointer)).then_some(pointer)

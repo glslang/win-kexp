@@ -5,11 +5,11 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::decode::{
-    PAGE_SIZE, PoolHeaderLayout, adjust_page_end_header, big_page_probe, decode_descriptor_at,
-    decode_large_allocation, decode_lfh_subsegment, decode_pool_header, decode_rb_root,
-    decode_slist_header_next, decode_vs_sizes, descriptor_backend, lfh_bitmap_state, read_u16,
-    read_u32, read_u64, valid_descriptor_tree_signature, valid_page_segment_signature,
-    valid_vs_signature,
+    PAGE_SIZE, PoolHeaderLayout, SpecialPoolHeader, adjust_page_end_header, big_page_probe,
+    decode_descriptor_at, decode_large_allocation, decode_lfh_subsegment, decode_pool_header,
+    decode_rb_root, decode_slist_header_next, decode_special_pool_header, decode_vs_sizes,
+    descriptor_backend, lfh_bitmap_state, read_u16, read_u32, read_u64,
+    valid_descriptor_tree_signature, valid_page_segment_signature, valid_vs_signature,
 };
 use super::{
     HeapIdentity, PoolBackend, PoolKind, PoolSpan, PoolState,
@@ -1611,46 +1611,53 @@ struct SpecialPlacement {
     approximate: bool,
 }
 
-/// The byte Driver Verifier fills unused special-pool space with.
-const SPECIAL_POOL_FILL: u8 = 0xfd;
-
-/// Where a special-pool block sits inside its page, and how big it is.
+/// Where a special-pool block sits inside its page, and whether the page corroborates it.
 ///
-/// Returns `(usable_address, size)`. The block is normally butted against the page end at
-/// `page + PAGE_SIZE - align_up(size, 16)`; the 16-byte rounding matters, since a plain
-/// `PAGE_SIZE - size` lands 8 bytes past the real block for a 0x68 allocation.
+/// The block is butted against the page end at `page + PAGE_SIZE - align_up(size, 16)`; the
+/// 16-byte rounding matters, since a plain `PAGE_SIZE - size` lands 8 bytes past the real
+/// block for a 0x68 allocation.
 ///
-/// The size comes from `_POOL_HEADER.PreviousSize`, which is **8 bits wide and so cannot
-/// describe every legal block**. A 0x140 allocation stores 0x40 there, and a bare range
-/// check cannot tell that from a genuine 0x40 — both fit the page comfortably. The
-/// placement is therefore corroborated against the fill: everything between the header and
-/// the block must be Verifier's `0xfd`. A truncated size puts the block too close to the
-/// page end, leaving real data where fill should be, and is rejected.
+/// The size arrives already decoded, from the thirteen bits the kernel keeps it in — see
+/// [`decode_special_pool_header`]. That is what makes this a corroboration rather than the
+/// load-bearing check it used to be: read as `_POOL_HEADER.PreviousSize`'s eight bits, a 0x140
+/// allocation reported 0x40 and nothing but the fill could tell that from a genuine 0x40. A
+/// value that cannot wrap has no such twin, so a page that fails the check below is a page we
+/// misread or one being written as we read it, not an ambiguity to resolve.
 ///
-/// The same check declines rather than lies in the two other cases that break the
-/// assumption: a page read only in part (nothing corroborates the tail), and a
-/// start-aligned page (`nt!MmSpecialPoolCatchOverruns` clear), where the block sits
-/// against the *preceding* guard page instead.
+/// Both runs of fill the kernel checks on free are checked here, against the fill byte the page
+/// itself records: from the header's end up to the block, and from the block's end to the page
+/// end. The second is the alignment padding — up to 15 bytes, and evidence the old check left
+/// on the floor.
+///
+/// It declines rather than lies in the two cases that break the placement rule: a page read
+/// only in part (nothing corroborates the tail), and a start-aligned page
+/// (`nt!MmSpecialPoolCatchOverruns` clear), where the block sits against the *preceding* guard
+/// page instead.
 ///
 /// The fallback reports the whole page after the header. An over-broad chunk still answers
 /// "was this freed, and which tag owned it"; a confidently wrong offset does not.
 fn special_pool_placement(
     page: u64,
-    requested: u64,
-    header_size: u64,
+    header: SpecialPoolHeader,
     page_bytes: &[u8],
 ) -> SpecialPlacement {
     let available = page_bytes.len() as u64;
-    let aligned = requested.next_multiple_of(16);
-    if requested != 0 && available == PAGE_SIZE && aligned + header_size <= PAGE_SIZE {
-        let start = (PAGE_SIZE - aligned) as usize;
-        if page_bytes[header_size as usize..start]
+    let header_size = header.header_size as u64;
+    // Both hold by construction — `decode_special_pool_header` returns `None` otherwise — so
+    // the slicing below cannot be out of range once the page is known to be whole.
+    let aligned = u64::from(header.requested).next_multiple_of(16);
+    let start = (PAGE_SIZE - aligned) as usize;
+    if available == PAGE_SIZE {
+        let leading = &page_bytes[header.header_size..start];
+        let padding = &page_bytes[start + header.requested as usize..];
+        if leading
             .iter()
-            .all(|byte| *byte == SPECIAL_POOL_FILL)
+            .chain(padding)
+            .all(|byte| *byte == header.fill)
         {
             return SpecialPlacement {
                 usable: page + PAGE_SIZE - aligned,
-                size: requested,
+                size: u64::from(header.requested),
                 approximate: false,
             };
         }
@@ -2004,15 +2011,20 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
 
     /// Decodes a Driver Verifier special-pool region, one allocation per page.
     ///
-    /// Special pool gives every allocation its own page: a `_POOL_HEADER` at the page
-    /// start, `0xfd` fill, then the caller's block pushed up against the page end so an
-    /// overrun lands on the following guard page. The guard page is unmapped, which is
-    /// why `valid_region` stops after the data page and why a *freed* allocation simply
-    /// vanishes — both are the mechanism working, not read failures.
+    /// Special pool gives every allocation its own page: a header at the page start, fill,
+    /// then the caller's block pushed up against the page end so an overrun lands on the
+    /// following guard page. The guard page is unmapped, which is why `valid_region` stops
+    /// after the data page and why a *freed* allocation simply vanishes — both are the
+    /// mechanism working, not read failures.
     ///
     /// The block is placed at `page + PAGE_SIZE - align_up(size, 16)`; the 16-byte
     /// alignment is easy to miss, and dropping it puts the reported address 8 bytes past
     /// the real one (`0xf98` instead of `0xf90` for a 0x68 allocation).
+    ///
+    /// The page is read by [`decode_special_pool_header`] rather than by the ordinary
+    /// [`decode_pool_header`]: special pool reuses those header bytes for a size, a fill
+    /// pattern and a tracking flag, so the generic reading's plausibility guard is testing
+    /// fields that are not there.
     fn walk_special_pool(
         &self,
         region: &PoolRegion,
@@ -2020,7 +2032,6 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         bytes: &[u8],
         snapshot: &mut PoolSnapshot,
     ) {
-        let header_size = region.pool_header.size as u64;
         let mut page = base.next_multiple_of(PAGE_SIZE);
         while let Some(offset) = page.checked_sub(base).map(|delta| delta as usize) {
             if offset >= bytes.len() {
@@ -2028,13 +2039,14 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             }
             let available = (bytes.len() - offset).min(PAGE_SIZE as usize);
             let page_bytes = &bytes[offset..offset + available];
-            let Some(header) = decode_pool_header(bytes, offset, region.pool_header) else {
+            let Some(header) = decode_special_pool_header(bytes, offset, region.pool_header) else {
                 // Special pool is page-granular: one undecodable page says nothing about
                 // the next, so stopping here would silently drop the rest of the region —
                 // and leaving `complete` set would cache that truncated result and re-serve
                 // it. Every other rejection path in this file reports and continues.
                 snapshot.diagnostics.push(format!(
-                    "special-pool page {page:#x}: pool header did not decode; page skipped"
+                    "special-pool page {page:#x}: header describes no block the page could \
+                     hold; page skipped"
                 ));
                 snapshot.complete = false;
                 let Some(next) = page.checked_add(PAGE_SIZE) else {
@@ -2046,12 +2058,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             // An untagged page is not an allocation. Freed special-pool pages are
             // unmapped rather than zeroed, so anything readable here should carry a tag.
             if header.tag != 0 {
-                let placement = special_pool_placement(
-                    page,
-                    u64::from(header.previous_size),
-                    header_size,
-                    page_bytes,
-                );
+                let placement = special_pool_placement(page, header, page_bytes);
                 // Say so when the size is a bound rather than a measurement. Otherwise a
                 // conservative page-sized range is indistinguishable from a real
                 // allocation: `tag_census` would fold it into `total_bytes` — reporting a
@@ -2574,6 +2581,20 @@ mod tests {
     }
 
     const SPECIAL_PAGE: u64 = 0xffff_8c8f_13a0_2000;
+    /// The byte Driver Verifier fills unused special-pool space with. A *fixture* value now,
+    /// not a constant the walker knows: the page records its own fill byte, and the decoder
+    /// reads it from there.
+    const VERIFIER_FILL: u8 = 0xfd;
+    /// `_POOL_HEADER` as Server 26100 x64 declares it: `PreviousSize`/`PoolIndex` share the
+    /// USHORT at +0, `BlockSize`/`PoolType` the one at +2, and `Ulong1` overlays all four.
+    const X64_POOL_HEADER: PoolHeaderLayout = PoolHeaderLayout {
+        size: 0x10,
+        previous_size: 0,
+        pool_index: 0,
+        block_size: 2,
+        pool_type: 2,
+        tag: 4,
+    };
 
     /// `(usable, size, approximate)` — flattened so the assertions below stay readable and
     /// so every case states whether the size was corroborated or merely bounded.
@@ -2581,14 +2602,25 @@ mod tests {
         (placement.usable, placement.size, placement.approximate)
     }
 
-    /// A special-pool page holding a block of `requested` bytes: header, then Verifier
-    /// fill, then the block itself pushed against the page end.
-    fn special_page(requested: usize, header_size: usize) -> Vec<u8> {
-        let mut page = vec![0u8; PAGE_SIZE as usize];
-        let start = PAGE_SIZE as usize - requested.next_multiple_of(16);
-        page[header_size..start].fill(SPECIAL_POOL_FILL);
-        page[start..].fill(0x41);
+    /// A special-pool page as the kernel writes one: the requested size in the low thirteen
+    /// bits of `Ulong1`, the fill byte in `BlockSize`'s, the tag at +4, fill from the header's
+    /// end to the block, the block against the page end, and fill again over the alignment
+    /// padding behind it.
+    fn special_page(requested: u32, tracked: bool) -> Vec<u8> {
+        let mut page = vec![VERIFIER_FILL; PAGE_SIZE as usize];
+        let word = requested | if tracked { 0x4000 } else { 0 } | (u32::from(VERIFIER_FILL) << 16);
+        page[..4].copy_from_slice(&word.to_le_bytes());
+        page[4..8].copy_from_slice(b"Tsp1");
+        let start = PAGE_SIZE as usize - (requested as usize).next_multiple_of(16);
+        page[start..start + requested as usize].fill(0x41);
         page
+    }
+
+    /// Decodes a fixture page and places its block, which is the path the walk takes.
+    fn place(page: &[u8]) -> SpecialPlacement {
+        let header =
+            decode_special_pool_header(page, 0, X64_POOL_HEADER).expect("page describes a block");
+        special_pool_placement(SPECIAL_PAGE, header, page)
     }
 
     /// The real values read off Server 26100.32995: a 0x68 message in special pool sits at
@@ -2597,43 +2629,87 @@ mod tests {
     #[test]
     fn test_special_pool_block_is_pushed_against_the_page_end() {
         assert_eq!(
-            placed(special_pool_placement(
-                SPECIAL_PAGE,
-                0x68,
-                0x10,
-                &special_page(0x68, 0x10)
-            )),
+            placed(place(&special_page(0x68, false))),
             (SPECIAL_PAGE + 0xf90, 0x68, false)
         );
         // Already a multiple of 16: no rounding, block ends exactly at the page end.
         assert_eq!(
-            placed(special_pool_placement(
-                SPECIAL_PAGE,
-                0x40,
-                0x10,
-                &special_page(0x40, 0x10)
-            )),
+            placed(place(&special_page(0x40, false))),
             (SPECIAL_PAGE + 0xfc0, 0x40, false)
         );
     }
 
-    /// The case a range check cannot catch: `PreviousSize` is 8 bits, so a 0x140 block
-    /// stores 0x40 there — a value that fits the page perfectly well and is indistinguishable
-    /// from a real 0x40 by size alone. Only the fill gives it away: placing a 0x40 block at
-    /// the page end would leave the real block's bytes sitting where fill should be.
+    /// The bug behind glslang/win-kexp#83, and the reason the size is no longer read as
+    /// `_POOL_HEADER.PreviousSize`: eight bits cannot hold 0x140, so that allocation used to
+    /// present as a 0x40 one — a value that fits the page perfectly well and that no range
+    /// check could tell from a genuine 0x40. Thirteen bits hold anything a page can, so the
+    /// two are now different numbers rather than the same one.
     #[test]
-    fn test_special_pool_detects_a_truncated_size_via_the_fill() {
-        // The page really holds 0x140 bytes of data; the header claims 0x40.
-        let page = special_page(0x140, 0x10);
+    fn test_special_pool_reads_a_size_that_does_not_fit_eight_bits() {
+        let page = special_page(0x140, false);
         assert_eq!(
-            placed(special_pool_placement(SPECIAL_PAGE, 0x40, 0x10, &page)),
-            (SPECIAL_PAGE + 0x10, PAGE_SIZE - 0x10, true),
-            "a truncated PreviousSize must fall back, not report a block at the page end"
+            page[0], 0x40,
+            "the low byte alone is the value that used to be read"
         );
-        // Sanity: told the truth, the same page resolves precisely.
         assert_eq!(
-            placed(special_pool_placement(SPECIAL_PAGE, 0x140, 0x10, &page)),
-            (SPECIAL_PAGE + 0xec0, 0x140, false)
+            placed(place(&page)),
+            (SPECIAL_PAGE + 0xec0, 0x140, false),
+            "the block is 0x140 bytes at page+0xec0, not 0x40 bytes at page+0xfc0"
+        );
+        // The largest block a page can hold, which is where the mask has to stop being generous.
+        assert_eq!(
+            placed(place(&special_page(0xff0, false))),
+            (SPECIAL_PAGE + 0x10, 0xff0, false)
+        );
+    }
+
+    /// Verifier tracking puts eight bytes of its own between the pool header and the fill, and
+    /// the page says so in `Ulong1`. Reading the fill from +0x10 there would compare tracking
+    /// data against the fill byte and give up on a page that is perfectly well formed.
+    #[test]
+    fn test_special_pool_skips_verifiers_tracking_block() {
+        let mut page = special_page(0x68, true);
+        page[0x10..0x18].copy_from_slice(&0xdead_beef_u64.to_le_bytes());
+        let header = decode_special_pool_header(&page, 0, X64_POOL_HEADER).unwrap();
+        assert_eq!(header.header_size, 0x18);
+        assert_eq!(header.requested, 0x68);
+        assert_eq!(header.tag, u32::from_le_bytes(*b"Tsp1"));
+        assert_eq!(
+            placed(special_pool_placement(SPECIAL_PAGE, header, &page)),
+            (SPECIAL_PAGE + 0xf90, 0x68, false)
+        );
+    }
+
+    /// The corroboration the old check left on the floor: the kernel compares the alignment
+    /// padding behind the block against the fill too, and up to fifteen bytes of evidence is
+    /// worth having when the alternative is trusting the leading run alone.
+    #[test]
+    fn test_special_pool_checks_the_padding_behind_the_block() {
+        let mut page = special_page(0x68, false);
+        page[PAGE_SIZE as usize - 1] = 0x41;
+        assert_eq!(
+            placed(place(&page)),
+            (SPECIAL_PAGE + 0x10, PAGE_SIZE - 0x10, true)
+        );
+    }
+
+    /// The fill byte comes off the page, so a page filled with something else still resolves
+    /// precisely — and one whose fill disagrees with its own recorded byte does not.
+    #[test]
+    fn test_special_pool_uses_the_fill_byte_the_page_records() {
+        let mut page = special_page(0x68, false);
+        page[0x10..0xf90].fill(0xc0);
+        page[0xff8..].fill(0xc0);
+        page[2] = 0xc0;
+        assert_eq!(
+            placed(place(&page)),
+            (SPECIAL_PAGE + 0xf90, 0x68, false),
+            "0xfd is Verifier's default, not part of the format"
+        );
+        page[2] = VERIFIER_FILL;
+        assert_eq!(
+            placed(place(&page)),
+            (SPECIAL_PAGE + 0x10, PAGE_SIZE - 0x10, true)
         );
     }
 
@@ -2642,37 +2718,113 @@ mod tests {
     /// declines instead of reporting a bogus address.
     #[test]
     fn test_special_pool_declines_a_start_aligned_page() {
-        let mut page = vec![0u8; PAGE_SIZE as usize];
+        let mut page = special_page(0x68, false);
+        page[0xf90..].fill(VERIFIER_FILL);
         page[0x10..0x78].fill(0x41); // block immediately after the header
-        page[0x78..].fill(SPECIAL_POOL_FILL); // fill trails it
         assert_eq!(
-            placed(special_pool_placement(SPECIAL_PAGE, 0x68, 0x10, &page)),
+            placed(place(&page)),
             (SPECIAL_PAGE + 0x10, PAGE_SIZE - 0x10, true)
         );
     }
 
+    /// A page that describes no block a page could hold is not one we read correctly, and the
+    /// walk skips it rather than reporting a span from it.
     #[test]
-    fn test_special_pool_falls_back_when_the_size_is_untrustworthy() {
-        let page = special_page(0x68, 0x10);
-        assert_eq!(
-            placed(special_pool_placement(SPECIAL_PAGE, 0, 0x10, &page)),
-            (SPECIAL_PAGE + 0x10, PAGE_SIZE - 0x10, true)
-        );
-        // A request that cannot share the page with its own header is not believable.
-        assert_eq!(
-            placed(special_pool_placement(SPECIAL_PAGE, PAGE_SIZE, 0x10, &page)),
-            (SPECIAL_PAGE + 0x10, PAGE_SIZE - 0x10, true)
-        );
+    fn test_special_pool_header_refuses_an_impossible_block() {
+        let mut page = special_page(0x68, false);
+        page[..4].copy_from_slice(&(u32::from(VERIFIER_FILL) << 16).to_le_bytes());
+        assert!(decode_special_pool_header(&page, 0, X64_POOL_HEADER).is_none());
+        // 0x1000 bytes cannot share a 0x1000 byte page with the header in front of them, and
+        // the mask reaches 0x1fff, so this is a value the field can really hold.
+        page[..4].copy_from_slice(&(0x1000 | (u32::from(VERIFIER_FILL) << 16)).to_le_bytes());
+        assert!(decode_special_pool_header(&page, 0, X64_POOL_HEADER).is_none());
+        // Tracked, and one alignment step too large to leave room for the tracking block.
+        page[..4]
+            .copy_from_slice(&(0xfe8 | 0x4000 | (u32::from(VERIFIER_FILL) << 16)).to_le_bytes());
+        assert!(decode_special_pool_header(&page, 0, X64_POOL_HEADER).is_none());
     }
 
     /// A partially readable page corroborates nothing about where the block sits, so the
     /// end-of-page placement must not be used and the size must not exceed what was read.
     #[test]
     fn test_special_pool_fallback_respects_the_readable_length() {
-        let partial = vec![SPECIAL_POOL_FILL; 0x200];
+        let mut partial = special_page(0x68, false);
+        partial.truncate(0x200);
+        assert_eq!(placed(place(&partial)), (SPECIAL_PAGE + 0x10, 0x1f0, true));
+    }
+
+    fn special_region(address: u64, pages: usize) -> PoolRegion {
+        PoolRegion {
+            address,
+            size: pages * PAGE_SIZE as usize,
+            pool_kind: PoolKind::SpecialNonPagedNx,
+            numa_node: 0,
+            heap: HeapIdentity {
+                pool_state: 0,
+                heap: 0,
+                special: true,
+            },
+            subsegment: None,
+            backend: PoolBackend::Segment,
+            unit_size: PAGE_SIZE as u32,
+            bitmap: Vec::new(),
+            heap_key: 0,
+            pool_header: X64_POOL_HEADER,
+            vs_header_size: 0,
+            vs_sizes_offset: 0,
+            known_tag: None,
+            states: Vec::new(),
+            reusable_chunks: Arc::default(),
+            cached_chunks: Arc::default(),
+        }
+    }
+
+    /// Special pool is page-granular, so one page that does not decode says nothing about the
+    /// next. Abandoning the region there — which is what this did before glslang/win-kexp#86 —
+    /// dropped every later allocation *and* left `complete` set, so the truncated snapshot was
+    /// the one cached and re-served.
+    #[test]
+    fn test_a_bad_special_pool_page_costs_that_page_only() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&special_page(0x68, false));
+        bytes.extend_from_slice(&vec![0u8; PAGE_SIZE as usize]); // decodes as nothing
+        bytes.extend_from_slice(&special_page(0x140, false));
+        let region = special_region(SPECIAL_PAGE, 3);
+        let memory = FlatMemory::new(SPECIAL_PAGE, bytes.len());
+        let layout = vs_layout(false);
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1000,
+        };
+        let mut snapshot = PoolSnapshot {
+            complete: true,
+            ..PoolSnapshot::default()
+        };
+        walker.walk_special_pool(&region, SPECIAL_PAGE, &bytes, &mut snapshot);
+
+        let found: Vec<_> = snapshot
+            .spans
+            .iter()
+            .map(|span| (span.usable_address, span.size))
+            .collect();
         assert_eq!(
-            placed(special_pool_placement(SPECIAL_PAGE, 0x68, 0x10, &partial)),
-            (SPECIAL_PAGE + 0x10, 0x1f0, true)
+            found,
+            [
+                (SPECIAL_PAGE + 0xf90, 0x68),
+                (SPECIAL_PAGE + 0x2000 + 0xec0, 0x140)
+            ],
+            "the page after the bad one must still be walked"
+        );
+        assert!(!snapshot.complete, "a skipped page is not a complete walk");
+        assert!(
+            snapshot
+                .diagnostics
+                .examples()
+                .iter()
+                .any(|message| message.contains(&format!("{:#x}", SPECIAL_PAGE + 0x1000))),
+            "the diagnostic has to name the page that was skipped: {:?}",
+            snapshot.diagnostics.examples()
         );
     }
     use crate::pool::{
