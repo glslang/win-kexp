@@ -2842,6 +2842,9 @@ mod tests {
     #[cfg(not(miri))]
     #[test]
     fn test_create_debug_engine() {
+        // Serialized like every other engine test: this one's `Drop` ends the process-wide
+        // debuggee session, which is not this process's to end while another test holds one.
+        let _debuggee = one_debuggee();
         // Create new debug engine instance
         let _ = DebugEngine::new();
 
@@ -3285,6 +3288,24 @@ mod tests {
         let _ = e.end_session();
     }
 
+    /// Serializes the tests that build a [`DebugEngine`].
+    ///
+    /// dbgeng holds **one debuggee session per process** and `DebugEngine::drop` ends it, so
+    /// two engine tests sharing a test binary either lose the race to open a target — the
+    /// launch fails with `0x80004005` — or end each other's session on the way out.
+    ///
+    /// Nothing under `cargo nextest run`, which gives every test its own process and is what CI
+    /// and this repo's instructions use. Load-bearing under plain `cargo test`, which the
+    /// coverage workflow runs. (The `#[ignore]`d tests above have the same requirement, met the
+    /// other way: they are documented as needing `--test-threads=1`.)
+    static ONE_DEBUGGEE: Mutex<()> = Mutex::new(());
+
+    fn one_debuggee() -> std::sync::MutexGuard<'static, ()> {
+        // A test that panics while holding this poisons it. The next test still needs the
+        // lock, and its own assertion is a better failure message than a poison error.
+        ONE_DEBUGGEE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Puts the session somewhere other than its default scope, and says what did it.
     ///
     /// `None` means nothing moved — which the scope tests below must treat as a failure rather
@@ -3303,6 +3324,7 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn a_scope_needs_a_target_to_be_read_from() {
+        let _debuggee = one_debuggee();
         let e = DebugEngine::new();
         // Measured: `GetScope` answers `E_UNEXPECTED` with no target, for every buffer size
         // including none at all. So there is no scope to report as empty — only an error.
@@ -3315,6 +3337,7 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn a_saved_scope_is_the_one_restored() {
+        let _debuggee = one_debuggee();
         let e = DebugEngine::new();
         e.launch_process("cmd.exe /c exit").expect("launch failed");
 
@@ -3349,6 +3372,7 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn a_guard_restores_the_scope_even_when_the_caller_panics() {
+        let _debuggee = one_debuggee();
         let e = DebugEngine::new();
         e.launch_process("cmd.exe /c exit").expect("launch failed");
         move_the_scope(&e).expect("nothing moved the scope; the rest is vacuous");
@@ -3376,6 +3400,7 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn a_scope_is_not_restored_onto_a_later_target() {
+        let _debuggee = one_debuggee();
         let e = DebugEngine::new();
         e.launch_process("cmd.exe /c exit").expect("launch failed");
         let stale = e.scope().expect("scope() failed");
