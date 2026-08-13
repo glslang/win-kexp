@@ -1583,18 +1583,21 @@ impl DebugEngine {
     /// Reads the engine's current [`Scope`], so it can be put back later.
     ///
     /// **What this is for.** Commands move the scope, and some move it as a side effect of
-    /// answering an unrelated question. Measured against dbgeng `10.0.29547.1002`, on a `0x13A`
-    /// kernel bug check and on a user-mode access violation: `!analyze -v` ends with the scope
-    /// at the target's *default*, so a session that had frame 3 selected is on frame 0
-    /// afterwards, and one that had `.ecxr`'s context selected has lost it. Nothing was written
-    /// to the debuggee — but two identical stack reads either side of the analysis describe
-    /// different things, which is the same problem for a host that has to report which of its
-    /// calls mutate state. Saving the scope first and restoring it after makes the analysis
-    /// observably scope-neutral.
+    /// answering an unrelated question. Measured against dbgeng `10.0.29547.1002` on four
+    /// targets — a `0x13A` kernel bug check, a `0xD1` driver fault, a `0x9F` power-state
+    /// watchdog, and a user-mode access violation: `!analyze -v` ends with the scope at the
+    /// target's *default*, so a session that had frame 3 selected is on frame 0 afterwards, and
+    /// one that had `.ecxr`'s context selected has lost it. Nothing was written to the debuggee
+    /// — but two identical stack reads either side of the analysis describe different things,
+    /// which is the same problem for a host that has to report which of its calls mutate state.
+    /// Saving the scope first and restoring it after makes the analysis observably
+    /// scope-neutral.
     ///
-    /// The current thread and process are *not* part of a scope, and were measured not to need
-    /// restoring alongside one: the `~0s` an analysis prints in its `STACK_COMMAND` is advice
-    /// for an operator to type, and running `!analyze -v` left the selected thread alone.
+    /// The current thread and process are *not* part of a scope, and do not need restoring
+    /// alongside one — for a better reason than "the analysis leaves them alone". It does move
+    /// them: on the `0x9F`, where the thread `!analyze` blames is not the one the dump opens on,
+    /// its output says `Implicit thread is now ffffe284fe4dd040` partway through. It puts them
+    /// back before it returns, which the scope is precisely what it does *not* do.
     ///
     /// **Sizing the context blob.** `GetScope` neither reports nor negotiates the size of the
     /// context it wants: it rejects a buffer smaller than the target's `CONTEXT` with
