@@ -91,6 +91,9 @@ pub enum DbgEngError {
 
     #[error("debugger text contains an interior NUL")]
     InvalidOutput,
+
+    #[error("this scope was read from a target the engine no longer holds")]
+    ScopeFromAnotherTarget,
 }
 
 /// Fallback length of `_EPROCESS::ImageFileName` when the field's own size cannot be read.
@@ -130,6 +133,16 @@ const WAIT_INFINITE: u32 = u32::MAX;
 /// `bcdedit /debug on` — blocks past this bound indefinitely (measured: >300s, killed).
 /// See [`DebugEngine::attach_kernel`].
 const KERNEL_ATTACH_WAIT_MS: u32 = 60_000;
+
+/// Buffer sizes offered to `GetScope` for a scope's register context, smallest first.
+///
+/// The engine rejects a buffer below the target's `CONTEXT` size and accepts anything at or
+/// above it (measured — see [`DebugEngine::scope`]), so the first size accepted is the smallest
+/// here that fits, and the first three are the `CONTEXT` sizes of the architectures dbgeng
+/// debugs: x86 (716), ARM64 (912), x64 (1232). The doubling tail is for a target whose context
+/// is larger than any of them — a size this crate has not seen, and would otherwise refuse to
+/// read a scope for at all.
+const SCOPE_CONTEXT_SIZES: &[u32] = &[716, 912, 1232, 2048, 4096, 8192, 16384, 32768, 65536];
 
 /// Ctrl+Breaks one engine from another thread.
 ///
@@ -401,6 +414,69 @@ pub struct StackFrame {
     pub symbol: Option<String>,
     /// How far past [`Self::symbol`] the instruction is; zero when there is no symbol.
     pub displacement: u64,
+}
+
+/// The engine's current **scope**: which instruction, which frame, and the register context
+/// those are read through — what `.frame`, `.cxr`, `.ecxr` and `.trap` set, and what `dt`, `dv`,
+/// `k` and every register read are answered against.
+///
+/// Held in order to be handed back. A scope is a position in someone else's session, and its
+/// fields are the engine's own bookkeeping — a [`DEBUG_STACK_FRAME`] it walked, and an opaque
+/// context blob whose layout is the target's `CONTEXT` — so this is a token to return through
+/// [`DebugEngine::set_scope`] rather than a record to edit. [`DebugEngine::scope_guard`] is the
+/// usual way to use one.
+///
+/// Compares by value, so "the scope did not move" is a thing a caller can assert.
+#[derive(Clone, PartialEq)]
+pub struct Scope {
+    instruction: u64,
+    frame: DEBUG_STACK_FRAME,
+    /// The target's register context, verbatim. Empty when the scope carries none — see
+    /// [`DebugEngine::scope`].
+    context: Vec<u8>,
+    /// Which target this was read from, so a restore cannot land on a later one. See
+    /// [`DebugEngine::target_identity`].
+    target: u64,
+}
+
+impl Scope {
+    /// The instruction the scope is on — frame 0's program counter, unless a frame or a
+    /// register context was selected, in which case it is that one's.
+    pub fn instruction_offset(&self) -> u64 {
+        self.instruction
+    }
+
+    /// The frame the scope names, as the engine walked it.
+    pub fn frame(&self) -> &DEBUG_STACK_FRAME {
+        &self.frame
+    }
+
+    /// Whether the scope carries a register context.
+    ///
+    /// `false` is a legitimate scope rather than a failed read: a target with no thread context
+    /// to offer still has a position, and restoring a scope that never had a context must not —
+    /// and does not — fail.
+    pub fn has_context(&self) -> bool {
+        !self.context.is_empty()
+    }
+}
+
+impl std::fmt::Debug for Scope {
+    /// Summarizes the context rather than printing it: the blob is a kilobyte of register
+    /// state whose bytes mean nothing outside the engine, and a derived `Debug` puts all of
+    /// it in every log line and assertion message that mentions a scope.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scope")
+            .field("instruction", &format_args!("{:#x}", self.instruction))
+            .field("frame", &self.frame.FrameNumber)
+            .field(
+                "frame_offset",
+                &format_args!("{:#x}", self.frame.FrameOffset),
+            )
+            .field("context", &format_args!("{} bytes", self.context.len()))
+            .field("target", &self.target)
+            .finish()
+    }
 }
 
 /// What kind of event a breakpoint watches for.
@@ -1504,6 +1580,156 @@ impl DebugEngine {
         self.execute_command("r")
     }
 
+    /// Reads the engine's current [`Scope`], so it can be put back later.
+    ///
+    /// **What this is for.** Commands move the scope, and some move it as a side effect of
+    /// answering an unrelated question. Measured against dbgeng `10.0.29547.1002`, on a `0x13A`
+    /// kernel bug check and on a user-mode access violation: `!analyze -v` ends with the scope
+    /// at the target's *default*, so a session that had frame 3 selected is on frame 0
+    /// afterwards, and one that had `.ecxr`'s context selected has lost it. Nothing was written
+    /// to the debuggee — but two identical stack reads either side of the analysis describe
+    /// different things, which is the same problem for a host that has to report which of its
+    /// calls mutate state. Saving the scope first and restoring it after makes the analysis
+    /// observably scope-neutral.
+    ///
+    /// The current thread and process are *not* part of a scope, and were measured not to need
+    /// restoring alongside one: the `~0s` an analysis prints in its `STACK_COMMAND` is advice
+    /// for an operator to type, and running `!analyze -v` left the selected thread alone.
+    ///
+    /// **Sizing the context blob.** `GetScope` neither reports nor negotiates the size of the
+    /// context it wants: it rejects a buffer smaller than the target's `CONTEXT` with
+    /// `E_INVALIDARG` and accepts any buffer at or above it, filling the front. (Measured on an
+    /// x64 target, kernel and user-mode alike: 1231 bytes rejected, 1232 — the x64 `CONTEXT` —
+    /// accepted, as is 4096.) So the ask walks [`SCOPE_CONTEXT_SIZES`] upward and keeps the
+    /// first size the engine accepts, which is the smallest of them that covers the target's
+    /// context. `sizeof(CONTEXT)` for *this* process would be the wrong number: the target's
+    /// architecture is the engine's business, not the host's.
+    ///
+    /// **A scope with no register context is legitimate**, so if the engine will not answer the
+    /// context form but will answer the contextless one (`GetScope` with no buffer, which is its
+    /// own documented form), that is the scope — [`Scope::has_context`] says which happened, and
+    /// [`Self::set_scope`] restores either.
+    ///
+    /// An engine with no target answers `E_UNEXPECTED` to both forms (measured: before any open,
+    /// after `end_session`, and on a dump named but never waited for), and that comes back as an
+    /// error rather than as an empty scope.
+    pub fn scope(&self) -> Result<Scope, DbgEngError> {
+        let mut refusal = None;
+        for &size in SCOPE_CONTEXT_SIZES {
+            let mut instruction = 0u64;
+            let mut frame = DEBUG_STACK_FRAME::default();
+            let mut context = vec![0u8; size as usize];
+            match unsafe {
+                self.symbols.GetScope(
+                    Some(&mut instruction),
+                    Some(&mut frame),
+                    Some(context.as_mut_ptr().cast()),
+                    size,
+                )
+            } {
+                Ok(()) => {
+                    return Ok(Scope {
+                        instruction,
+                        frame,
+                        context,
+                        target: self.target_identity(),
+                    });
+                }
+                // "That buffer is too small for this target's context" — try the next size up.
+                Err(why) if why.code() == E_INVALIDARG => refusal = Some(why),
+                // Anything else is the engine declining to produce a context at all, which is
+                // not the same as declining to produce a scope.
+                Err(why) => {
+                    refusal = Some(why);
+                    break;
+                }
+            }
+        }
+        self.contextless_scope(refusal)
+    }
+
+    /// The scope with no register context — the fallback of [`Self::scope`], and the shape a
+    /// target that has no thread context answers with. `refusal` is why the context form did
+    /// not work, reported if this form fails too.
+    fn contextless_scope(
+        &self,
+        refusal: Option<windows::core::Error>,
+    ) -> Result<Scope, DbgEngError> {
+        let mut instruction = 0u64;
+        let mut frame = DEBUG_STACK_FRAME::default();
+        unsafe {
+            self.symbols
+                .GetScope(Some(&mut instruction), Some(&mut frame), None, 0)
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: "reading the debugger's scope".into(),
+            // The context read is the one that was actually wanted, so its failure is the
+            // one worth reporting when neither form works.
+            source: refusal.unwrap_or(source),
+        })?;
+        Ok(Scope {
+            instruction,
+            frame,
+            context: Vec::new(),
+            target: self.target_identity(),
+        })
+    }
+
+    /// Puts a [`Scope`] back — `.cxr`'s mechanism, with the engine's own bytes.
+    ///
+    /// Refused if the engine no longer holds the target the scope was read from: the frame and
+    /// context describe *that* target's stack, and applying them to a later one would point the
+    /// session at an address that means nothing there. This is the case a long-lived
+    /// [`ScopeGuard`] hits when whatever it wrapped replaced the target underneath it.
+    pub fn set_scope(&self, scope: &Scope) -> Result<(), DbgEngError> {
+        if scope.target != self.target_identity() {
+            return Err(DbgEngError::ScopeFromAnotherTarget);
+        }
+        unsafe {
+            self.symbols.SetScope(
+                scope.instruction,
+                Some(&scope.frame),
+                // A scope that carried no context is restored as one: passing a buffer the
+                // engine never gave us would be inventing register state.
+                if scope.context.is_empty() {
+                    None
+                } else {
+                    Some(scope.context.as_ptr().cast())
+                },
+                scope.context.len() as u32,
+            )
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: "restoring the debugger's scope".into(),
+            source,
+        })
+    }
+
+    /// Reads the current [`Scope`] and hands back a guard that restores it when dropped.
+    ///
+    /// The shape to wrap a scope-moving command in, because it puts the scope back on *every*
+    /// path out — an early return, an error, a panic unwinding through the caller — which is
+    /// exactly where a hand-written restore is forgotten:
+    ///
+    /// ```no_run
+    /// # use win_kexp::dbgeng::DebugEngine;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let engine = DebugEngine::new();
+    /// let analysis = {
+    ///     let _scope = engine.scope_guard()?;
+    ///     engine.execute_command("!analyze -v")?
+    /// }; // the scope `!analyze` moved is back here
+    /// # let _ = analysis;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn scope_guard(&self) -> Result<ScopeGuard<'_>, DbgEngError> {
+        Ok(ScopeGuard {
+            engine: self,
+            saved: self.scope()?,
+        })
+    }
+
     /// The current register set as **values**, read through `IDebugRegisters`.
     ///
     /// The same registers [`Self::registers`] prints, minus the printing. `r` renders a target's
@@ -2285,6 +2511,42 @@ impl<'a> PendingTarget<'a> {
     }
 }
 
+/// Holds the [`Scope`] the engine was in, and puts it back when dropped.
+///
+/// From [`DebugEngine::scope_guard`]. The guard borrows the engine, so it cannot outlive it;
+/// what it cannot promise is that the engine still holds the same *target* at drop time, and a
+/// scope from a released target is refused rather than applied — see [`DebugEngine::set_scope`].
+///
+/// `Drop` cannot report anything, so a caller who needs to know the restore worked calls
+/// [`Self::restore`] and reads the result; the drop afterwards then restores the same scope
+/// again, which is a no-op the engine accepts.
+#[must_use = "the scope is restored when this is dropped, so dropping it immediately restores nothing later"]
+pub struct ScopeGuard<'a> {
+    engine: &'a DebugEngine,
+    saved: Scope,
+}
+
+impl ScopeGuard<'_> {
+    /// The scope that will be restored — the engine's position when the guard was taken.
+    pub fn saved(&self) -> &Scope {
+        &self.saved
+    }
+
+    /// Restores the saved scope now, reporting whether it worked.
+    pub fn restore(&self) -> Result<(), DbgEngError> {
+        self.engine.set_scope(&self.saved)
+    }
+}
+
+impl Drop for ScopeGuard<'_> {
+    fn drop(&mut self) {
+        // Best-effort: a failure here has nowhere to go, and this runs on unwind paths where
+        // panicking would abort the process. A target that has gone away is the ordinary
+        // failure, and it is refused inside `set_scope` rather than applied to its successor.
+        let _ = self.engine.set_scope(&self.saved);
+    }
+}
+
 // Output callbacks implementation to capture command output
 #[windows::core::implement(
     windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacks
@@ -3020,6 +3282,121 @@ mod tests {
             "next command did not take effect — the requested interrupt was left pending"
         );
 
+        let _ = e.end_session();
+    }
+
+    /// Puts the session somewhere other than its default scope, and says what did it.
+    ///
+    /// `None` means nothing moved — which the scope tests below must treat as a failure rather
+    /// than a pass, since a scope that never moved is restored by doing nothing at all.
+    fn move_the_scope(e: &DebugEngine) -> Option<&'static str> {
+        let before = e.scope().ok()?;
+        for command in [".frame 1", ".frame 2", ".ecxr"] {
+            let _ = e.execute_command(command);
+            if e.scope().ok()? != before {
+                return Some(command);
+            }
+        }
+        None
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn a_scope_needs_a_target_to_be_read_from() {
+        let e = DebugEngine::new();
+        // Measured: `GetScope` answers `E_UNEXPECTED` with no target, for every buffer size
+        // including none at all. So there is no scope to report as empty — only an error.
+        let err = e
+            .scope()
+            .expect_err("an engine holding no target reported a scope");
+        println!("scope() with no target: {err}");
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn a_saved_scope_is_the_one_restored() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c exit").expect("launch failed");
+
+        let moved_by = move_the_scope(&e).expect("nothing moved the scope; the rest is vacuous");
+        let saved = e.scope().expect("scope() failed");
+        println!("scope moved by `{moved_by}`: {saved:?}");
+        // The context is what makes this more than a frame number, and its buffer is sized by
+        // walking `SCOPE_CONTEXT_SIZES`. A live target on any architecture the CI runs (x64 and
+        // ARM64) must find its size in there.
+        assert!(
+            saved.has_context(),
+            "no size in SCOPE_CONTEXT_SIZES covered this target's CONTEXT"
+        );
+
+        // Move again, so the restore has something to undo.
+        e.execute_command(".frame 0").expect(".frame 0 failed");
+        assert_ne!(
+            e.scope().expect("scope() failed"),
+            saved,
+            "the second move did not move anything"
+        );
+
+        e.set_scope(&saved).expect("set_scope failed");
+        assert_eq!(
+            e.scope().expect("scope() failed"),
+            saved,
+            "the scope that came back is not the one that was saved"
+        );
+        let _ = e.end_session();
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn a_guard_restores_the_scope_even_when_the_caller_panics() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c exit").expect("launch failed");
+        move_the_scope(&e).expect("nothing moved the scope; the rest is vacuous");
+        let before = e.scope().expect("scope() failed");
+
+        // The path a hand-written save/restore pair misses. `AssertUnwindSafe` because the
+        // engine is deliberately shared across the boundary: whether it was left consistent is
+        // the thing under test.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = e.scope_guard().expect("scope_guard() failed");
+            e.execute_command(".frame 0").expect(".frame 0 failed");
+            panic!("the guarded call gave up");
+        }))
+        .is_err();
+        assert!(panicked, "the closure was supposed to panic");
+
+        assert_eq!(
+            e.scope().expect("scope() failed"),
+            before,
+            "the guard did not restore the scope while unwinding"
+        );
+        let _ = e.end_session();
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn a_scope_is_not_restored_onto_a_later_target() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c exit").expect("launch failed");
+        let stale = e.scope().expect("scope() failed");
+        let _ = e.end_session();
+
+        // A second target in the same engine: the frame and context in `stale` describe a stack
+        // that no longer exists, and pointing this session at it would be worse than refusing.
+        e.launch_process("cmd.exe /c exit")
+            .expect("second launch failed");
+        let err = e
+            .set_scope(&stale)
+            .expect_err("a scope from the previous target was applied to this one");
+        assert!(
+            matches!(err, DbgEngError::ScopeFromAnotherTarget),
+            "wrong error for a stale scope: {err}"
+        );
+
+        // The refusal is about *that* scope, not about the engine: this target's own still works.
+        let fresh = e.scope().expect("scope() failed");
+        e.set_scope(&fresh)
+            .expect("set_scope failed on a fresh scope");
         let _ = e.end_session();
     }
 }
