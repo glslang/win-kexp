@@ -408,6 +408,21 @@ impl Module {
     }
 }
 
+/// The kernel image a target is running: where it is loaded, and which build it is.
+///
+/// Hashable and comparable so it can key a cache of anything derived from the kernel's types
+/// and globals — which is why the build fields travel with the base rather than beside it. See
+/// [`DebugEngine::kernel_image`] for what each field is and why these three.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct KernelImage {
+    /// Where `nt` is loaded. Globals resolved against it are addresses, so this is part of the
+    /// identity of anything resolved, not merely of the lookup that found it.
+    pub base: u64,
+    pub size: u32,
+    pub timestamp: u32,
+    pub checksum: u32,
+}
+
 /// The bug check a target stopped on, as [`DebugEngine::bug_check`] reports it.
 ///
 /// The engine's own five values and nothing else: what each parameter *means* is per-code lore
@@ -811,6 +826,44 @@ impl DebugEngine {
             source,
         })?;
         Ok(base)
+    }
+
+    /// Where `nt` is loaded **and which build it is**.
+    ///
+    /// The base alone does not identify a kernel. Two targets from different Windows builds can
+    /// load `nt` at the same address — the debugger says nothing about the change — so anything
+    /// caching type offsets or globals against a base can serve one build's layout for another
+    /// and mis-decode every structure it reads, confidently. That is what this exists for; see
+    /// [`Self::kernel_base`] when only the address is wanted.
+    ///
+    /// `TimeDateStamp` and `SizeOfImage` are the identity a symbol server keys the *binary* on
+    /// — the `65F579991450000` in a downloaded `ntkrnlmp.exe` path is exactly this pair — so
+    /// they change with the build by construction. `CheckSum` comes along because it is in the
+    /// same read and narrows it further.
+    ///
+    /// One caveat worth knowing: a target whose headers the engine could not read reports these
+    /// as zero, and two such builds at one base are indistinguishable again. That is the state
+    /// this replaced, not a regression from it.
+    pub fn kernel_image(&self) -> Result<KernelImage, DbgEngError> {
+        let base = self.kernel_base()?;
+        let mut params = DEBUG_MODULE_PARAMETERS::default();
+        // Looked up by base rather than by index: `GetModuleByModuleName` hands back an
+        // address, and asking for the parameters of *that* module is one call, where finding
+        // its index first would be two and could race a module list that changed between them.
+        unsafe {
+            self.symbols
+                .GetModuleParameters(1, Some(&base), 0, &mut params)
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: format!("reading the parameters of the kernel image at {base:#x}"),
+            source,
+        })?;
+        Ok(KernelImage {
+            base,
+            size: params.Size,
+            timestamp: params.TimeDateStamp,
+            checksum: params.Checksum,
+        })
     }
 
     pub fn symbol_offset(&self, name: &str) -> Result<u64, DbgEngError> {

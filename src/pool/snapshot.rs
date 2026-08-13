@@ -2602,10 +2602,9 @@ mod tests {
             types.insert("_HEAP_VS_SLOT_MAP", type_layout(4, &[("SlotRef", 0)]));
         }
         PoolLayout {
-            key: crate::pool::layout::SessionKey {
-                kernel_base: 0,
+            key: crate::pool::layout::LayoutKey {
+                image: crate::dbgeng::KernelImage::default(),
                 session: 1,
-                target: 1,
             },
             globals: HashMap::new(),
             types,
@@ -2702,10 +2701,9 @@ mod tests {
     fn test_vs_roots_reports_when_neither_shape_resolves() {
         let memory = FlatMemory::new(VS_CONTEXT, 0x100);
         let layout = PoolLayout {
-            key: crate::pool::layout::SessionKey {
-                kernel_base: 0,
+            key: crate::pool::layout::LayoutKey {
+                image: crate::dbgeng::KernelImage::default(),
                 session: 1,
-                target: 1,
             },
             globals: HashMap::new(),
             types: HashMap::new(),
@@ -3362,7 +3360,7 @@ mod tests {
             DESCRIPTOR_FLAG_ALLOCATED, DESCRIPTOR_FLAG_FIRST, DESCRIPTOR_FLAG_SUBSEGMENT,
             DESCRIPTOR_FLAG_VS,
         },
-        layout::{SessionKey, TypeLayout},
+        layout::{LayoutKey, TypeLayout},
     };
 
     /// `RangeFlags` for an in-use page range: allocated, and the range's first descriptor.
@@ -3741,10 +3739,12 @@ mod tests {
             type_layout(0x20, &[("Va", 0), ("Key", 8), ("NumberOfBytes", 0x10)]),
         );
         PoolLayout {
-            key: SessionKey {
-                kernel_base: K,
+            key: LayoutKey {
+                image: crate::dbgeng::KernelImage {
+                    base: K,
+                    ..crate::dbgeng::KernelImage::default()
+                },
                 session: 1,
-                target: 1,
             },
             globals: [
                 ("ExPoolState", STATE),

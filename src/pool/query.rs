@@ -335,16 +335,18 @@ pub(crate) fn prepare_index(
     // itself; the generation only has to move when the *target* changes, which is what
     // `invalidate_session` is for.
     let key = SessionKey {
-        kernel_base: engine.kernel_base()?,
+        image: engine.kernel_image()?,
         session: generation(),
         target: engine.target_identity(),
     };
-    // Layouts describe the *image*, not which target instance is loaded, so they are keyed
-    // without `target`. Including it inserted an entry per engine and per `end_session`
-    // that nothing ever pruned — the same unbounded growth removed above for `refresh`.
-    let layout_key = SessionKey { target: 0, ..key };
+    // The layout cache takes the same key and narrows it to a `LayoutKey` itself — a layout
+    // describes the *image*, not which target instance is loaded, and the two ways of getting
+    // that wrong are opposite. Keyed on the target it grew an entry per engine and per
+    // `end_session` that nothing pruned; keyed on the base alone, two Windows builds whose
+    // kernels load at one address share a layout, which is not a leak but wrong data reported
+    // confidently.
     let layout = LayoutCache::global()
-        .get_or_resolve(engine, layout_key)
+        .get_or_resolve(engine, key)
         .map_err(|error| PoolQueryError::Layout(error.to_string()))?;
 
     // Keyed on the whole `SessionKey`: a programmatic host receives no session
