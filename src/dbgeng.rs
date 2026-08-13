@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -603,6 +604,66 @@ fn next_target_identity() -> u64 {
     NEXT_TARGET_IDENTITY.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The identity currently in force for each debug client, so one **outlives the wrapper it was
+/// issued to**.
+///
+/// A borrowed engine is built afresh around the same `IDebugClient6` for every extension
+/// command, so its identity has to be stable across those wrappers or each command misses every
+/// cache. Deriving it from the client pointer did that, and lost each wrapper's lifecycle with
+/// the wrapper: an `end_session` bumped a field on a value dropped moments later, so the next
+/// wrapper restored the original pointer-derived identity and could be served a snapshot
+/// gathered from the target before it. The identity lives here instead, where the bump survives.
+///
+/// An entry is only ever cache warmth. Forgetting one costs a re-resolve and a re-walk, never a
+/// stale answer, since a fresh identity matches nothing — which is why this can simply drop
+/// everything when it grows rather than needing an eviction policy to reason about.
+///
+/// **What it does not fix**: a client released and another allocated at the same address
+/// inherits the first one's identity. That was equally true of the pointer-derived scheme this
+/// replaces, and closing it needs an identity read from the debuggee rather than from the
+/// client holding it.
+fn client_identities() -> &'static Mutex<HashMap<usize, u64>> {
+    static IDENTITIES: OnceLock<Mutex<HashMap<usize, u64>>> = OnceLock::new();
+    IDENTITIES.get_or_init(Mutex::default)
+}
+
+/// How many clients' identities to remember before dropping the lot; see [`client_identities`]
+/// for why dropping them is safe. Sized well past the handful of clients any real host holds —
+/// the extension reuses exactly one — so reaching it means something is creating clients in a
+/// loop, and that is the case worth bounding.
+const MAX_REMEMBERED_CLIENTS: usize = 64;
+
+fn client_key(client: &IDebugClient6) -> usize {
+    client.as_raw() as usize
+}
+
+/// The identity in force for `client`, issuing one if this is the first wrapper to ask.
+fn identity_of(client: &IDebugClient6) -> u64 {
+    identity_for(client_key(client))
+}
+
+/// Issues a fresh identity for `client` and records it, so nothing cached against the target it
+/// is letting go of can be handed to a later wrapper around the same client.
+fn reissue_identity(client: &IDebugClient6) -> u64 {
+    reissue_for(client_key(client))
+}
+
+/// The two above, over the key rather than the COM pointer it comes from — which is all the
+/// registry deals in, and all a test of it needs.
+fn identity_for(key: usize) -> u64 {
+    let mut identities = client_identities().lock().unwrap();
+    if identities.len() >= MAX_REMEMBERED_CLIENTS {
+        identities.clear();
+    }
+    *identities.entry(key).or_insert_with(next_target_identity)
+}
+
+fn reissue_for(key: usize) -> u64 {
+    let identity = next_target_identity();
+    client_identities().lock().unwrap().insert(key, identity);
+    identity
+}
+
 pub struct DebugEngine {
     client: IDebugClient6,
     control: IDebugControl4,
@@ -662,11 +723,12 @@ impl DebugEngine {
         // We opened this session, so we own its teardown.
         let mut engine = Self::from_client_interface(client);
         engine.owns_session = true;
-        // Only an engine that opened its own session gets a distinct identity: it is
-        // long-lived, and a host may hold several against targets that share a kernel base.
+        // A client this new cannot be one anything holds a cached view of — whatever address
+        // it landed on. Reissuing rather than adopting whatever `identity_of` found there is
+        // what makes a recycled pointer harmless for the case we control.
         engine
             .target_identity
-            .store(next_target_identity(), Ordering::Release);
+            .store(reissue_identity(&engine.client), Ordering::Release);
         engine
     }
 
@@ -710,11 +772,12 @@ impl DebugEngine {
             .cast::<IDebugSymbols3>()
             .expect("[-] Failed to get debug symbols interface");
 
-        // Derived from the client rather than a counter: a borrowed engine is wrapped
-        // afresh per extension command, so a per-wrapper counter would miss the caches
-        // every time — while a shared constant would collide across two programmatic
-        // hosts holding unrelated targets that happen to share a kernel base.
-        let identity = client.as_raw() as u64;
+        // Looked up by client rather than counted per wrapper: a borrowed engine is wrapped
+        // afresh per extension command, so a per-wrapper counter would miss the caches every
+        // time — while a shared constant would collide across two programmatic hosts holding
+        // unrelated targets that happen to share a kernel base. See `client_identities` for
+        // why this is a registry and not the client pointer it used to be.
+        let identity = identity_of(&client);
         Self {
             client,
             control,
@@ -749,7 +812,7 @@ impl DebugEngine {
                 operation: "querying IDebugSymbols3".into(),
                 source,
             })?;
-        let identity = client.as_raw() as u64;
+        let identity = identity_of(&client);
         Ok(Self {
             client,
             control,
@@ -779,6 +842,11 @@ impl DebugEngine {
     /// Changes when the engine is replaced *or* when it releases its target, so a cache
     /// keyed on it cannot serve data gathered from a previous target. The kernel base is
     /// not sufficient on its own: two dumps from the same boot share it.
+    ///
+    /// Held against the *client* rather than in this wrapper — see [`client_identities`] — so
+    /// that a host which rebuilds its engine around one client, as a WinDbg extension does per
+    /// command, both keeps its caches and cannot lose a release that happened in an earlier
+    /// wrapper.
     pub fn target_identity(&self) -> u64 {
         self.target_identity.load(Ordering::Acquire)
     }
@@ -1773,8 +1841,9 @@ impl DebugEngine {
     ///   A guard wrapping one command is not exposed to this by a command that moves the thread
     ///   and moves it back, which is what `!analyze -v` was measured doing (see [`Self::scope`]):
     ///   what matters at the restore is where the thread ended up, not where it went.
-    /// - **A borrowed WinDbg client whose host switched targets.** There the identity is the
-    ///   client pointer, which does not change when WinDbg opens something else under it.
+    /// - **A borrowed WinDbg client whose host switched targets.** The identity is held per
+    ///   client and reissued when an `end_session` goes through *this* engine, so a change
+    ///   WinDbg makes on its own — opening another dump under an extension — does not move it.
     ///
     /// In both, the caller is the only one who can know, and a guard held across such a change
     /// restores a scope its target no longer means.
@@ -2499,9 +2568,11 @@ impl DebugEngine {
     /// reused for another target.
     pub fn end_session(&self) -> Result<(), DbgEngError> {
         // The target is going away, so anything cached against it must not be reused for
-        // whatever this engine holds next.
+        // whatever this engine holds next — nor by the next wrapper built around this same
+        // client, which is why the new identity is recorded against the client and not only
+        // in this engine's own field.
         self.target_identity
-            .store(next_target_identity(), Ordering::Release);
+            .store(reissue_identity(&self.client), Ordering::Release);
         // A live kernel left halted (at a break) and detached *passively* stays FROZEN —
         // one CPU halted, the rest spinning — because a passive detach never tells the
         // target to run. Resume it and actively detach instead, leaving it running.
@@ -2869,6 +2940,49 @@ mod tests {
     };
 
     use super::*;
+
+    /// glslang/win-kexp#82: a borrowed engine's lifecycle used to die with the wrapper.
+    ///
+    /// The identity was the client pointer, so it was stable across the per-command wrappers an
+    /// extension builds — which is what it was for — while an `end_session` bumped a field on a
+    /// value dropped moments later. Rebuild the wrapper around the same client and the original
+    /// pointer-derived identity came back, matching cache entries gathered from the target it
+    /// had just let go of.
+    ///
+    /// One test rather than four: the registry is process-global, so separate tests could clear
+    /// each other's entries through the cap below.
+    #[test]
+    fn a_clients_identity_outlives_the_wrapper_it_was_issued_to() {
+        // Keys no real client pointer can collide with: an `IDebugClient6` is a heap
+        // allocation, and these sit far below any address one lands at.
+        let (client, other) = (0x11, 0x22);
+
+        let first = identity_for(client);
+        assert_eq!(
+            identity_for(client),
+            first,
+            "a rebuilt wrapper keeps its caches"
+        );
+        assert_ne!(identity_for(other), first, "two clients are two targets");
+
+        // The case that was lost: the wrapper that ends the session is gone by the time the
+        // next one asks, so the bump has to be recorded against the client, not in the wrapper.
+        let after_release = reissue_for(client);
+        assert_ne!(after_release, first);
+        assert_eq!(identity_for(client), after_release);
+
+        // Forgetting an entry is safe by construction, and this is the claim that makes it so:
+        // identities come from a counter that never repeats, so a dropped entry costs a re-walk
+        // and can never resurrect a previous target's.
+        for filler in 0..MAX_REMEMBERED_CLIENTS {
+            identity_for(0x1000 + filler);
+        }
+        assert!(client_identities().lock().unwrap().len() <= MAX_REMEMBERED_CLIENTS);
+        assert!(
+            identity_for(client) >= after_release,
+            "a forgotten client is issued a later identity, never an earlier one"
+        );
+    }
 
     /// A `DEBUG_VALUE` carrying a value in the arm `type_code` names.
     fn tagged(type_code: u32, fill: impl FnOnce(&mut DEBUG_VALUE_0)) -> DEBUG_VALUE {
