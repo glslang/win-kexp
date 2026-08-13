@@ -7,7 +7,7 @@ use thiserror::Error;
 use super::decode::{
     PAGE_SIZE, PoolHeaderLayout, SpecialPoolHeader, adjust_page_end_header, big_page_probe,
     decode_descriptor_at, decode_large_allocation, decode_lfh_subsegment, decode_pool_header,
-    decode_rb_root, decode_slist_header_next, decode_special_pool_header, decode_vs_sizes,
+    decode_rb_root, decode_slist_header_next, decode_special_pool_header, decode_vs_chunk,
     descriptor_backend, lfh_bitmap_state, read_u16, read_u32, read_u64,
     valid_descriptor_tree_signature, valid_page_segment_signature, valid_vs_signature,
 };
@@ -1595,6 +1595,17 @@ pub(crate) struct PoolSnapshot {
     pub budget_expired: bool,
     /// What the walk stepped over rather than gave up on; see [`WalkStalls`].
     pub stalls: WalkStalls,
+    /// Chunk headers a backend decoder refused and resynchronised past, across the whole walk.
+    ///
+    /// A count, because the diagnostic that names them cannot be one. `PoolDiagnostics`
+    /// collapses messages by shape, and a refusal is reported once per extent — so the figure
+    /// beside that line counts *extents that contained a refusal*, which reads like a chunk
+    /// count and is not one. On the walk that raised glslang/win-kexp#93 the difference was
+    /// between "884" and a number nothing recorded.
+    ///
+    /// Only `walk_vs` feeds it today; LFH subsegments are refused during discovery, one per
+    /// subsegment, where the count and the message already agree.
+    pub refused_chunks: u64,
 }
 
 /// What valid-region queries that could not advance cost the walk, and what stepping over them
@@ -2228,10 +2239,27 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         }
     }
 
+    /// Decodes one committed extent of a VS subsegment, chunk by chunk.
+    ///
+    /// A refused header costs more than itself: the walk no longer knows where the next one
+    /// starts, so it advances sixteen bytes and tries again, and every header after it in the
+    /// extent is decoded at a *guessed* offset rather than at the end of the previous chunk.
+    /// One header rewritten while we read it and one systematically misdecoded field therefore
+    /// look identical from a count — which is why what is reported here is the count of
+    /// **chunks** refused rather than of extents that contained a refusal, the failing
+    /// predicate in its own words, and the `Sizes` word as read.
     fn walk_vs(&self, region: &PoolRegion, base: u64, bytes: &[u8], snapshot: &mut PoolSnapshot) {
         let mut offset = ((16 - (base as usize & 0xf)) & 0xf).min(bytes.len());
         let mut chunks = 0usize;
-        let mut reported_corruption = false;
+        let header_bytes = region.vs_header_size + region.pool_header.size;
+        let subsegment_end = region.address.saturating_add(region.size as u64);
+        let mut refused = 0u64;
+        let mut resync_from = None;
+        let mut chain_breaks = 0u64;
+        // What the *next* header must record as its previous size, or `None` where there is
+        // nothing to compare against: at the start of an extent, and after a resynchronisation,
+        // where the walk no longer knows which chunk it is standing on.
+        let mut previous_chunk = None;
         while offset
             .saturating_add(region.vs_header_size)
             .saturating_add(region.pool_header.size)
@@ -2242,32 +2270,46 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             let Some(encoded) = read_u64(bytes, offset + region.vs_sizes_offset) else {
                 break;
             };
-            let Some(sizes) = decode_vs_sizes(encoded, header_address, region.heap_key) else {
-                if !reported_corruption {
-                    snapshot.diagnostics.push(format!(
-                        "rejecting corrupt VS metadata beginning at {header_address:#x}"
-                    ));
-                    reported_corruption = true;
+            let chunk = match decode_vs_chunk(
+                encoded,
+                header_address,
+                region.heap_key,
+                header_bytes,
+                subsegment_end,
+            ) {
+                Ok(chunk) => chunk,
+                Err(rejection) => {
+                    if refused == 0 {
+                        snapshot.diagnostics.push(format!(
+                            "refusing VS chunk at {header_address:#x}: {rejection}"
+                        ));
+                    }
+                    refused += 1;
+                    resync_from.get_or_insert(header_address);
+                    previous_chunk = None;
+                    snapshot.complete = false;
+                    offset = offset.saturating_add(16);
+                    continue;
                 }
-                snapshot.complete = false;
-                offset = offset.saturating_add(16);
-                continue;
             };
-            let chunk_size = (sizes.size as usize).saturating_mul(16);
-            if chunk_size < region.vs_header_size + region.pool_header.size
-                || header_address.saturating_add(chunk_size as u64)
-                    > region.address.saturating_add(region.size as u64)
+            if let Some(expected) = previous_chunk
+                && chunk.previous_size != expected
             {
-                if !reported_corruption {
+                // Not a refusal: the chunk itself is plausible, and the chain disagreeing says
+                // the *stride* that reached it is wrong. Reported so one live run can tell a
+                // header rewritten under us from a walk decoding the wrong field, which is the
+                // question a refusal count on its own cannot answer.
+                if chain_breaks == 0 {
                     snapshot.diagnostics.push(format!(
-                        "rejecting implausible VS chunk size {chunk_size:#x} at {header_address:#x}"
+                        "VS chunk at {header_address:#x} records a previous size of \
+                         {:#x} where the chunk before it measured {expected:#x}",
+                        chunk.previous_size
                     ));
-                    reported_corruption = true;
                 }
+                chain_breaks += 1;
                 snapshot.complete = false;
-                offset = offset.saturating_add(16);
-                continue;
             }
+            let chunk_size = chunk.size;
             if offset.saturating_add(chunk_size) > bytes.len() {
                 snapshot.complete = false;
                 break;
@@ -2286,7 +2328,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 PoolState::CachedFree
             } else if region.reusable_chunks.contains(&header_address) {
                 PoolState::ReusableFree
-            } else if sizes.allocated {
+            } else if chunk.allocated {
                 PoolState::Allocated
             } else {
                 PoolState::ReusableFree
@@ -2304,9 +2346,21 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             );
             span.size_class = chunk_size.min(u32::MAX as usize) as u32;
             snapshot.spans.push(span);
-            let _ = sizes.previous_size;
+            previous_chunk = Some(chunk_size);
             offset += chunk_size;
             chunks += 1;
+        }
+        if let Some(from) = resync_from {
+            snapshot.refused_chunks = snapshot.refused_chunks.saturating_add(refused);
+            snapshot.diagnostics.push(format!(
+                "{refused} VS chunk headers refused, resynchronising from {from:#x}"
+            ));
+        }
+        if chain_breaks > 0 {
+            snapshot.diagnostics.push(format!(
+                "{chain_breaks} VS chunks disagreed with the size of the chunk before them, \
+                 from {base:#x}"
+            ));
         }
         if chunks >= self.traversal_limit {
             snapshot.complete = false;
@@ -2860,6 +2914,181 @@ mod tests {
             reusable_chunks: Arc::default(),
             cached_chunks: Arc::default(),
         }
+    }
+
+    const VS_BASE: u64 = 0x2000;
+    const VS_HEAP_KEY: u64 = 0x1234_5678_9abc_def0;
+
+    fn vs_region(size: usize) -> PoolRegion {
+        PoolRegion {
+            address: VS_BASE,
+            size,
+            pool_kind: PoolKind::NonPagedNx,
+            numa_node: 0,
+            heap: HeapIdentity {
+                pool_state: 0,
+                heap: 0,
+                special: false,
+            },
+            subsegment: Some(VS_BASE),
+            backend: PoolBackend::Vs,
+            unit_size: 0,
+            bitmap: Vec::new(),
+            heap_key: VS_HEAP_KEY,
+            pool_header: X64_POOL_HEADER,
+            vs_header_size: 0x10,
+            vs_sizes_offset: 0,
+            known_tag: None,
+            states: Vec::new(),
+            reusable_chunks: Arc::default(),
+            cached_chunks: Arc::default(),
+        }
+    }
+
+    /// VS chunks laid end to end from [`VS_BASE`]: each carries its `Sizes` word, then the pool
+    /// header, then its data. `(size, previous)` are both bytes, and `previous` is written as
+    /// given so the chain can be broken on purpose.
+    fn vs_extent(chunks: &[(usize, usize)]) -> Vec<u8> {
+        let mut bytes = vec![0u8; chunks.iter().map(|(size, _)| size).sum()];
+        let mut offset = 0;
+        for &(size, previous) in chunks {
+            let decoded =
+                ((size as u64 / 16) << 16) | ((previous as u64 / 16) << 32) | (1u64 << 48);
+            let encoded = decoded ^ VS_HEAP_KEY ^ (VS_BASE + offset as u64);
+            bytes[offset..offset + 8].copy_from_slice(&encoded.to_le_bytes());
+            let pool = offset + 0x10;
+            bytes[pool..pool + 4].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+            bytes[pool + 4..pool + 8].copy_from_slice(b"VS!!");
+            offset += size;
+        }
+        bytes
+    }
+
+    fn walk_vs_extent(bytes: &[u8]) -> PoolSnapshot {
+        let region = vs_region(bytes.len());
+        let memory = FlatMemory::new(VS_BASE, bytes.len());
+        let layout = vs_layout(false);
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1000,
+        };
+        let mut snapshot = PoolSnapshot {
+            complete: true,
+            ..PoolSnapshot::default()
+        };
+        walker.walk_vs(&region, VS_BASE, bytes, &mut snapshot);
+        snapshot
+    }
+
+    /// glslang/win-kexp#93: "884x rejecting implausible VS chunk size # at #" counted the
+    /// *extents* that contained a refusal, because the message was latched behind a bool. How
+    /// many chunks were refused was reported nowhere — and a refusal is not free, since the
+    /// walk then advances sixteen bytes at a time and decodes every later header in the extent
+    /// at a guessed offset.
+    #[test]
+    fn test_vs_refusals_are_counted_as_chunks_not_as_extents() {
+        let mut bytes = vs_extent(&[(0x40, 0), (0x40, 0x40), (0x40, 0x40)]);
+        bytes.extend_from_slice(&[0u8; 0x40]); // three more header-sized strides of nothing
+        let snapshot = walk_vs_extent(&bytes);
+
+        assert_eq!(snapshot.spans.len(), 3);
+        assert_eq!(snapshot.refused_chunks, 3);
+        assert!(!snapshot.complete);
+        let examples = snapshot.diagnostics.examples();
+        assert_eq!(
+            examples
+                .iter()
+                .filter(|message| message.starts_with("refusing VS chunk at"))
+                .count(),
+            1,
+            "the detail is a sample, not one line per refusal: {examples:?}"
+        );
+        assert!(
+            examples.iter().any(|message| message
+                == "3 VS chunk headers refused, resynchronising from 0x20c0"),
+            "{examples:?}"
+        );
+    }
+
+    /// One predicate covered two different failures and printed one sentence for both, so a
+    /// live run could not say which was happening. Distinct prose keeps them distinct shapes
+    /// under diagnostic collapse while the numbers still fold.
+    #[test]
+    fn test_vs_says_which_check_a_chunk_failed() {
+        let refuse = |size: usize, end: u64| {
+            let decoded = (size as u64 / 16) << 16;
+            decode_vs_chunk(
+                decoded ^ VS_HEAP_KEY ^ VS_BASE,
+                VS_BASE,
+                VS_HEAP_KEY,
+                0x20,
+                end,
+            )
+            .unwrap_err()
+        };
+        assert_eq!(refuse(0, 0x3000).reason, "the size word decodes to zero");
+        assert_eq!(
+            refuse(0x10, 0x3000).reason,
+            "the chunk is smaller than its own headers"
+        );
+        assert_eq!(
+            refuse(0x100, 0x2080).reason,
+            "the chunk runs past the end of its subsegment"
+        );
+        // The word as read travels with the refusal, so a header can be re-decoded by hand
+        // against another candidate mix without another walk of the target.
+        assert_eq!(
+            refuse(0x10, 0x3000).encoded,
+            (1u64 << 16) ^ VS_HEAP_KEY ^ VS_BASE
+        );
+        // A subsegment's last chunk reaches its boundary exactly, and refusing that would drop
+        // a well-formed chunk from every subsegment that is fully occupied.
+        assert_eq!(
+            decode_vs_chunk(
+                ((0x80u64 / 16) << 16) ^ VS_HEAP_KEY ^ VS_BASE,
+                VS_BASE,
+                VS_HEAP_KEY,
+                0x20,
+                VS_BASE + 0x80,
+            )
+            .unwrap()
+            .size,
+            0x80
+        );
+    }
+
+    /// The corroboration the decoder had in hand and threw away (`let _ = sizes.previous_size`).
+    /// It is what tells the two explanations for a refusal apart: a chain that holds either
+    /// side of one bad chunk is a header rewritten while we read it, while a chain that never
+    /// holds says the stride itself is wrong and the chunks behind it are fiction.
+    #[test]
+    fn test_vs_reports_a_chunk_that_disagrees_with_its_predecessor() {
+        let snapshot = walk_vs_extent(&vs_extent(&[(0x40, 0), (0x40, 0x40), (0x40, 0x20)]));
+
+        assert_eq!(
+            snapshot.spans.len(),
+            3,
+            "the chunk itself is still plausible"
+        );
+        assert_eq!(snapshot.refused_chunks, 0);
+        assert!(!snapshot.complete);
+        let examples = snapshot.diagnostics.examples();
+        assert!(
+            examples.iter().any(|message| message
+                == "VS chunk at 0x2080 records a previous size of 0x20 where the chunk before it measured 0x40"),
+            "{examples:?}"
+        );
+        assert!(
+            examples
+                .iter()
+                .any(|message| message.starts_with("1 VS chunks disagreed")),
+            "{examples:?}"
+        );
+        // A chain that holds says nothing at all.
+        let quiet = walk_vs_extent(&vs_extent(&[(0x40, 0), (0x40, 0x40), (0x40, 0x40)]));
+        assert!(quiet.complete);
+        assert!(quiet.diagnostics.is_empty(), "{:?}", quiet.diagnostics);
     }
 
     /// A memory source with gaps in it, answering `valid_region` two ways the debugger does.

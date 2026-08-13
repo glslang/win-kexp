@@ -36,6 +36,8 @@ pub(crate) struct PoolIndex {
     /// Carried through from [`PoolSnapshot::stalls`], for the same reason the two flags above
     /// are: the index is all a caller ever sees of the walk.
     pub stalls: WalkStalls,
+    /// Carried through from [`PoolSnapshot::refused_chunks`].
+    pub refused_chunks: u64,
     row_postings: HashMap<RowIdentity, Vec<usize>>,
     span_rows: Vec<RowIdentity>,
 }
@@ -86,6 +88,7 @@ impl PoolIndex {
             complete: snapshot.complete,
             budget_expired: snapshot.budget_expired,
             stalls: snapshot.stalls,
+            refused_chunks: snapshot.refused_chunks,
             row_postings,
             span_rows,
         }

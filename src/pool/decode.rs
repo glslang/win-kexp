@@ -171,14 +171,104 @@ pub(crate) fn valid_descriptor_tree_signature(signature: u32) -> bool {
 }
 
 /// Windows VS headers encode both size words with the heap key and header address.
-pub(crate) fn decode_vs_sizes(encoded: u64, header: u64, heap_key: u64) -> Option<VsSizes> {
+///
+/// Unconditional: whether the values are believable is [`decode_vs_chunk`]'s question, and a
+/// header refused there still has to be able to say what it decoded to.
+pub(crate) fn decode_vs_sizes(encoded: u64, header: u64, heap_key: u64) -> VsSizes {
     let decoded = encoded ^ heap_key ^ header;
-    let size = (decoded >> 16) as u16;
-    let previous_size = (decoded >> 32) as u16;
-    (size != 0).then_some(VsSizes {
+    VsSizes {
+        size: (decoded >> 16) as u16,
+        previous_size: (decoded >> 32) as u16,
+        allocated: (decoded >> 48) as u8 != 0,
+    }
+}
+
+/// One `_HEAP_VS_CHUNK_HEADER`, in bytes rather than in the sixteen-byte units it stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VsChunk {
+    /// The chunk's whole extent, its own headers included.
+    pub size: usize,
+    /// What this header says the chunk *before* it measured.
+    ///
+    /// The kernel keeps the chain so a free can coalesce backwards, which makes it a
+    /// corroboration of the walk's own forward stride that costs nothing: walking forward, the
+    /// next chunk's `previous_size` must equal this chunk's `size`. It is also the check that
+    /// separates the two explanations for a refused header — a chain that holds either side of
+    /// one bad chunk is a header rewritten while we read it, a chain that never holds says the
+    /// field or the starting offset is wrong and everything decoded after it is fiction.
+    pub previous_size: usize,
+    pub allocated: bool,
+}
+
+/// Why a VS chunk header was not believed, and the decoded values that say so.
+///
+/// Same division of labour as [`LfhRejection`]: the failing predicate is prose with no digits
+/// in it, so `PoolDiagnostics` keeps the shapes apart while folding the numbers, and the values
+/// travel as numbers so a sample of each shape carries real ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VsRejection {
+    /// The predicate that failed, as prose with no digits in it.
+    pub reason: &'static str,
+    pub size: usize,
+    pub previous_size: usize,
+    /// The `Sizes` word as read, so a refused header can be re-decoded by hand against another
+    /// candidate mix without another walk of the target.
+    pub encoded: u64,
+}
+
+impl fmt::Display for VsRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} (size {:#x}, previous size {:#x}, encoded {:#018x})",
+            self.reason, self.size, self.previous_size, self.encoded
+        )
+    }
+}
+
+/// Decodes a VS chunk header, or says which plausibility check it failed.
+///
+/// `header_bytes` is the chunk header plus the pool header it carries — the smallest extent a
+/// chunk can occupy and still be one. `subsegment_end` is one past the last byte of the
+/// subsegment the chunk belongs to.
+///
+/// The end test is `>` and not `>=` deliberately: a subsegment's last chunk reaches its
+/// boundary exactly, and refusing that would reject a well-formed chunk from every subsegment
+/// that is fully occupied.
+pub(crate) fn decode_vs_chunk(
+    encoded: u64,
+    header_address: u64,
+    heap_key: u64,
+    header_bytes: usize,
+    subsegment_end: u64,
+) -> Result<VsChunk, VsRejection> {
+    let sizes = decode_vs_sizes(encoded, header_address, heap_key);
+    let size = usize::from(sizes.size).saturating_mul(16);
+    let previous_size = usize::from(sizes.previous_size).saturating_mul(16);
+    let reject = |reason| {
+        Err(VsRejection {
+            reason,
+            size,
+            previous_size,
+            encoded,
+        })
+    };
+    // Its own reason rather than a case of "smaller than its headers": a zero size is what an
+    // uninitialised or wrongly keyed word decodes to, and it is also the one value the walk
+    // could not stride by even if it believed it.
+    if size == 0 {
+        return reject("the size word decodes to zero");
+    }
+    if size < header_bytes {
+        return reject("the chunk is smaller than its own headers");
+    }
+    if header_address.saturating_add(size as u64) > subsegment_end {
+        return reject("the chunk runs past the end of its subsegment");
+    }
+    Ok(VsChunk {
         size,
         previous_size,
-        allocated: (decoded >> 48) as u8 != 0,
+        allocated: sizes.allocated,
     })
 }
 
@@ -568,7 +658,7 @@ mod tests {
             0x12_3456
         );
         assert_eq!(decode_descriptor_at(&wide_descriptor, 12, 8, 5, 2), None);
-        let decoded = decode_vs_sizes((4u64 << 16) ^ 0x1234 ^ 0x55, 0x1234, 0x55).unwrap();
+        let decoded = decode_vs_sizes((4u64 << 16) ^ 0x1234 ^ 0x55, 0x1234, 0x55);
         assert_eq!(decoded.size, 4);
         assert!(!decoded.allocated);
         let lfh_key = 0xa5c3_0010;

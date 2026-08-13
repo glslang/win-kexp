@@ -220,6 +220,9 @@ pub struct PoolSnapshotReport {
     pub diagnostics: PoolDiagnostics,
     /// What the walk stepped over rather than gave up on, in bytes; see [`WalkStalls`].
     pub stalls: WalkStalls,
+    /// Chunk headers the walk refused and resynchronised past; see
+    /// [`crate::pool::PoolSnapshot::refused_chunks`] for why this is not read off a diagnostic.
+    pub refused_chunks: u64,
 }
 
 /// How much of the pool a walk covered.
@@ -296,6 +299,7 @@ fn report_of(index: &PoolIndex) -> PoolSnapshotReport {
         },
         diagnostics: index.diagnostics.clone(),
         stalls: index.stalls,
+        refused_chunks: index.refused_chunks,
     }
 }
 
