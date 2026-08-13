@@ -13,7 +13,7 @@ This repository is intended for exploit research in isolated Windows test system
 - **Process utilities**: process lookup, remote allocation, shellcode writes, and `CreateRemoteThread` launch.
 - **ROP helpers**: chain-writing macros and executable PE section scanning for gadget lookup.
 - **Kernel tooling**: pool helpers, Win32k/device I/O wrappers, and driver base discovery.
-- **Debug engine**: `dbgeng` wrappers for local/kernel attach, command execution, breakpoints, symbols, dumps, traces, and session cleanup — including typed reads of the target's context (`register_values`, `modules`, `breakpoints`), so a host gets values instead of `r`/`lm`/`bl` text to parse.
+- **Debug engine**: `dbgeng` wrappers for local/kernel attach, command execution, breakpoints, symbols, dumps, traces, and session cleanup — including typed reads of the target's context (`register_values`, `modules`, `breakpoints`), so a host gets values instead of `r`/`lm`/`bl` text to parse, and `scope()`/`set_scope()`/`ScopeGuard` to run a command that moves the debugger's scope (`!analyze -v` is one) and leave the session where it was found.
 
 ## Requirements
 
