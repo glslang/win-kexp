@@ -1817,11 +1817,24 @@ impl DebugEngine {
     /// user-mode target it is the debuggee, and the engine names it directly. On a kernel target
     /// `GetCurrentProcessExecutableName` answers with the *kernel image* — `ntkrnlmp.exe`, for
     /// every process there has ever been — which is not an answer, so the name is read out of the
-    /// current `_EPROCESS` instead, exactly where `!analyze` reads it.
+    /// current `_EPROCESS` instead.
     ///
     /// The kernel path therefore needs symbols for `nt`. Without them it fails rather than
     /// falling back to the executable name: `ntkrnlmp.exe` presented as the crashing process is
     /// worse than no answer, because it looks like one.
+    ///
+    /// # Which field, and why it is not the obvious one
+    ///
+    /// `_EPROCESS::ImageFileName` is the obvious one and it is **15 bytes**, so it silently
+    /// truncates: `mm_exploit_v5.exe` reads back as `mm_exploit_v5.`, which looks like a name and
+    /// is not one. Measured against a real crash dump, where `!analyze` printed the full name
+    /// beside this function's truncated one.
+    ///
+    /// So the audit name is preferred — `SeAuditProcessCreationInfo.ImageFileName`, an
+    /// `OBJECT_NAME_INFORMATION` holding the full NT path, of which the leaf is taken. It is what
+    /// `!analyze` reports. `ImageFileName` remains the fallback for a target whose audit name is
+    /// not there to read (it is a pointer, and a partial dump need not have captured what it
+    /// points at), because a truncated name beats no name.
     pub fn current_process_name(&self) -> Result<String, DbgEngError> {
         let system: IDebugSystemObjects =
             self.client.cast().map_err(|source| DbgEngError::Context {
@@ -1846,8 +1859,11 @@ impl DebugEngine {
         })?;
         let nt = self.kernel_base()?;
         let eprocess = self.type_id(nt, "_EPROCESS")?;
+        if let Some(full) = self.audit_image_name(nt, eprocess, process) {
+            return Ok(full);
+        }
         let offset = self.field_offset(nt, eprocess, "ImageFileName")?;
-        // `ImageFileName` is a fixed 15-byte array, NUL-padded rather than NUL-terminated: a name
+        // `ImageFileName` is a fixed-size array, NUL-*padded* rather than NUL-terminated: a name
         // that fills it has no terminator at all, which is why the length is read from the type
         // and the result cut at the first NUL rather than parsed as a C string.
         let size = self
@@ -1855,6 +1871,52 @@ impl DebugEngine {
             .unwrap_or(EPROCESS_IMAGE_NAME_LEN) as usize;
         let raw = self.read_memory(process.saturating_add(u64::from(offset)), size)?;
         Ok(nul_terminated(&raw))
+    }
+
+    /// The leaf of `SeAuditProcessCreationInfo.ImageFileName`, the full NT path of a process's
+    /// image — `mm_exploit_v5.exe` where `_EPROCESS::ImageFileName` has only `mm_exploit_v5.`.
+    ///
+    /// Best-effort throughout, returning `None` rather than an error at every step: this is the
+    /// *better* of two answers and the caller has the other one. It is several dereferences deep,
+    /// and each of them is a page a partial crash dump is entitled not to have captured.
+    ///
+    /// The field's offset is resolved from symbols, because that is what moves between builds. The
+    /// two structures it leads through are not read through symbols: `OBJECT_NAME_INFORMATION`
+    /// begins with its `UNICODE_STRING`, and a `UNICODE_STRING` on x64 is `{u16 Length, u16
+    /// MaximumLength, u32 pad, u64 Buffer}`. That is ABI, not a build detail.
+    fn audit_image_name(&self, nt: u64, eprocess: u32, process: u64) -> Option<String> {
+        let offset = self
+            .field_offset(nt, eprocess, "SeAuditProcessCreationInfo")
+            .ok()?;
+        // The structure's single member is the `OBJECT_NAME_INFORMATION*`, so its address is the
+        // structure's own.
+        let name_info = u64::from_le_bytes(
+            self.read_memory(process.checked_add(u64::from(offset))?, 8)
+                .ok()?
+                .try_into()
+                .ok()?,
+        );
+        if name_info == 0 {
+            return None;
+        }
+        let unicode_string = self.read_memory(name_info, 16).ok()?;
+        let length = u16::from_le_bytes(unicode_string[0..2].try_into().ok()?) as usize;
+        let buffer = u64::from_le_bytes(unicode_string[8..16].try_into().ok()?);
+        // A zero-length or absurd name is not an answer. The bound is generous — an NT path can be
+        // long — and exists only so a wild `Length` cannot ask for a huge read.
+        if buffer == 0 || length == 0 || length > 2 * 1024 {
+            return None;
+        }
+        let raw = self.read_memory(buffer, length).ok()?;
+        let wide: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let path = String::from_utf16_lossy(&wide);
+        // The leaf, as `!analyze` prints it: the path is
+        // `\Device\HarddiskVolume3\Users\Admin\mm_exploit_v5.exe`.
+        let leaf = path.rsplit(['\\', '/']).next().unwrap_or(&path).trim();
+        (!leaf.is_empty()).then(|| leaf.to_string())
     }
 
     /// The size of one field of a type, for a field whose length is part of its meaning.
