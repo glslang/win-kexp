@@ -642,6 +642,48 @@ mod tests {
         assert_eq!(found.next.unwrap().display_tag, "Cccc");
     }
 
+    /// A VS chunk as `walk_vs` reports one: the physical `_POOL_HEADER` sits a chunk header
+    /// into the chunk, and the usable bytes a pool header past that. So the raw chunk start,
+    /// `header_address` and `usable_address` are three different addresses — the geometry
+    /// `PoolSpan::allocation` cannot build, and the reason glslang/win-kexp#85 went unnoticed.
+    fn vs_allocation(chunk: u64, chunk_size: u64, tag: &[u8; 4], heap_id: u64) -> PoolSpan {
+        const VS_HEADER: u64 = 0x10;
+        const POOL_HEADER: u64 = 0x10;
+        let raw_tag = u32::from_le_bytes(*tag);
+        PoolSpan {
+            header_address: chunk + VS_HEADER,
+            usable_address: chunk + VS_HEADER + POOL_HEADER,
+            size: chunk_size - VS_HEADER - POOL_HEADER,
+            raw_tag,
+            display_tag: crate::pool::decode::display_tag(raw_tag),
+            pool_kind: PoolKind::NonPagedNx,
+            numa_node: 0,
+            heap: heap(heap_id),
+            subsegment: Some(0x9000),
+            backend: PoolBackend::Vs,
+            state: PoolState::Allocated,
+            size_class: chunk_size as u32,
+        }
+    }
+
+    /// glslang/win-kexp#85: the contiguity check compared `end()` — which lands on the raw
+    /// chunk end — with the next span's `header_address`, which for a VS chunk is a chunk
+    /// header *past* its start. The two differ by exactly that header for every genuinely
+    /// adjacent pair, so `previous` and `next` came back `None` for every VS allocation there
+    /// is: the one question `chunk_at` exists to answer, disabled for a whole backend.
+    #[test]
+    fn test_vs_neighbours_are_reported_despite_their_chunk_header() {
+        let index = index_of(vec![
+            vs_allocation(0x1000, 0x100, b"Aaaa", 1),
+            vs_allocation(0x1100, 0x100, b"Bbbb", 1),
+            vs_allocation(0x1200, 0x100, b"Cccc", 1),
+        ]);
+        let found = neighbourhood_at(&index, 0x1150).expect("address is covered");
+        assert_eq!(found.chunk.display_tag, "Bbbb");
+        assert_eq!(found.previous.unwrap().display_tag, "Aaaa");
+        assert_eq!(found.next.unwrap().display_tag, "Cccc");
+    }
+
     /// Allocator slack separates these two: `walk_lfh` omits a slot that would straddle a
     /// page, so spans can share every allocator identity and still not touch. Reporting
     /// them as bordering would misstate the grooming geometry this API exists to describe.
