@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use windows::Win32::Foundation::{S_FALSE, S_OK};
+use windows::Win32::Foundation::{E_INVALIDARG, E_NOINTERFACE, S_FALSE, S_OK};
 use windows::core::{HRESULT, IUnknown, Interface, PCSTR, PCWSTR, PWSTR};
 
 // Import the necessary Windows Debug Engine interfaces
@@ -1631,13 +1631,29 @@ impl DebugEngine {
     /// the caller has a handful of addresses rather than a need for the whole table.
     pub fn module_at(&self, address: u64) -> Result<Option<Module>, DbgEngError> {
         let mut index = 0u32;
-        let found = unsafe {
+        match unsafe {
             self.symbols
                 .GetModuleByOffset(address, 0, Some(&mut index), None)
-        }
-        .is_ok();
-        if !found {
-            return Ok(None);
+        } {
+            Ok(()) => {}
+            // "No module holds this offset" — the answer this reports as `None`.
+            //
+            // Two codes, because the engine is not the only implementation and the documentation
+            // names neither. `E_INVALIDARG` is what a real dbgeng 10.x answers, measured against a
+            // kernel dump for a pool address, an unmapped kernel address and a null one — the
+            // offset *is* the parameter it is calling incorrect. `E_NOINTERFACE` is what Wine's
+            // dbgeng and the neighbouring `IDebugSymbols` lookups answer for not-found, so it is
+            // accepted too rather than turned into an error on a host that answers that way.
+            Err(why) if matches!(why.code(), E_INVALIDARG | E_NOINTERFACE) => return Ok(None),
+            // Anything else is the lookup itself failing — no debuggee, a target that has gone
+            // away — and reporting that as "the address is in no module" would turn a broken
+            // engine into a stack frame attributed to nothing, which reads like a finding.
+            Err(source) => {
+                return Err(DbgEngError::Context {
+                    operation: format!("locating the module holding {address:#x}"),
+                    source,
+                });
+            }
         }
         let mut params = DEBUG_MODULE_PARAMETERS::default();
         // `Count = 1, Start = index`: the parameters for that one module.
