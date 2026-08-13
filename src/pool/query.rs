@@ -21,7 +21,7 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
 use super::decode::parse_tag;
 use super::index::{PoolIndex, SnapshotCache};
 use super::layout::{LayoutCache, SessionKey};
-use super::snapshot::{SnapshotError, SnapshotWalker};
+use super::snapshot::{SnapshotError, SnapshotWalker, WalkStalls};
 use super::{PoolDiagnostics, PoolSpan, PoolState};
 use crate::dbgeng::{DbgEngError, DebugEngine};
 
@@ -218,6 +218,8 @@ pub struct PoolSnapshotReport {
     /// the messages it carries verbatim are a capped sample, so counting them measures the
     /// cap rather than the target.
     pub diagnostics: PoolDiagnostics,
+    /// What the walk stepped over rather than gave up on, in bytes; see [`WalkStalls`].
+    pub stalls: WalkStalls,
 }
 
 /// How much of the pool a walk covered.
@@ -293,6 +295,7 @@ fn report_of(index: &PoolIndex) -> PoolSnapshotReport {
             (false, false) => WalkCoverage::Partial,
         },
         diagnostics: index.diagnostics.clone(),
+        stalls: index.stalls,
     }
 }
 
@@ -519,9 +522,8 @@ mod tests {
     fn index_of(spans: Vec<PoolSpan>) -> PoolIndex {
         PoolIndex::build(crate::pool::PoolSnapshot {
             spans,
-            diagnostics: PoolDiagnostics::default(),
             complete: true,
-            budget_expired: false,
+            ..crate::pool::PoolSnapshot::default()
         })
     }
 
@@ -682,10 +684,8 @@ mod tests {
     #[test]
     fn test_empty_walk_still_reports_why() {
         let index = PoolIndex::build(crate::pool::PoolSnapshot {
-            spans: Vec::new(),
             diagnostics: PoolDiagnostics::from_iter(["cannot read pool node 0 heap 2".to_string()]),
-            complete: false,
-            budget_expired: false,
+            ..crate::pool::PoolSnapshot::default()
         });
         let report = report_of(&index);
         assert_eq!(report.total_chunks, 0);
@@ -709,10 +709,9 @@ mod tests {
     fn test_coverage_says_which_way_a_walk_fell_short() {
         let walked = |complete, budget_expired| {
             report_of(&PoolIndex::build(crate::pool::PoolSnapshot {
-                spans: Vec::new(),
-                diagnostics: PoolDiagnostics::default(),
                 complete,
                 budget_expired,
+                ..crate::pool::PoolSnapshot::default()
             }))
             .coverage
         };

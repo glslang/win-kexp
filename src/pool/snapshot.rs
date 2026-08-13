@@ -1593,6 +1593,30 @@ pub(crate) struct PoolSnapshot {
     /// the snapshot, both look like a short list — so the reason travels as a field rather than
     /// being inferred downstream from the diagnostic it also writes.
     pub budget_expired: bool,
+    /// What the walk stepped over rather than gave up on; see [`WalkStalls`].
+    pub stalls: WalkStalls,
+}
+
+/// What valid-region queries that could not advance cost the walk, and what stepping over them
+/// bought.
+///
+/// Numbers rather than another diagnostic, because a diagnostic can only say how *often* the
+/// walk stalled and that was never the question. A walk that steps over one page and a walk
+/// that abandons everything behind it emit the same line the same number of times; what
+/// separates them is how much memory the decision covered — which the walk knows at the moment
+/// it decides, and used to throw away.
+///
+/// `recovered_bytes` is what the change is judged by: committed memory read *after* a stall in
+/// the same region, which is precisely the coverage a walk that gave up at the first stall
+/// reported as nothing at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalkStalls {
+    /// How many times a query could not advance and the walk stepped over a page.
+    pub pages: u64,
+    /// Bytes filed as unreadable by those steps.
+    pub skipped_bytes: u64,
+    /// Bytes of committed memory read after a stall, in the regions that stalled.
+    pub recovered_bytes: u64,
 }
 
 pub(crate) struct SnapshotWalker<'a, M> {
@@ -1697,6 +1721,17 @@ const DISCOVERY_BUDGET_SHARE: (u32, u32) = (2, 3);
 /// from the other side. The budget is a ceiling on effort, not a promise about return latency:
 /// it exists so the engine cannot run for *minutes* after its caller has given up.
 const EXTENT_READ_CHUNK: usize = 256 * 1024;
+
+/// How many pages in a row a region may refuse to advance over before the walk gives up on
+/// the rest of it.
+///
+/// Every one of these is a debugger round trip, and on a live KD link a round trip is the
+/// expensive unit — so this is not sized for how large a hole might be, but for how much
+/// probing a *dead* region is worth before its remainder is written off. Eight covers the
+/// shape the live samples actually show, a single unreadable page part-way through a
+/// committed region, with room to spare; a region that is dead all the way down costs eight
+/// queries rather than one per page of its length.
+const MAX_CONSECUTIVE_STALLS: u32 = 8;
 
 /// Splits a walk budget into the deadline discovery works to and the one the whole walk
 /// works to. `None` in gives `None` out for both: no budget, no deadlines.
@@ -1829,6 +1864,8 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
     ) -> Result<(), SnapshotError> {
         let requested_end = region.address.saturating_add(region.size as u64);
         let mut cursor = region.address;
+        let mut consecutive_stalls = 0u32;
+        let mut stalled_here = false;
         while cursor < requested_end {
             check_budget(self.memory)?;
             let remaining = requested_end.saturating_sub(cursor).min(usize::MAX as u64) as usize;
@@ -1856,12 +1893,51 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 .saturating_add(reported_size as u64)
                 .min(requested_end);
             if valid_end <= valid_base {
+                // Two states used to arrive here as one, and only the second is a problem.
+                //
+                // The engine placing the next valid region beyond the end of what was asked
+                // about is the region *finishing*: its tail has already been filed as
+                // unreadable by the branch above, there is nothing behind it to lose, and the
+                // loop is done. Reporting that as a failure to advance is what made this the
+                // walk's largest diagnostic category — 3,285 lines on a live 26100 walk —
+                // while describing nothing wrong.
+                if valid_base >= requested_end {
+                    break;
+                }
+                // The rest is a real stall: a valid region was reported inside the span and it
+                // ends at or before where the cursor already is. Step over a page and ask
+                // again, rather than giving up on every committed page behind it — the
+                // samples show these firing part-way through regions of 0x10fd0 and 0x3afc0
+                // bytes, not at their tails.
+                //
+                // The advance is **unconditional**. A query that keeps answering the same way
+                // would otherwise spin here without end, which is the reason this used to
+                // abandon the region outright.
+                let skip = PAGE_SIZE.min(requested_end - valid_base);
                 snapshot.diagnostics.push(format!(
-                    "valid-region query made no progress at {cursor:#x}"
+                    "valid-region query made no progress at {valid_base:#x}; stepping over a page"
                 ));
-                self.unreadable(region, valid_base, requested_end - valid_base, snapshot);
-                break;
+                self.unreadable(region, valid_base, skip, snapshot);
+                snapshot.stalls.pages += 1;
+                snapshot.stalls.skipped_bytes = snapshot.stalls.skipped_bytes.saturating_add(skip);
+                stalled_here = true;
+                consecutive_stalls += 1;
+                cursor = valid_base.saturating_add(skip);
+                // Bounded, so a region that is dead all the way down still costs a fixed
+                // number of queries rather than one per page of its length. Consecutive:
+                // the single unreadable page in the middle of a live region — the shape these
+                // samples actually have — resets it and costs one extra query.
+                if consecutive_stalls > MAX_CONSECUTIVE_STALLS {
+                    snapshot.diagnostics.push(format!(
+                        "region {:#x}+{:#x}: giving up after consecutive pages that would not advance",
+                        region.address, region.size
+                    ));
+                    self.unreadable(region, cursor, requested_end - cursor, snapshot);
+                    break;
+                }
+                continue;
             }
+            consecutive_stalls = 0;
             let bytes = match self.read_extent(valid_base, (valid_end - valid_base) as usize) {
                 Ok(bytes) => bytes,
                 // Out of time is not "this memory would not read". Left to the arm below it
@@ -1877,10 +1953,19 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                     continue;
                 }
             };
+            if stalled_here {
+                // Committed memory read on the far side of a stall — the coverage the old
+                // `break` discarded, counted so the change can be judged by what it recovers
+                // rather than by whether a diagnostic category shrank.
+                snapshot.stalls.recovered_bytes = snapshot
+                    .stalls
+                    .recovered_bytes
+                    .saturating_add(bytes.len() as u64);
+            }
             // Verifier special pool is page-granular and its ranges are indistinguishable
             // from any other plain page range by their flags, so this has to come *before*
             // the backend dispatch. Walked as page ranges instead, the pool header plus
-            // 0xfd fill decodes as garbage and every allocation in the heap silently
+            // its fill decodes as garbage and every allocation in the heap silently
             // disappears from the snapshot.
             if region.heap.special {
                 self.walk_special_pool(region, valid_base, &bytes, snapshot);
@@ -2356,10 +2441,8 @@ mod tests {
             traversal_limit: 1000,
         };
         let mut snapshot = PoolSnapshot {
-            spans: Vec::new(),
-            diagnostics: PoolDiagnostics::default(),
             complete: true,
-            budget_expired: false,
+            ..PoolSnapshot::default()
         };
         walker.walk_lfh(&region, 0x1f80, &memory.bytes, &mut snapshot);
 
@@ -2777,6 +2860,224 @@ mod tests {
             reusable_chunks: Arc::default(),
             cached_chunks: Arc::default(),
         }
+    }
+
+    /// A memory source with gaps in it, answering `valid_region` two ways the debugger does.
+    ///
+    /// A **hole** is a page with nothing committed: the query looks past it and names where the
+    /// next committed run begins, which the walk records and steps over. A **stall** is the
+    /// query naming the address it was given and reporting no length with it — no answer the
+    /// walk can advance on, and the shape behind the 3,285 `valid-region query made no
+    /// progress` lines a live 26100 walk emitted.
+    struct HoleyMemory {
+        base: u64,
+        bytes: Vec<u8>,
+        holes: HashSet<u64>,
+        stalls: HashSet<u64>,
+        queries: Cell<usize>,
+    }
+
+    impl HoleyMemory {
+        fn new(base: u64, bytes: Vec<u8>) -> Self {
+            Self {
+                base,
+                bytes,
+                holes: HashSet::new(),
+                stalls: HashSet::new(),
+                queries: Cell::new(0),
+            }
+        }
+
+        fn end(&self) -> u64 {
+            self.base + self.bytes.len() as u64
+        }
+
+        fn committed(&self, page: u64) -> bool {
+            page >= self.base
+                && page < self.end()
+                && !self.holes.contains(&page)
+                && !self.stalls.contains(&page)
+        }
+    }
+
+    impl PoolMemory for HoleyMemory {
+        fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
+            let offset = (address - self.base) as usize;
+            self.bytes
+                .get(offset..offset + size)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| SnapshotError::InvalidData {
+                    detail: format!("read past the fixture at {address:#x}+{size:#x}"),
+                })
+        }
+
+        fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError> {
+            self.queries.set(self.queries.get() + 1);
+            let page = address & !(PAGE_SIZE - 1);
+            if self.stalls.contains(&page) {
+                return Ok((address, 0));
+            }
+            let mut next = page;
+            while next < self.end() && !self.committed(next) {
+                next += PAGE_SIZE;
+            }
+            if next >= self.end() {
+                // Nothing committed from here on, so the engine names a base past the span
+                // that was asked about. That is the region *ending*, not a failure to advance.
+                return Ok((self.end(), 0));
+            }
+            let base = next.max(address);
+            let mut run = next;
+            while self.committed(run) {
+                run += PAGE_SIZE;
+            }
+            Ok((base, (run.min(address + size as u64) - base) as usize))
+        }
+
+        fn interrupted(&self) -> Result<bool, SnapshotError> {
+            Ok(false)
+        }
+    }
+
+    /// Three special-pool pages, so each committed page the walk reaches shows up as exactly
+    /// one span at a known address — which is what makes "did it walk past the gap" checkable.
+    fn special_pages(count: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for _ in 0..count {
+            bytes.extend_from_slice(&special_page(0x68, false));
+        }
+        bytes
+    }
+
+    fn walk_holey(memory: &HoleyMemory, region: &PoolRegion) -> PoolSnapshot {
+        let layout = vs_layout(false);
+        let walker = SnapshotWalker {
+            memory,
+            layout: &layout,
+            traversal_limit: 1000,
+        };
+        let mut snapshot = PoolSnapshot {
+            complete: true,
+            ..PoolSnapshot::default()
+        };
+        walker.walk_region(region, &mut snapshot).unwrap();
+        snapshot
+    }
+
+    /// glslang/win-kexp#94. One page the query cannot advance over used to cost every
+    /// committed page behind it: the walk filed the rest of the region as unreadable and
+    /// `break`ed, while the sibling case one branch above — a query reporting a *gap* —
+    /// recorded the hole and carried on. The samples show these firing part-way through
+    /// regions tens of pages long, so what was given up on was not a tail.
+    #[test]
+    fn test_a_stalled_query_costs_a_page_not_the_region() {
+        let mut memory = HoleyMemory::new(SPECIAL_PAGE, special_pages(4));
+        memory.stalls.insert(SPECIAL_PAGE + 0x1000);
+        let snapshot = walk_holey(&memory, &special_region(SPECIAL_PAGE, 4));
+
+        let allocated: Vec<_> = snapshot
+            .spans
+            .iter()
+            .filter(|span| span.state == PoolState::Allocated)
+            .map(|span| span.usable_address)
+            .collect();
+        assert_eq!(
+            allocated,
+            [
+                SPECIAL_PAGE + 0xf90,
+                SPECIAL_PAGE + 0x2f90,
+                SPECIAL_PAGE + 0x3f90
+            ],
+            "the pages behind the stalled one must still be walked"
+        );
+        assert!(
+            snapshot
+                .spans
+                .iter()
+                .any(|span| span.state == PoolState::Unreadable
+                    && span.header_address == SPECIAL_PAGE + 0x1000
+                    && span.size == PAGE_SIZE),
+            "the page that stalled is still filed as unreadable"
+        );
+        assert!(!snapshot.complete);
+        assert_eq!(
+            snapshot.stalls,
+            WalkStalls {
+                pages: 1,
+                skipped_bytes: PAGE_SIZE,
+                // Two pages of committed memory on the far side of the stall — what the old
+                // `break` reported as nothing at all.
+                recovered_bytes: 2 * PAGE_SIZE,
+            }
+        );
+    }
+
+    /// The reason the `break` was there in the first place: the advance has to be
+    /// unconditional or a query that keeps answering the same way spins forever. Unconditional
+    /// *and* bounded — a region that is dead all the way down costs a fixed number of queries,
+    /// not one per page of its length, which on a live KD link is the cost that matters.
+    #[test]
+    fn test_a_region_that_never_advances_is_given_up_on() {
+        let pages = 4096;
+        let mut memory = HoleyMemory::new(SPECIAL_PAGE, vec![0u8; pages * PAGE_SIZE as usize]);
+        for page in 0..pages as u64 {
+            memory.stalls.insert(SPECIAL_PAGE + page * PAGE_SIZE);
+        }
+        let snapshot = walk_holey(&memory, &special_region(SPECIAL_PAGE, pages));
+
+        assert!(
+            memory.queries.get() <= MAX_CONSECUTIVE_STALLS as usize + 1,
+            "a dead region cost {} queries",
+            memory.queries.get()
+        );
+        assert!(!snapshot.complete);
+        assert_eq!(snapshot.stalls.pages, u64::from(MAX_CONSECUTIVE_STALLS) + 1);
+        // Every byte of it is accounted for as unreadable, whether stepped over or written off.
+        let unreadable: u64 = snapshot
+            .spans
+            .iter()
+            .filter(|span| span.state == PoolState::Unreadable)
+            .map(|span| span.size)
+            .sum();
+        assert_eq!(unreadable, pages as u64 * PAGE_SIZE);
+    }
+
+    /// The other half of the fix, and the larger half of the 3,285: a region simply running
+    /// out of committed pages arrived at the same branch and was reported as a failure to
+    /// advance. Nothing is behind it to lose — the hole branch has already filed the tail —
+    /// so there is nothing to report.
+    #[test]
+    fn test_a_region_running_out_of_committed_pages_is_not_a_stall() {
+        let mut memory = HoleyMemory::new(SPECIAL_PAGE, special_pages(4));
+        memory.holes.insert(SPECIAL_PAGE + 0x3000);
+        let snapshot = walk_holey(&memory, &special_region(SPECIAL_PAGE, 4));
+
+        assert_eq!(snapshot.stalls, WalkStalls::default());
+        assert!(
+            !snapshot
+                .diagnostics
+                .examples()
+                .iter()
+                .any(|message| message.contains("made no progress")),
+            "{:?}",
+            snapshot.diagnostics.examples()
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .examples()
+                .iter()
+                .any(|message| message.contains("only committed through")),
+            "the tail is still reported as the unreadable space it is"
+        );
+        assert_eq!(
+            snapshot
+                .spans
+                .iter()
+                .filter(|span| span.state == PoolState::Allocated)
+                .count(),
+            3
+        );
     }
 
     /// Special pool is page-granular, so one page that does not decode says nothing about the
