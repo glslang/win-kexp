@@ -122,6 +122,15 @@ fn main() {
     let panicked = catch_unwind(AssertUnwindSafe(|| {
         let _guard = e.scope_guard().expect("scope_guard() failed");
         let _ = e.execute_command("!analyze -v");
+        // Not only the analysis: on an engine with no `ext.dll` that command does nothing at
+        // all, and a guard that restored a scope nothing had moved would prove nothing. This
+        // moves it whatever the analysis did.
+        let _ = e.execute_command(".frame 0");
+        println!(
+            "inside: {}  (moved: {})",
+            describe(&e.scope().expect("scope() failed")),
+            e.scope().expect("scope() failed") != before
+        );
         panic!("the command's caller gave up here");
     }))
     .is_err();

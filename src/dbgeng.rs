@@ -1681,6 +1681,22 @@ impl DebugEngine {
     /// context describe *that* target's stack, and applying them to a later one would point the
     /// session at an address that means nothing there. This is the case a long-lived
     /// [`ScopeGuard`] hits when whatever it wrapped replaced the target underneath it.
+    ///
+    /// **What that check does and does not cover.** [`Self::target_identity`] is a per-engine
+    /// generation, bumped when this engine is created and when `end_session` releases its
+    /// target — so it catches the destructive case, a session ended and another opened, where
+    /// the saved addresses are meaningless. It says nothing about *movement inside* one
+    /// session, and there are two such cases:
+    ///
+    /// - **A different process or thread is current.** A scope is engine-global, not per-thread,
+    ///   so a scope captured while one process was current is restored as-is while another is —
+    ///   which is what `.cxr` does deliberately, and is wrong only if the caller did not mean
+    ///   it. (`!analyze -v` does not move the current thread; that was measured.)
+    /// - **A borrowed WinDbg client whose host switched targets.** There the identity is the
+    ///   client pointer, which does not change when WinDbg opens something else under it.
+    ///
+    /// In both, the caller is the only one who can know, and a guard held across such a change
+    /// restores a scope its target no longer means.
     pub fn set_scope(&self, scope: &Scope) -> Result<(), DbgEngError> {
         if scope.target != self.target_identity() {
             return Err(DbgEngError::ScopeFromAnotherTarget);
@@ -3298,8 +3314,10 @@ mod tests {
     /// and this repo's instructions use. Load-bearing under plain `cargo test`, which the
     /// coverage workflow runs. (The `#[ignore]`d tests above have the same requirement, met the
     /// other way: they are documented as needing `--test-threads=1`.)
+    #[cfg(not(miri))]
     static ONE_DEBUGGEE: Mutex<()> = Mutex::new(());
 
+    #[cfg(not(miri))]
     fn one_debuggee() -> std::sync::MutexGuard<'static, ()> {
         // A test that panics while holding this poisons it. The next test still needs the
         // lock, and its own assertion is a better failure message than a poison error.
@@ -3310,6 +3328,7 @@ mod tests {
     ///
     /// `None` means nothing moved — which the scope tests below must treat as a failure rather
     /// than a pass, since a scope that never moved is restored by doing nothing at all.
+    #[cfg(not(miri))]
     fn move_the_scope(e: &DebugEngine) -> Option<&'static str> {
         let before = e.scope().ok()?;
         for command in [".frame 1", ".frame 2", ".ecxr"] {
