@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use super::{PoolDiagnostics, PoolSpan, PoolState, snapshot::PoolSnapshot};
+use super::{PoolDiagnostics, PoolSpan, PoolState, snapshot::PoolSnapshot, snapshot::WalkStalls};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Direction {
@@ -33,6 +33,9 @@ pub(crate) struct PoolIndex {
     /// an index that outlives the walk is the only thing a caller ever sees, so a reason left
     /// behind here is a reason nobody can recover.
     pub budget_expired: bool,
+    /// Carried through from [`PoolSnapshot::stalls`], for the same reason the two flags above
+    /// are: the index is all a caller ever sees of the walk.
+    pub stalls: WalkStalls,
     row_postings: HashMap<RowIdentity, Vec<usize>>,
     span_rows: Vec<RowIdentity>,
 }
@@ -82,6 +85,7 @@ impl PoolIndex {
             diagnostics: snapshot.diagnostics,
             complete: snapshot.complete,
             budget_expired: snapshot.budget_expired,
+            stalls: snapshot.stalls,
             row_postings,
             span_rows,
         }
@@ -272,8 +276,7 @@ mod tests {
                 span(0x1080, tag, PoolState::Allocated, 2),
             ],
             complete: true,
-            budget_expired: false,
-            diagnostics: PoolDiagnostics::default(),
+            ..PoolSnapshot::default()
         };
         let index = PoolIndex::build(snapshot.clone());
         assert_eq!(index.postings[&tag], vec![1, 4]);
@@ -295,8 +298,7 @@ mod tests {
                 span(0x1080, other, PoolState::Allocated, 1),
             ],
             complete: true,
-            budget_expired: false,
-            diagnostics: PoolDiagnostics::default(),
+            ..PoolSnapshot::default()
         });
         assert_eq!(contextual.context_for_tag(tag), vec![0, 1, 2, 3, 4]);
         assert_eq!(contextual.successor(2), None);

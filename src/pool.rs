@@ -14,7 +14,7 @@ pub mod query;
 
 pub(crate) use index::PoolIndex;
 pub(crate) use snapshot::PoolSnapshot;
-pub use snapshot::{DIAGNOSTIC_EXAMPLES, DiagnosticShape, PoolDiagnostics};
+pub use snapshot::{DIAGNOSTIC_EXAMPLES, DiagnosticShape, PoolDiagnostics, WalkStalls};
 
 /// Exact allocator identity.  Values are deliberately not collapsed into just
 /// paged/nonpaged because crossing one of these boundaries creates false holes.

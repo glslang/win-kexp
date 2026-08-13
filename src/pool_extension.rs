@@ -166,6 +166,7 @@ fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
         let snapshot = crate::pool::PoolSnapshot {
             complete: filtered.complete,
             budget_expired: filtered.budget_expired,
+            stalls: filtered.stalls,
             spans: filtered.spans,
             diagnostics: filtered.diagnostics,
         };

@@ -411,6 +411,7 @@ mod tests {
             spans,
             complete: true,
             budget_expired: false,
+            stalls: Default::default(),
             diagnostics: PoolDiagnostics::from_iter([
                 "per-session paged heaps are not included".to_string()
             ]),
@@ -502,6 +503,7 @@ mod tests {
             spans: many,
             complete: true,
             budget_expired: false,
+            stalls: Default::default(),
             diagnostics: PoolDiagnostics::default(),
         });
         let dml_chunks = render_pool_map(
