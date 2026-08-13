@@ -103,6 +103,14 @@ pub enum DbgEngError {
 /// symbol answer produces a slightly short name rather than no name at all.
 const EPROCESS_IMAGE_NAME_LEN: u32 = 15;
 
+/// Buffer to ask a module's names into when the engine reports no size for them, which is what
+/// an *unloaded* module's parameters carry. Big enough for a full image path.
+const MODULE_NAME_FALLBACK: usize = 260;
+
+/// `DEBUG_MODULE_PARAMETERS::Flags`: this module has unloaded. Zero — `DEBUG_MODULE_LOADED` — is
+/// the other state, so the flag is what separates the two halves of the engine's module list.
+const DEBUG_MODULE_UNLOADED: u32 = 0x0000_0001;
+
 /// `CreateProcess` flag: debug only the launched process, not its children.
 const DEBUG_ONLY_THIS_PROCESS: u32 = 0x0000_0002;
 /// `CreateProcess` flag: give the launched target its own console. Without this a
@@ -360,14 +368,22 @@ impl SymbolKind {
     }
 }
 
-/// One loaded module, as [`DebugEngine::modules`] reports it.
+/// One module, as [`DebugEngine::modules`] and [`DebugEngine::unloaded_modules`] report it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Module {
     pub base: u64,
     pub size: u32,
     /// The name symbols are qualified by — the `nt` in `nt!KeBugCheckEx`.
+    ///
+    /// **Empty for an unloaded module**, which is not a truncation bug but the fact: there is no
+    /// module left to qualify a symbol with. `lm` prints [`Self::image_name`] in its name column
+    /// for those rows, and so should anything rendering them.
     pub name: String,
     /// The image's own name (`ntkrnlmp.exe`).
+    ///
+    /// The one name an *unloaded* module still has, and the kernel stores it truncated — twelve
+    /// characters, so `WpdUpFltr.sys` comes back as `WpdUpFltr.sy`. `lm` shows the same truncation
+    /// because it is reading the same list.
     pub image_name: String,
     /// The path the engine loaded the image from, where it has one.
     pub loaded_image_name: String,
@@ -376,6 +392,13 @@ pub struct Module {
     pub symbols: SymbolKind,
     /// Whether this is a user-mode module. On a kernel target both kinds can be present.
     pub user_mode: bool,
+    /// Whether this module has **unloaded**: the engine's own `DEBUG_MODULE_UNLOADED` flag, not
+    /// an inference from which call produced it.
+    ///
+    /// Carried on the value so a `Module` that has been passed around still knows which half of
+    /// the engine's list it came from — the distinction decides whether `base` is where the image
+    /// *is* or where it *was*.
+    pub unloaded: bool,
 }
 
 impl Module {
@@ -1824,16 +1847,50 @@ impl DebugEngine {
         })
     }
 
-    /// The loaded modules, read through `IDebugSymbols3` — what `lm` renders, as data.
+    /// The loaded modules, read through `IDebugSymbols3` — what `lm` renders above its
+    /// `Unloaded modules:` line, as data.
     ///
-    /// Ordered as the engine holds them (by load order), and **loaded modules only**: the
-    /// engine also keeps a tail of unloaded ones, which `lm` does not show either and which
-    /// answer a different question.
+    /// Ordered as the engine holds them (by load order), and **loaded modules only**. The tail of
+    /// modules that have since unloaded is [`Self::unloaded_modules`]: a different question about
+    /// a different kind of thing, and one `lm` does print, so a host rendering that text beside
+    /// these values needs both to describe the same listing.
     ///
     /// [`Module::symbols`] is the column hosts most often reach into `lm` for — "does this
     /// module have real symbols, or is it deferred / export-only?" — and it is a value here
     /// rather than a parenthesised word.
     pub fn modules(&self) -> Result<Vec<Module>, DbgEngError> {
+        let (loaded, _) = self.module_counts()?;
+        self.module_range(0, loaded)
+    }
+
+    /// The modules that have **unloaded**, which the engine keeps a bounded tail of and `lm`
+    /// prints under `Unloaded modules:`.
+    ///
+    /// A different question from [`Self::modules`], and worth asking: a stack frame or a pool
+    /// pointer into a driver that is no longer there resolves to no loaded module at all, and
+    /// this tail is what names it. `!analyze` reads the same list.
+    ///
+    /// **Read through the same index space**, because that is how the engine exposes it:
+    /// `GetNumberModules` returns the two counts, and the unloaded ones are
+    /// [indexed after the loaded ones][counts] — indices `Loaded..Loaded + Unloaded`. So this is
+    /// `GetModuleParameters` over that range, not a second enumeration.
+    ///
+    /// **Empty is an ordinary answer.** Windows does not track unloaded modules everywhere — for
+    /// user-mode targets only since Server 2003, per the same page — and a target that tracks
+    /// them has simply not unloaded anything yet. Neither is a failure, so both are `Ok(vec![])`.
+    ///
+    /// The fields that describe an image (`base`, `size`, the names) are the ones that were true
+    /// when it was loaded; `symbols` says what the engine holds for it now, which is usually
+    /// nothing.
+    ///
+    /// [counts]: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dbgeng/nf-dbgeng-idebugsymbols-getnumbermodules
+    pub fn unloaded_modules(&self) -> Result<Vec<Module>, DbgEngError> {
+        let (loaded, unloaded) = self.module_counts()?;
+        self.module_range(loaded, unloaded)
+    }
+
+    /// How many modules the engine holds: `(loaded, unloaded)`.
+    fn module_counts(&self) -> Result<(u32, u32), DbgEngError> {
         let mut loaded = 0u32;
         let mut unloaded = 0u32;
         unsafe { self.symbols.GetNumberModules(&mut loaded, &mut unloaded) }.map_err(|source| {
@@ -1842,24 +1899,29 @@ impl DebugEngine {
                 source,
             }
         })?;
-        if loaded == 0 {
+        Ok((loaded, unloaded))
+    }
+
+    /// `count` modules starting at `start` in the engine's own index space.
+    fn module_range(&self, start: u32, count: u32) -> Result<Vec<Module>, DbgEngError> {
+        if count == 0 {
             return Ok(Vec::new());
         }
-        // One call for the whole table: the parameters are the engine's own bookkeeping and
+        // One call for the whole range: the parameters are the engine's own bookkeeping and
         // cannot fail per-module the way a register read can.
-        let mut params = vec![DEBUG_MODULE_PARAMETERS::default(); loaded as usize];
+        let mut params = vec![DEBUG_MODULE_PARAMETERS::default(); count as usize];
         unsafe {
             self.symbols
-                .GetModuleParameters(loaded, None, 0, params.as_mut_ptr())
+                .GetModuleParameters(count, None, start, params.as_mut_ptr())
         }
         .map_err(|source| DbgEngError::Context {
             operation: "reading module parameters".into(),
             source,
         })?;
 
-        let mut out = Vec::with_capacity(loaded as usize);
-        for (index, params) in params.iter().enumerate() {
-            out.push(self.named_module(index as u32, params));
+        let mut out = Vec::with_capacity(count as usize);
+        for (offset, params) in params.iter().enumerate() {
+            out.push(self.named_module(start + offset as u32, params));
         }
         Ok(out)
     }
@@ -1927,9 +1989,24 @@ impl DebugEngine {
         // Names come back in a single call with three buffers, each optional. Sized from the
         // parameters above rather than from a guess, because a loaded-image name is a full
         // path and truncating it silently would be worse than not reporting it.
-        let mut name_buffer = vec![0u8; params.ModuleNameSize.max(1) as usize];
-        let mut image_buffer = vec![0u8; params.ImageNameSize.max(1) as usize];
-        let mut loaded_buffer = vec![0u8; params.LoadedImageNameSize.max(1) as usize];
+        // A size of **zero** is not "no name": an unloaded module's parameters carry no sizes at
+        // all, and the engine still has the (truncated) name `lm` prints for it under
+        // `Unloaded modules:`. Measured on a kernel dump — every unloaded entry reports
+        // `ModuleNameSize == 0` — where sizing from it produced fifty nameless modules. So a
+        // reported size is believed and an absent one falls back to a path-sized buffer.
+        let sized = |reported: u32| {
+            vec![
+                0u8;
+                if reported == 0 {
+                    MODULE_NAME_FALLBACK
+                } else {
+                    reported as usize
+                }
+            ]
+        };
+        let mut name_buffer = sized(params.ModuleNameSize);
+        let mut image_buffer = sized(params.ImageNameSize);
+        let mut loaded_buffer = sized(params.LoadedImageNameSize);
         let named = unsafe {
             self.symbols.GetModuleNames(
                 index,
@@ -1957,6 +2034,7 @@ impl DebugEngine {
             checksum: params.Checksum,
             symbols: SymbolKind::from_engine(params.SymbolType),
             user_mode: params.Flags & DEBUG_MODULE_USER_MODE != 0,
+            unloaded: params.Flags & DEBUG_MODULE_UNLOADED != 0,
         }
     }
 
