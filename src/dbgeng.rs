@@ -1693,8 +1693,10 @@ impl DebugEngine {
     ///
     /// - **A different process or thread is current.** A scope is engine-global, not per-thread,
     ///   so a scope captured while one process was current is restored as-is while another is —
-    ///   which is what `.cxr` does deliberately, and is wrong only if the caller did not mean
-    ///   it. (`!analyze -v` does not move the current thread; that was measured.)
+    ///   which is what `.cxr` does deliberately, and is wrong only if the caller did not mean it.
+    ///   A guard wrapping one command is not exposed to this by a command that moves the thread
+    ///   and moves it back, which is what `!analyze -v` was measured doing (see [`Self::scope`]):
+    ///   what matters at the restore is where the thread ended up, not where it went.
     /// - **A borrowed WinDbg client whose host switched targets.** There the identity is the
     ///   client pointer, which does not change when WinDbg opens something else under it.
     ///
