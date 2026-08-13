@@ -115,6 +115,41 @@ fn main() {
         Err(err) => println!("modules ERR: {err}"),
     }
 
+    // --- unloaded modules -----------------------------------------------------------
+    //
+    // The tail `lm` prints under `Unloaded modules:`, which `modules()` deliberately does not
+    // carry. Compared against that text by eye like everything else here: the count, the names
+    // and the ranges have to be the rows `lm` printed above.
+    println!("\n=== unloaded_modules() ===");
+    match e.unloaded_modules() {
+        Ok(modules) => {
+            println!("{} unloaded modules", modules.len());
+            for module in modules.iter().take(8) {
+                println!(
+                    "  {:#018x}-{:#018x}  {:<16} {:<24} {:?}",
+                    module.base,
+                    module.end(),
+                    module.name,
+                    module.image_name,
+                    module.symbols,
+                );
+            }
+            // `name` is empty for these *by design* — nothing is left to qualify a symbol with —
+            // so the name to check is the image's, which is what `lm` prints in its place and
+            // what the kernel truncates to twelve characters.
+            let nameless = modules.iter().filter(|m| m.image_name.is_empty()).count();
+            println!("unloaded modules with no image name: {nameless} (expected 0)");
+            let named = modules.iter().filter(|m| !m.name.is_empty()).count();
+            println!("unloaded modules with a module name: {named} (expected 0)");
+            let flagged = modules.iter().filter(|m| m.unloaded).count();
+            println!(
+                "flagged unloaded by the engine: {flagged} (expected {})",
+                modules.len()
+            );
+        }
+        Err(err) => println!("unloaded_modules ERR: {err}"),
+    }
+
     // --- breakpoints ----------------------------------------------------------------
     //
     // Two on purpose: one that resolves now, and one on a module nothing has loaded, which is
