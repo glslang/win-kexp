@@ -1938,7 +1938,10 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 // number of queries rather than one per page of its length. Consecutive:
                 // the single unreadable page in the middle of a live region — the shape these
                 // samples actually have — resets it and costs one extra query.
-                if consecutive_stalls > MAX_CONSECUTIVE_STALLS {
+                //
+                // `>=`, so the count is the number of queries the limit permits and not one
+                // short of it: the check runs after the page it counts has been stepped over.
+                if consecutive_stalls >= MAX_CONSECUTIVE_STALLS {
                     snapshot.diagnostics.push(format!(
                         "region {:#x}+{:#x}: giving up after consecutive pages that would not advance",
                         region.address, region.size
@@ -3252,13 +3255,13 @@ mod tests {
         }
         let snapshot = walk_holey(&memory, &special_region(SPECIAL_PAGE, pages));
 
-        assert!(
-            memory.queries.get() <= MAX_CONSECUTIVE_STALLS as usize + 1,
-            "a dead region cost {} queries",
-            memory.queries.get()
+        assert_eq!(
+            memory.queries.get(),
+            MAX_CONSECUTIVE_STALLS as usize,
+            "a dead region costs the limit in queries, and not one more"
         );
         assert!(!snapshot.complete);
-        assert_eq!(snapshot.stalls.pages, u64::from(MAX_CONSECUTIVE_STALLS) + 1);
+        assert_eq!(snapshot.stalls.pages, u64::from(MAX_CONSECUTIVE_STALLS));
         // Every byte of it is accounted for as unreadable, whether stepped over or written off.
         let unreadable: u64 = snapshot
             .spans

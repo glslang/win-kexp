@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -618,9 +618,11 @@ fn next_target_identity() -> u64 {
 /// stale answer, since a fresh identity matches nothing — which is why this can simply drop
 /// everything when it grows rather than needing an eviction policy to reason about.
 ///
-/// **What it does not fix**: a client released and another allocated at the same address
-/// inherits the first one's identity. That was equally true of the pointer-derived scheme this
-/// replaces, and closing it needs an identity read from the debuggee rather than from the
+/// **What it does not fix**: a client the *host* released, with another allocated at the same
+/// address, inherits the first one's identity. Every client this code creates itself reissues
+/// instead — see [`DebugEngine::new`] and [`DebugEngine::create_from_windbg_client`] — so what
+/// is left is the case we cannot observe. That was equally true of the pointer-derived scheme
+/// this replaces, and closing it needs an identity read from the debuggee rather than from the
 /// client holding it.
 fn client_identities() -> &'static Mutex<HashMap<usize, u64>> {
     static IDENTITIES: OnceLock<Mutex<HashMap<usize, u64>>> = OnceLock::new();
@@ -637,6 +639,18 @@ fn client_key(client: &IDebugClient6) -> usize {
     client.as_raw() as usize
 }
 
+/// The registry, recovered if a thread panicked while holding it.
+///
+/// Poisoning carries nothing here: the map holds `u64` and no invariant a panic could leave
+/// half-applied. Propagating it would, though — `from_client_interface` is infallible, so one
+/// unrelated panic would turn every later wrap into a second one. Same recovery as
+/// [`DebugEngine::release_deferred_inputs`].
+fn locked_identities() -> MutexGuard<'static, HashMap<usize, u64>> {
+    client_identities()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The identity in force for `client`, issuing one if this is the first wrapper to ask.
 fn identity_of(client: &IDebugClient6) -> u64 {
     identity_for(client_key(client))
@@ -651,8 +665,12 @@ fn reissue_identity(client: &IDebugClient6) -> u64 {
 /// The two above, over the key rather than the COM pointer it comes from — which is all the
 /// registry deals in, and all a test of it needs.
 fn identity_for(key: usize) -> u64 {
-    let mut identities = client_identities().lock().unwrap();
-    if identities.len() >= MAX_REMEMBERED_CLIENTS {
+    let mut identities = locked_identities();
+    // Only a client we have never seen can push the map over its cap, and only then is
+    // anything dropped. Clearing before the lookup would take the identity of the very client
+    // being asked about — a live one, mid-session — and hand it a new one, which is a cache
+    // thrown away for the caller that arrived rather than for the ones that left.
+    if !identities.contains_key(&key) && identities.len() >= MAX_REMEMBERED_CLIENTS {
         identities.clear();
     }
     *identities.entry(key).or_insert_with(next_target_identity)
@@ -660,7 +678,7 @@ fn identity_for(key: usize) -> u64 {
 
 fn reissue_for(key: usize) -> u64 {
     let identity = next_target_identity();
-    client_identities().lock().unwrap().insert(key, identity);
+    locked_identities().insert(key, identity);
     identity
 }
 
@@ -756,7 +774,15 @@ impl DebugEngine {
         }
         .cast::<IDebugClient6>()
         .expect("[-] Failed to cast debug client");
-        Self::from_client_interface(new_client)
+        // `CreateClient` hands back a client this code just made, so — exactly as in `new` — it
+        // cannot be one anything holds a cached view of, whatever address it landed on.
+        // Adopting what `identity_of` found there would inherit a released client's identity
+        // the moment the allocator reused its address.
+        let engine = Self::from_client_interface(new_client);
+        engine
+            .target_identity
+            .store(reissue_identity(&engine.client), Ordering::Release);
+        engine
     }
 
     pub fn from_client_interface(client: IDebugClient6) -> Self {
@@ -2952,7 +2978,7 @@ mod tests {
     /// One test rather than four: the registry is process-global, so separate tests could clear
     /// each other's entries through the cap below.
     #[test]
-    fn a_clients_identity_outlives_the_wrapper_it_was_issued_to() {
+    fn test_a_clients_identity_outlives_the_wrapper_it_was_issued_to() {
         // Keys no real client pointer can collide with: an `IDebugClient6` is a heap
         // allocation, and these sit far below any address one lands at.
         let (client, other) = (0x11, 0x22);
@@ -2977,11 +3003,33 @@ mod tests {
         for filler in 0..MAX_REMEMBERED_CLIENTS {
             identity_for(0x1000 + filler);
         }
-        assert!(client_identities().lock().unwrap().len() <= MAX_REMEMBERED_CLIENTS);
+        assert!(locked_identities().len() <= MAX_REMEMBERED_CLIENTS);
         assert!(
             identity_for(client) >= after_release,
             "a forgotten client is issued a later identity, never an earlier one"
         );
+
+        // A client already known does not make room, because it does not need any. Clearing
+        // before the lookup would take the identity of the very client being asked about — a
+        // live one, mid-session — so the cap has to be reached with it present to see that.
+        let mut identities = locked_identities();
+        identities.clear();
+        identities.insert(client, after_release);
+        for filler in 1..MAX_REMEMBERED_CLIENTS {
+            identities.insert(0x2000 + filler, next_target_identity());
+        }
+        assert_eq!(identities.len(), MAX_REMEMBERED_CLIENTS);
+        drop(identities);
+        assert_eq!(
+            identity_for(client),
+            after_release,
+            "a client at the cap keeps the caches it is in the middle of using"
+        );
+        assert_eq!(locked_identities().len(), MAX_REMEMBERED_CLIENTS);
+
+        // A client it has never seen is what makes room, and pays for it with everything.
+        identity_for(0xbeef);
+        assert!(locked_identities().len() < MAX_REMEMBERED_CLIENTS);
     }
 
     /// A `DEBUG_VALUE` carrying a value in the arm `type_code` names.
