@@ -1063,7 +1063,7 @@ impl DebugEngine {
     /// DbgEng has no field-count getter. Its documented enumeration contract is consecutive
     /// indices ending at the first failed `GetFieldName`, so a corrupt provider cannot turn
     /// this into an unbounded loop.
-    pub fn field_names(&self, module: u64, type_id: u32) -> Result<Vec<String>, DbgEngError> {
+    pub fn field_names(&self, module: u64, type_id: u32) -> Vec<String> {
         const MAX_FIELDS: u32 = 4096;
         let mut fields = Vec::new();
         for index in 0..MAX_FIELDS {
@@ -1076,7 +1076,7 @@ impl DebugEngine {
                 Ok(_) | Err(_) => break,
             }
         }
-        Ok(fields)
+        fields
     }
 
     /// The PEB of DbgEng's current process.

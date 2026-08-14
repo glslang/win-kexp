@@ -3,7 +3,9 @@
 //! `cargo run --example user_heap_smoke` launches a child under DbgEng. The child creates a
 //! Segment Heap and allocations spanning the usual size regimes, then breaks in; the controller
 //! lists roots and verifies that every returned pointer is covered. This requires DbgEng and the
-//! matching `ntdll` PDB on the configured symbol path.
+//! matching `ntdll` PDB. Set `WIN_KEXP_USER_HEAP_SYMBOLS` to a WinDbg symbol path such as
+//! `srv*C:\ProgramData\dbg\sym*https://msdl.microsoft.com/download/symbols`; when it is unset,
+//! the helper uses `_NT_SYMBOL_PATH` and then that public-server path.
 
 use std::ffi::CString;
 use std::hint::black_box;
@@ -23,7 +25,9 @@ fn target() {
     // Exercise the 0x20 bucket until it transitions to LFH, then retain the last slot as the
     // LFH witness. The other sizes exercise the three progressively larger paths.
     for _ in 0..32 {
-        keep_alive.push(unsafe { HeapAlloc(heap, HEAP_FLAGS(0), 0x20) } as u64);
+        let pointer = unsafe { HeapAlloc(heap, HEAP_FLAGS(0), 0x20) } as u64;
+        assert_ne!(pointer, 0, "allocate 0x20");
+        keep_alive.push(pointer);
     }
     let mut allocations = vec![("lfh", *keep_alive.last().unwrap())];
     allocations.extend(

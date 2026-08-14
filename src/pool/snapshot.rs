@@ -1821,7 +1821,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
 
         let discovery_clock = Budgeted::new(self.memory, discovery_deadline);
         let mut discovery = Discovery::default();
-        let mut expired = match discover_pool_regions(
+        let expired = match discover_pool_regions(
             &discovery_clock,
             self.layout,
             self.traversal_limit,
@@ -1846,15 +1846,27 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             layout: self.layout,
             traversal_limit: self.traversal_limit,
         };
-        let discovered = discovery.regions.len();
+        walker.walk_discovered_regions(discovery.regions, budget, expired, &mut snapshot)?;
+        Ok(snapshot)
+    }
+
+    /// Walk every discovered region and record how much of the discovery was covered.
+    fn walk_discovered_regions(
+        &self,
+        regions: Vec<PoolRegion>,
+        budget: Option<Duration>,
+        mut expired: bool,
+        snapshot: &mut PoolSnapshot,
+    ) -> Result<(), SnapshotError> {
+        let discovered = regions.len();
         let mut walked = 0usize;
-        for region in discovery.regions {
+        for region in regions {
             let outcome = if region.backend == PoolBackend::Large {
                 // No reads of its own: the span comes from metadata discovery already did.
-                walker.walk_large(&region, &mut snapshot);
+                self.walk_large(&region, snapshot);
                 Ok(())
             } else {
-                walker.walk_region(&region, &mut snapshot)
+                self.walk_region(&region, snapshot)
             };
             match outcome {
                 // Counted only when the region was walked *through*. A region abandoned
@@ -1885,7 +1897,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         snapshot
             .spans
             .sort_by_key(|span| (span.heap, span.usable_address));
-        Ok(snapshot)
+        Ok(())
     }
 
     /// Reads one region and decodes its chunks, stopping if the walk's time runs out.
@@ -2562,36 +2574,7 @@ pub(crate) fn walk_user_segment_heaps<M: PoolMemory>(
         layout,
         traversal_limit,
     };
-    let discovered = discovery.regions.len();
-    let mut walked = 0usize;
-    for region in discovery.regions {
-        let outcome = if region.backend == PoolBackend::Large {
-            walker.walk_large(&region, &mut snapshot);
-            Ok(())
-        } else {
-            walker.walk_region(&region, &mut snapshot)
-        };
-        match outcome {
-            Ok(()) => walked += 1,
-            Err(SnapshotError::BudgetExpired) => {
-                expired = true;
-                break;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    if expired {
-        snapshot.complete = false;
-        snapshot.budget_expired = true;
-        snapshot.diagnostics.push(format!(
-            "the walk ran out of its {:?} budget: {walked} of {discovered} discovered regions \
-             were walked; what is missing is unknown, not absent",
-            budget.unwrap_or_default()
-        ));
-    }
-    snapshot
-        .spans
-        .sort_by_key(|span| (span.heap, span.usable_address));
+    walker.walk_discovered_regions(discovery.regions, budget, expired, &mut snapshot)?;
     Ok(snapshot)
 }
 
@@ -2672,6 +2655,58 @@ mod tests {
         assert!(
             snapshot.complete,
             "a straddling slot is expected layout and must not mark the snapshot incomplete"
+        );
+    }
+
+    #[test]
+    fn test_user_regions_never_report_payload_bytes_as_pool_tags() {
+        let no_pool_header = PoolHeaderLayout {
+            size: 0,
+            previous_size: 0,
+            pool_index: 0,
+            block_size: 0,
+            pool_type: 0,
+            tag: 0,
+        };
+        let memory = FlatMemory::new(0x1000, 0x1000);
+        let layout = vs_layout(false);
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1000,
+        };
+        let mut snapshot = PoolSnapshot {
+            complete: true,
+            ..PoolSnapshot::default()
+        };
+
+        let mut lfh = lfh_region(0x1000, 0x20);
+        lfh.size = 0x20;
+        lfh.pool_header = no_pool_header;
+        let mut lfh_bytes = vec![0; 0x20];
+        lfh_bytes[..4].copy_from_slice(b"LFH!");
+        walker.walk_lfh(&lfh, lfh.address, &lfh_bytes, &mut snapshot);
+
+        let mut vs = vs_region(0x40);
+        vs.pool_header = no_pool_header;
+        let mut vs_bytes = vs_extent(&[(0x40, 0)]);
+        vs_bytes[0x10..0x14].copy_from_slice(b"VS!!");
+        walker.walk_vs(&vs, vs.address, &vs_bytes, &mut snapshot);
+
+        let mut page = lfh_region(0x3000, 0x20);
+        page.size = 0x20;
+        page.backend = PoolBackend::Segment;
+        page.pool_header = no_pool_header;
+        page.states = vec![PoolState::Allocated];
+        let mut page_bytes = vec![0; 0x20];
+        page_bytes[..4].copy_from_slice(b"PAGE");
+        walker.walk_page_ranges(&page, page.address, &page_bytes, &mut snapshot);
+
+        assert_eq!(snapshot.spans.len(), 3);
+        assert!(
+            snapshot.spans.iter().all(|span| span.raw_tag == 0),
+            "user payload bytes must not be decoded as kernel pool tags: {:?}",
+            snapshot.spans
         );
     }
 

@@ -249,7 +249,9 @@ pub unsafe extern "system" fn DebugExtensionUninitialize() {
 pub unsafe extern "system" fn DebugExtensionNotify(notify: u32, _argument: u64) {
     let _ = catch_unwind(AssertUnwindSafe(|| match notify {
         DEBUG_NOTIFY_SESSION_ACTIVE | DEBUG_NOTIFY_SESSION_INACTIVE => invalidate_session(),
-        DEBUG_NOTIFY_SESSION_INACCESSIBLE => query::snapshots().invalidate(),
+        // Target memory can change while the session is inaccessible. Layouts describe the
+        // loaded PDBs and remain valid, but both allocator snapshots must be discarded.
+        DEBUG_NOTIFY_SESSION_INACCESSIBLE => query::invalidate_allocator_snapshots(),
         DEBUG_NOTIFY_SESSION_ACCESSIBLE => {}
         _ => {}
     }));

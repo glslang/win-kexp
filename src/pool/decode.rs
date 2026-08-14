@@ -412,6 +412,11 @@ pub(crate) fn decode_pool_header(
     offset: usize,
     layout: PoolHeaderLayout,
 ) -> Option<PoolHeader> {
+    // User Segment Heap blocks have no kernel `_POOL_HEADER`; their shared-decoder adapter is
+    // deliberately zero-sized and must not reinterpret payload bytes as header fields or tags.
+    if layout.size == 0 {
+        return None;
+    }
     range(bytes, offset, layout.size)?;
     // PDB field offsets for the two bitfield pairs can both name the containing
     // USHORT. In that representation the second member occupies its high byte.
@@ -761,6 +766,16 @@ mod tests {
                 .pool_index,
             3
         );
+
+        let no_pool_header = PoolHeaderLayout {
+            size: 0,
+            previous_size: 0,
+            pool_index: 0,
+            block_size: 0,
+            pool_type: 0,
+            tag: 0,
+        };
+        assert_eq!(decode_pool_header(b"DATA", 0, no_pool_header), None);
     }
 
     /// The flag combinations the kernel itself dispatches on, as read out of `nt` on Server

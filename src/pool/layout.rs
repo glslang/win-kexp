@@ -340,6 +340,27 @@ fn resolve_type(
     Ok(TypeLayout { size, fields })
 }
 
+fn apply_optional_fields(
+    symbols: &impl Symbols,
+    module: u64,
+    types: &mut HashMap<&'static str, TypeLayout>,
+) {
+    for &(type_name, canonical, aliases) in OPTIONAL_FIELDS {
+        let Some(layout) = types.get_mut(type_name) else {
+            continue;
+        };
+        let Ok(type_id) = symbols.type_id(module, type_name) else {
+            continue;
+        };
+        if let Some(offset) = aliases
+            .iter()
+            .find_map(|field| symbols.field(module, type_id, field).ok())
+        {
+            layout.fields.insert(canonical, offset);
+        }
+    }
+}
+
 impl AllocatorSchema {
     pub(crate) fn is_user(&self) -> bool {
         !self.globals.contains_key("ExPoolState") && self.globals.contains_key("RtlpHpHeapGlobals")
@@ -411,20 +432,7 @@ impl AllocatorSchema {
                 types.insert(spec.name, layout);
             }
         }
-        for &(type_name, canonical, aliases) in OPTIONAL_FIELDS {
-            let Some(layout) = types.get_mut(type_name) else {
-                continue;
-            };
-            let Ok(type_id) = symbols.type_id(key.image.base, type_name) else {
-                continue;
-            };
-            if let Some(offset) = aliases
-                .iter()
-                .find_map(|field| symbols.field(key.image.base, type_id, field).ok())
-            {
-                layout.fields.insert(canonical, offset);
-            }
-        }
+        apply_optional_fields(symbols, key.image.base, &mut types);
         Ok(Self {
             key,
             globals,
@@ -461,6 +469,9 @@ impl AllocatorSchema {
         for spec in USER_TYPES {
             types.insert(spec.name, resolve_type(symbols, key.image.base, spec)?);
         }
+        // Kernel-only optional lookaside types are intentionally tolerated when `ntdll`
+        // omits them. The big-page tracker alone is skipped explicitly because interpreting
+        // it requires the kernel-only global table and dedicated discovery path.
         for spec in OPTIONAL_TYPES {
             if spec.name == "_POOL_TRACKER_BIG_PAGES" {
                 continue;
@@ -469,20 +480,7 @@ impl AllocatorSchema {
                 types.insert(spec.name, layout);
             }
         }
-        for &(type_name, canonical, aliases) in OPTIONAL_FIELDS {
-            let Some(layout) = types.get_mut(type_name) else {
-                continue;
-            };
-            let Ok(type_id) = symbols.type_id(key.image.base, type_name) else {
-                continue;
-            };
-            if let Some(offset) = aliases
-                .iter()
-                .find_map(|field| symbols.field(key.image.base, type_id, field).ok())
-            {
-                layout.fields.insert(canonical, offset);
-            }
-        }
+        apply_optional_fields(symbols, key.image.base, &mut types);
         if !types
             .get("_SEGMENT_HEAP")
             .is_some_and(|layout| layout.fields.contains_key("Signature"))
@@ -552,9 +550,15 @@ impl AllocatorSchema {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum LayoutTarget {
+    Kernel,
+    User,
+}
+
 #[derive(Default)]
 pub(crate) struct LayoutCache {
-    entries: Mutex<HashMap<LayoutKey, AllocatorSchema>>,
+    entries: Mutex<HashMap<(LayoutTarget, LayoutKey), AllocatorSchema>>,
 }
 
 impl LayoutCache {
@@ -567,13 +571,21 @@ impl LayoutCache {
         &self,
         symbols: &impl Symbols,
         key: impl Into<LayoutKey>,
+        target: LayoutTarget,
     ) -> Result<AllocatorSchema, LayoutError> {
         let key = key.into();
-        if let Some(layout) = self.entries.lock().unwrap().get(&key).cloned() {
+        let cache_key = (target, key);
+        if let Some(layout) = self.entries.lock().unwrap().get(&cache_key).cloned() {
             return Ok(layout);
         }
-        let layout = AllocatorSchema::resolve(symbols, key)?;
-        self.entries.lock().unwrap().insert(key, layout.clone());
+        let layout = match target {
+            LayoutTarget::Kernel => AllocatorSchema::resolve(symbols, key),
+            LayoutTarget::User => AllocatorSchema::resolve_user(symbols, key),
+        }?;
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(cache_key, layout.clone());
         Ok(layout)
     }
 
@@ -718,11 +730,15 @@ mod tests {
         let symbols = FakeSymbols::default();
         let cache = LayoutCache::default();
         let resolve = |key: LayoutKey| {
-            let layout = cache.get_or_resolve(&symbols, key).unwrap();
+            let layout = cache
+                .get_or_resolve(&symbols, key, LayoutTarget::Kernel)
+                .unwrap();
             (symbols.resolutions.get(), layout.key.image)
         };
         let through_an_engine = |key: SessionKey| {
-            let layout = cache.get_or_resolve(&symbols, key).unwrap();
+            let layout = cache
+                .get_or_resolve(&symbols, key, LayoutTarget::Kernel)
+                .unwrap();
             (symbols.resolutions.get(), layout.key.image)
         };
 
@@ -756,6 +772,29 @@ mod tests {
             "a second build at one base must not be served the first build's layout"
         );
         assert_eq!(resolved, other_build);
+    }
+
+    #[test]
+    fn test_layout_cache_keeps_kernel_and_user_resolvers_separate() {
+        let symbols = FakeSymbols {
+            optional_fields: true,
+            ..FakeSymbols::default()
+        };
+        let cache = LayoutCache::default();
+        let kernel = cache
+            .get_or_resolve(&symbols, key(), LayoutTarget::Kernel)
+            .unwrap();
+        let resolved_after_kernel = symbols.resolutions.get();
+        let user = cache
+            .get_or_resolve(&symbols, key(), LayoutTarget::User)
+            .unwrap();
+
+        assert!(!kernel.is_user());
+        assert!(user.is_user());
+        assert!(
+            symbols.resolutions.get() > resolved_after_kernel,
+            "one image key may not alias two module-specific resolver modes"
+        );
     }
 
     fn missing_item(result: Result<PoolLayout, LayoutError>) -> String {
