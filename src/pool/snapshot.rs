@@ -1916,17 +1916,26 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                     break;
                 }
                 // The rest is a real stall: a valid region was reported inside the span and it
-                // ends at or before where the cursor already is. Step over a page and ask
-                // again, rather than giving up on every committed page behind it — the
-                // samples show these firing part-way through regions of 0x10fd0 and 0x3afc0
+                // ends at or before where the cursor already is. Step over the page it stalled
+                // on and ask again, rather than giving up on every committed page behind it —
+                // the samples show these firing part-way through regions of 0x10fd0 and 0x3afc0
                 // bytes, not at their tails.
                 //
-                // The advance is **unconditional**. A query that keeps answering the same way
-                // would otherwise spin here without end, which is the reason this used to
-                // abandon the region outright.
-                let skip = PAGE_SIZE.min(requested_end - valid_base);
+                // To the next page **boundary**, not a page's worth of bytes: a region begins
+                // wherever the allocator put it (`…de6030`, `…e02130` in those same samples),
+                // so a stall at a page offset of 0xfd0 would otherwise write off 0x30 bytes of
+                // the page that stalled and 0xfd0 bytes of the page after it — discarding a
+                // healthy page to skip a bad one, which is this whole branch's mistake in
+                // miniature. Every stall after the first is aligned by construction.
+                //
+                // The advance is **unconditional**: the boundary is always past `valid_base`,
+                // and `requested_end` is too — the check above returned otherwise — so this
+                // cannot be zero. A query that keeps answering the same way would spin here
+                // without end, which is the reason this used to abandon the region outright.
+                let page_end = (valid_base & !(PAGE_SIZE - 1)).saturating_add(PAGE_SIZE);
+                let skip = page_end.min(requested_end) - valid_base;
                 snapshot.diagnostics.push(format!(
-                    "valid-region query made no progress at {valid_base:#x}; stepping over a page"
+                    "valid-region query made no progress at {valid_base:#x}; stepping over the                      rest of the page"
                 ));
                 self.unreadable(region, valid_base, skip, snapshot);
                 snapshot.stalls.pages += 1;
@@ -3239,6 +3248,38 @@ mod tests {
                 // `break` reported as nothing at all.
                 recovered_bytes: 2 * PAGE_SIZE,
             }
+        );
+    }
+
+    /// A region begins wherever the allocator put it — `…de6030` and `…e02130` in the live
+    /// samples — so a stall can land at any page offset. Advancing a page's *worth of bytes*
+    /// from there writes off the tail of the page that stalled and the head of the page after
+    /// it, discarding a healthy page in order to skip a bad one: this branch's own mistake, in
+    /// miniature. The other stall tests miss it because their region is page-aligned.
+    #[test]
+    fn test_a_stall_part_way_through_a_page_does_not_swallow_the_next_one() {
+        let mut memory = HoleyMemory::new(SPECIAL_PAGE, special_pages(3));
+        memory.stalls.insert(SPECIAL_PAGE);
+        // Starting 0x30 bytes short of the second page, as an unaligned region does.
+        let mut region = special_region(SPECIAL_PAGE, 3);
+        region.address = SPECIAL_PAGE + 0xfd0;
+        region.size = 3 * PAGE_SIZE as usize - 0xfd0;
+        let snapshot = walk_holey(&memory, &region);
+
+        assert_eq!(
+            snapshot.stalls.skipped_bytes, 0x30,
+            "only the rest of the page that stalled is written off"
+        );
+        let allocated: Vec<_> = snapshot
+            .spans
+            .iter()
+            .filter(|span| span.state == PoolState::Allocated)
+            .map(|span| span.usable_address)
+            .collect();
+        assert_eq!(
+            allocated,
+            [SPECIAL_PAGE + 0x1f90, SPECIAL_PAGE + 0x2f90],
+            "the page immediately after the stall is healthy and must still be walked"
         );
     }
 
