@@ -21,7 +21,7 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
 
 use super::decode::parse_tag;
 use super::index::{PoolIndex, SnapshotCache};
-use super::layout::{LayoutCache, SessionKey};
+use super::layout::{LayoutCache, LayoutTarget, SessionKey};
 use super::snapshot::{SnapshotError, SnapshotWalker, WalkStalls};
 use super::{PoolBackend, PoolDiagnostics, PoolSpan, PoolState};
 use crate::dbgeng::{DbgEngError, DebugEngine};
@@ -366,7 +366,7 @@ pub(crate) fn prepare_index(
     // kernels load at one address share a layout, which is not a leak but wrong data reported
     // confidently.
     let layout = LayoutCache::global()
-        .get_or_resolve(engine, key)
+        .get_or_resolve(engine, key, LayoutTarget::Kernel)
         .map_err(|error| PoolQueryError::Layout(error.to_string()))?;
     let module = engine.module_identity("nt")?;
     if !module.symbols.has_type_info() || module.symbol_file.is_empty() {

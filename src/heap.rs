@@ -11,15 +11,15 @@ use thiserror::Error;
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_STATUS_BREAK, DEBUG_STATUS_NO_DEBUGGEE,
 };
+use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_AMD64;
 
 use crate::allocator::LayoutProvenance;
 use crate::dbgeng::{DbgEngError, DebugEngine, KernelImage};
-use crate::pool::layout::{LayoutKey, PoolLayout};
+use crate::pool::layout::{LayoutCache, LayoutKey, LayoutTarget, PoolLayout};
 use crate::pool::query::WalkCoverage;
 use crate::pool::snapshot::{PoolSnapshot, SnapshotError, walk_user_segment_heaps};
 use crate::pool::{DiagnosticShape, PoolBackend, PoolState, WalkStalls};
 
-const IMAGE_FILE_MACHINE_AMD64: u32 = 0x8664;
 const SEGMENT_HEAP_SIGNATURE: u32 = 0xddee_ddee;
 const NT_HEAP_SIGNATURE: u32 = 0xeeff_eeff;
 const MAX_PROCESS_HEAPS: usize = 4096;
@@ -201,8 +201,10 @@ pub enum HeapQueryError {
     NotUserTarget,
     #[error("no debuggee is loaded")]
     NoDebuggee,
-    #[error("the target is running; break in before walking heaps")]
-    TargetRunning,
+    #[error(
+        "the target is not stopped (execution status {status:#x}); break in before walking heaps"
+    )]
+    TargetRunning { status: u32 },
     #[error("heap walking supports x64 targets only (machine {machine:#x})")]
     UnsupportedArchitecture { machine: u32 },
     #[error("invalid PEB heap metadata: {0}")]
@@ -235,6 +237,19 @@ struct HeapSnapshot {
     scope: HeapScope,
     walk: HeapWalkReport,
     diagnostics: HeapDiagnosticReport,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ValidatedTarget {
+    target: u64,
+    peb: u64,
+    generation: u64,
+}
+
+struct ResolvedSchema {
+    layout: PoolLayout,
+    provenance: LayoutProvenance,
+    image: KernelImage,
 }
 
 #[derive(Default)]
@@ -272,48 +287,6 @@ fn snapshots() -> &'static SnapshotCache {
     CACHE.get_or_init(SnapshotCache::default)
 }
 
-#[derive(Default)]
-struct UserLayoutCache {
-    entries: Mutex<HashMap<LayoutKey, PoolLayout>>,
-}
-
-impl UserLayoutCache {
-    fn global() -> &'static Self {
-        static CACHE: OnceLock<UserLayoutCache> = OnceLock::new();
-        CACHE.get_or_init(UserLayoutCache::default)
-    }
-
-    fn get_or_resolve(
-        &self,
-        engine: &DebugEngine,
-        key: LayoutKey,
-    ) -> Result<PoolLayout, HeapQueryError> {
-        if let Some(layout) = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&key)
-            .cloned()
-        {
-            return Ok(layout);
-        }
-        let layout = PoolLayout::resolve_user(engine, key)
-            .map_err(|error| HeapQueryError::Layout(error.to_string()))?;
-        self.entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(key, layout.clone());
-        Ok(layout)
-    }
-
-    fn invalidate(&self) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-    }
-}
-
 /// Drop the user-heap snapshot while retaining the image-keyed `ntdll` schema.
 pub fn invalidate_snapshot() {
     snapshots().invalidate();
@@ -322,18 +295,24 @@ pub fn invalidate_snapshot() {
 /// Drop every user-heap snapshot and resolved `ntdll` schema.
 pub fn invalidate_caches() {
     invalidate_snapshot();
-    UserLayoutCache::global().invalidate();
+    LayoutCache::global().invalidate();
 }
 
 fn read_u32(engine: &DebugEngine, address: u64) -> Result<u32, DbgEngError> {
     Ok(u32::from_le_bytes(
-        engine.read_memory(address, 4)?.try_into().unwrap(),
+        engine
+            .read_memory(address, 4)?
+            .try_into()
+            .expect("read_memory returns exactly four bytes or a ShortRead error"),
     ))
 }
 
 fn read_u64(engine: &DebugEngine, address: u64) -> Result<u64, DbgEngError> {
     Ok(u64::from_le_bytes(
-        engine.read_memory(address, 8)?.try_into().unwrap(),
+        engine
+            .read_memory(address, 8)?
+            .try_into()
+            .expect("read_memory returns exactly eight bytes or a ShortRead error"),
     ))
 }
 
@@ -366,6 +345,40 @@ fn classify_root(
             Some("root matches neither the PDB-resolved Segment nor NT heap signature".into()),
         ),
     }
+}
+
+fn read_root_signatures(
+    engine: &DebugEngine,
+    address: u64,
+    segment_offset: u64,
+    nt_offset: u64,
+) -> (Result<u32, String>, Result<u32, String>) {
+    let start_offset = segment_offset.min(nt_offset);
+    let end_offset = segment_offset.max(nt_offset).saturating_add(4);
+    let Some(start) = address.checked_add(start_offset) else {
+        let error = "heap signature address overflow".to_string();
+        return (Err(error.clone()), Err(error));
+    };
+    let size = usize::try_from(end_offset.saturating_sub(start_offset))
+        .expect("two u32 PDB fields fit in a host-sized read buffer");
+    let bytes = match engine.read_memory(start, size) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let error = error.to_string();
+            return (Err(error.clone()), Err(error));
+        }
+    };
+    let decode = |offset: u64| {
+        let relative = usize::try_from(offset - start_offset)
+            .expect("a field within the signature buffer has a host-sized offset");
+        let value = bytes
+            .get(relative..relative + 4)
+            .expect("read_memory returns the complete signature buffer or a ShortRead error")
+            .try_into()
+            .expect("a signature slice is exactly four bytes");
+        Ok(u32::from_le_bytes(value))
+    };
+    (decode(segment_offset), decode(nt_offset))
 }
 
 fn enumerate_roots(
@@ -413,7 +426,11 @@ fn enumerate_roots(
         .map_err(|error| HeapQueryError::Layout(error.to_string()))? as u64;
     let mut roots = Vec::with_capacity(count);
     for (index, entry) in bytes.chunks_exact(8).enumerate() {
-        let address = u64::from_le_bytes(entry.try_into().unwrap());
+        let address = u64::from_le_bytes(
+            entry
+                .try_into()
+                .expect("ProcessHeaps is read as a whole number of pointer-sized entries"),
+        );
         if address == 0 {
             roots.push(HeapRoot {
                 index,
@@ -434,14 +451,7 @@ fn enumerate_roots(
             });
             continue;
         }
-        let segment = address
-            .checked_add(segment_offset)
-            .ok_or_else(|| "Segment signature address overflow".into())
-            .and_then(|address| read_u32(engine, address).map_err(|error| error.to_string()));
-        let nt = address
-            .checked_add(nt_offset)
-            .ok_or_else(|| "NT signature address overflow".into())
-            .and_then(|address| read_u32(engine, address).map_err(|error| error.to_string()));
+        let (segment, nt) = read_root_signatures(engine, address, segment_offset, nt_offset);
         let (kind, reason) = classify_root(segment, nt);
         roots.push(HeapRoot {
             index,
@@ -470,7 +480,7 @@ fn scope_of(roots: &[HeapRoot]) -> HeapScope {
 fn from_pool_snapshot(
     snapshot: PoolSnapshot,
 ) -> (Vec<HeapAllocation>, HeapWalkReport, HeapDiagnosticReport) {
-    let allocations: Vec<_> = snapshot
+    let mut allocations: Vec<_> = snapshot
         .spans
         .iter()
         .map(|span| HeapAllocation {
@@ -485,6 +495,7 @@ fn from_pool_snapshot(
             size_class: span.size_class,
         })
         .collect();
+    allocations.sort_by_key(|allocation| (allocation.user_address, allocation.heap));
     let walk = HeapWalkReport {
         coverage: match (snapshot.complete, snapshot.budget_expired) {
             (true, _) => WalkCoverage::Complete,
@@ -511,18 +522,17 @@ fn from_pool_snapshot(
     (allocations, walk, diagnostics)
 }
 
-fn prepare(engine: &DebugEngine, walk: HeapWalk) -> Result<HeapSnapshot, HeapQueryError> {
-    let started = Instant::now();
+fn validate_target(engine: &DebugEngine) -> Result<ValidatedTarget, HeapQueryError> {
     if engine.is_kernel_target()? {
         return Err(HeapQueryError::NotUserTarget);
     }
     match engine.execution_status()? {
         DEBUG_STATUS_NO_DEBUGGEE => return Err(HeapQueryError::NoDebuggee),
         DEBUG_STATUS_BREAK => {}
-        _ => return Err(HeapQueryError::TargetRunning),
+        status => return Err(HeapQueryError::TargetRunning { status }),
     }
     let machine = engine.processor_type()?;
-    if machine != IMAGE_FILE_MACHINE_AMD64 {
+    if machine != u32::from(IMAGE_FILE_MACHINE_AMD64.0) {
         return Err(HeapQueryError::UnsupportedArchitecture { machine });
     }
     let peb = engine.current_process_peb()?;
@@ -531,6 +541,17 @@ fn prepare(engine: &DebugEngine, walk: HeapWalk) -> Result<HeapSnapshot, HeapQue
             "DbgEng returned a null PEB".into(),
         ));
     }
+    Ok(ValidatedTarget {
+        target: engine.target_identity(),
+        peb,
+        generation: crate::pool::query::generation(),
+    })
+}
+
+fn resolve_schema(
+    engine: &DebugEngine,
+    target: ValidatedTarget,
+) -> Result<ResolvedSchema, HeapQueryError> {
     let loaded_module = engine.module("ntdll")?;
     let image = KernelImage {
         base: loaded_module.base,
@@ -538,12 +559,13 @@ fn prepare(engine: &DebugEngine, walk: HeapWalk) -> Result<HeapSnapshot, HeapQue
         timestamp: loaded_module.timestamp,
         checksum: loaded_module.checksum,
     };
-    let generation = crate::pool::query::generation();
     let layout_key = LayoutKey {
         image,
-        session: generation,
+        session: target.generation,
     };
-    let layout = UserLayoutCache::global().get_or_resolve(engine, layout_key)?;
+    let layout = LayoutCache::global()
+        .get_or_resolve(engine, layout_key, LayoutTarget::User)
+        .map_err(|error| HeapQueryError::Layout(error.to_string()))?;
     // Type lookups above force a deferred module to load. Check provenance afterwards so
     // export-only symbols fail explicitly without preventing the normal deferred-load path.
     let module = engine.module_identity("ntdll")?;
@@ -555,11 +577,25 @@ fn prepare(engine: &DebugEngine, walk: HeapWalk) -> Result<HeapSnapshot, HeapQue
     let provenance = layout
         .provenance(module)
         .map_err(|error| HeapQueryError::Layout(error.to_string()))?;
-    let key = SnapshotKey {
-        target: engine.target_identity(),
-        peb,
+    Ok(ResolvedSchema {
+        layout,
+        provenance,
         image,
-        generation,
+    })
+}
+
+fn walk_snapshot(
+    engine: &DebugEngine,
+    walk: HeapWalk,
+    started: Instant,
+    target: ValidatedTarget,
+    schema: ResolvedSchema,
+) -> Result<HeapSnapshot, HeapQueryError> {
+    let key = SnapshotKey {
+        target: target.target,
+        peb: target.peb,
+        image: schema.image,
+        generation: target.generation,
     };
     if walk.refresh {
         snapshots().invalidate();
@@ -567,15 +603,15 @@ fn prepare(engine: &DebugEngine, walk: HeapWalk) -> Result<HeapSnapshot, HeapQue
         return Ok(snapshot);
     }
 
-    let roots = enumerate_roots(engine, &layout, peb)?;
+    let roots = enumerate_roots(engine, &schema.layout, target.peb)?;
     let scope = scope_of(&roots);
     let remaining = walk
         .budget
         .map(|budget| budget.saturating_sub(started.elapsed()));
     let pool = walk_user_segment_heaps(
         engine,
-        &layout,
-        peb,
+        &schema.layout,
+        target.peb,
         &scope.segment_heaps_walked,
         remaining,
         1_000_000,
@@ -588,7 +624,7 @@ fn prepare(engine: &DebugEngine, walk: HeapWalk) -> Result<HeapSnapshot, HeapQue
     let snapshot = HeapSnapshot {
         roots,
         allocations,
-        layout: provenance,
+        layout: schema.provenance,
         scope,
         walk: report,
         diagnostics,
@@ -597,6 +633,13 @@ fn prepare(engine: &DebugEngine, walk: HeapWalk) -> Result<HeapSnapshot, HeapQue
         snapshots().put(key, snapshot.clone());
     }
     Ok(snapshot)
+}
+
+fn prepare(engine: &DebugEngine, walk: HeapWalk) -> Result<HeapSnapshot, HeapQueryError> {
+    let started = Instant::now();
+    let target = validate_target(engine)?;
+    let schema = resolve_schema(engine, target)?;
+    walk_snapshot(engine, walk, started, target, schema)
 }
 
 fn answer<T>(snapshot: &HeapSnapshot, found: T) -> HeapAnswer<T> {
@@ -635,9 +678,16 @@ pub fn chunk_at(
 }
 
 fn neighbourhood_at(allocations: &[HeapAllocation], address: u64) -> Option<HeapNeighbourhood> {
-    let position = allocations
-        .iter()
-        .position(|allocation| allocation.contains(address))?;
+    let split = allocations.partition_point(|allocation| allocation.user_address <= address);
+    let position = split
+        .checked_sub(1)
+        .filter(|&index| allocations[index].contains(address))
+        .or_else(|| {
+            allocations
+                .get(split)
+                .filter(|allocation| allocation.contains(address))
+                .map(|_| split)
+        })?;
     let allocation = allocations[position].clone();
     let same_heap = |candidate: &HeapAllocation| {
         candidate.heap == allocation.heap
