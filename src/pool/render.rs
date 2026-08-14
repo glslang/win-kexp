@@ -408,6 +408,7 @@ mod tests {
         spans[3].subsegment = Some(2);
         spans[4].subsegment = Some(2);
         let index = PoolIndex::build(PoolSnapshot {
+            layout: Default::default(),
             spans,
             complete: true,
             budget_expired: false,
@@ -501,6 +502,7 @@ mod tests {
             many.push(value);
         }
         let many_index = PoolIndex::build(PoolSnapshot {
+            layout: Default::default(),
             spans: many,
             complete: true,
             budget_expired: false,

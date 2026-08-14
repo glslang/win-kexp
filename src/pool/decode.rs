@@ -528,8 +528,23 @@ pub(crate) fn decode_special_pool_header(
 }
 
 pub(crate) fn decode_rb_root(root: u64, tree_address: u64, encoded: bool) -> Option<u64> {
+    decode_rb_root_for(root, tree_address, encoded, false)
+}
+
+pub(crate) fn decode_rb_root_for(
+    root: u64,
+    tree_address: u64,
+    encoded: bool,
+    user: bool,
+) -> Option<u64> {
     let pointer = if encoded { root ^ tree_address } else { root } & !0xf;
-    (pointer == 0 || is_kernel_pointer(pointer)).then_some(pointer)
+    (pointer == 0
+        || if user {
+            is_user_pointer(pointer)
+        } else {
+            is_kernel_pointer(pointer)
+        })
+    .then_some(pointer)
 }
 
 /// Decode the 60-bit `NextEntry` field packed above the low four reserved bits
@@ -546,14 +561,47 @@ pub(crate) fn decode_large_allocation(
     virtual_address_field: u64,
     allocated_pages_field: u64,
 ) -> Option<(u64, u64)> {
+    decode_large_allocation_for(virtual_address_field, allocated_pages_field, false)
+}
+
+pub(crate) fn decode_large_allocation_for(
+    virtual_address_field: u64,
+    allocated_pages_field: u64,
+    user: bool,
+) -> Option<(u64, u64)> {
     let virtual_address = virtual_address_field & !0xffff;
     let allocated_pages = allocated_pages_field >> 12;
-    (virtual_address != 0 && is_kernel_pointer(virtual_address) && allocated_pages != 0)
+    (virtual_address != 0
+        && if user {
+            is_user_pointer(virtual_address)
+        } else {
+            is_kernel_pointer(virtual_address)
+        }
+        && allocated_pages != 0)
         .then_some((virtual_address, allocated_pages))
+}
+
+/// Recover the exact request encoded in the low sixteen bits of the large-allocation address
+/// word. Callers must pass `validated_alias` only when the selected PDB reports `UnusedBytes`
+/// at the same offset as `VirtualAddress`.
+pub(crate) fn decode_large_requested_size(
+    virtual_address_field: u64,
+    allocated_bytes: u64,
+    validated_alias: bool,
+) -> Option<u64> {
+    if !validated_alias {
+        return None;
+    }
+    let unused = virtual_address_field & 0xffff;
+    allocated_bytes.checked_sub(unused)
 }
 
 pub(crate) fn is_kernel_pointer(pointer: u64) -> bool {
     pointer == 0 || pointer >= 0xffff_8000_0000_0000
+}
+
+pub(crate) fn is_user_pointer(pointer: u64) -> bool {
+    (0x1_0000..0x0000_8000_0000_0000).contains(&pointer)
 }
 
 pub(crate) fn big_page_hash(address: u64, table_size: usize) -> Option<usize> {
@@ -891,6 +939,19 @@ mod tests {
         assert_eq!(
             decode_large_allocation(root | 0x1234, (0x2345u64 << 12) | 0xabc),
             Some((root, 0x2345))
+        );
+        assert_eq!(
+            decode_large_requested_size(root | 0x1234, 0x20_000, true),
+            Some(0x1_edcc)
+        );
+        assert_eq!(
+            decode_large_requested_size(root | 0x1234, 0x20_000, false),
+            None,
+            "without a PDB-validated alias capacity must not be presented as an exact request"
+        );
+        assert_eq!(
+            decode_large_requested_size(root | 0xffff, 0x1000, true),
+            None
         );
     }
 }

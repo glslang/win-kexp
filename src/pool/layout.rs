@@ -4,7 +4,8 @@ use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 
 use super::decode::PoolHeaderLayout;
-use crate::dbgeng::{DbgEngError, DebugEngine, KernelImage};
+use crate::allocator::{LayoutProvenance, VsSemanticFamily, fingerprint};
+use crate::dbgeng::{DbgEngError, DebugEngine, KernelImage, ModuleIdentity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SessionKey {
@@ -55,16 +56,22 @@ impl From<SessionKey> for LayoutKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PoolLayout {
+pub(crate) struct AllocatorSchema {
     pub key: LayoutKey,
     pub globals: HashMap<&'static str, u64>,
     pub types: HashMap<&'static str, TypeLayout>,
 }
 
+/// Kernel-facing compatibility name. User and kernel adapters both resolve the same
+/// module-scoped allocator schema; the alias keeps the mature pool decoder terminology local.
+pub(crate) type PoolLayout = AllocatorSchema;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum LayoutError {
-    #[error("missing kernel pool symbols ({item}); run `.reload /f nt` and retry")]
+    #[error("missing allocator symbols ({item})")]
     Missing { item: String },
+    #[error("unsupported allocator layout {fingerprint}: {detail}")]
+    Unsupported { fingerprint: String, detail: String },
 }
 
 pub(crate) trait Symbols {
@@ -143,8 +150,8 @@ const TYPES: &[TypeSpec] = &[
         ],
     },
     // Deliberately no *required* fields. The VS free-chunk state lives inside this
-    // struct on older builds, and from Windows 26100 it moved into a separately
-    // addressed _HEAP_VS_AFFINITY_SLOT. Both shapes are resolved optionally below;
+    // struct in one schema family and moved into a separately addressed
+    // _HEAP_VS_AFFINITY_SLOT in another. Both shapes are resolved optionally below;
     // requiring either one here would refuse to walk half the world.
     TypeSpec {
         name: "_HEAP_VS_CONTEXT",
@@ -211,9 +218,8 @@ const TYPES: &[TypeSpec] = &[
 ];
 
 const OPTIONAL_TYPES: &[TypeSpec] = &[
-    // Windows 26100+: the VS free-chunk tree, subsegment list and delay-free list moved
-    // out of _HEAP_VS_CONTEXT into one of these per-affinity slots. Absent on older
-    // builds, where the same state is inline in the context.
+    // Affinity-slot family: the VS free-chunk tree, subsegment list and delay-free list live
+    // outside _HEAP_VS_CONTEXT in one of these per-affinity slots. Absent in the inline family.
     TypeSpec {
         name: "_HEAP_VS_AFFINITY_SLOT",
         fields: &[
@@ -254,6 +260,7 @@ const OPTIONAL_TYPES: &[TypeSpec] = &[
 ];
 
 const OPTIONAL_FIELDS: &[(&str, &str, &[&str])] = &[
+    ("_SEGMENT_HEAP", "Signature", &["Signature"]),
     ("_EX_HEAP_POOL_NODE", "Lookasides", &["Lookasides"]),
     ("_RTL_RB_TREE", "Encoded", &["Encoded"]),
     (
@@ -267,17 +274,32 @@ const OPTIONAL_FIELDS: &[(&str, &str, &[&str])] = &[
         &["AffinitySlots", "AffinitizedInfoArrays"],
     ),
     ("_RTL_LOOKASIDE", "Size", &["Size", "SizeClass"]),
-    // Legacy (pre-26100) in-context VS state.
+    // Inline-family VS state.
     ("_HEAP_VS_CONTEXT", "FreeChunkTree", &["FreeChunkTree"]),
     (
         "_HEAP_VS_CONTEXT",
         "DelayFreeContext",
         &["DelayFreeContext"],
     ),
-    // 26100+: locate the affinity slots. Both are self-relative to the VS context and
+    // Affinity-slot family. Both references are self-relative to the VS context and
     // scaled by 64 bytes; the slot map holds AffinityMask + 1 entries.
     ("_HEAP_VS_CONTEXT", "SlotMapRef", &["SlotMapRef"]),
     ("_HEAP_VS_CONTEXT", "AffinityMask", &["AffinityMask"]),
+    ("_HEAP_LARGE_ALLOC_DATA", "UnusedBytes", &["UnusedBytes"]),
+];
+
+const USER_TYPES: &[TypeSpec] = &[
+    TypeSpec {
+        name: "_PEB",
+        fields: &[
+            ("NumberOfHeaps", &["NumberOfHeaps"]),
+            ("ProcessHeaps", &["ProcessHeaps"]),
+        ],
+    },
+    TypeSpec {
+        name: "_HEAP",
+        fields: &[("Signature", &["Signature"])],
+    },
 ];
 
 const GLOBALS: &[(&str, &[&str])] = &[
@@ -318,7 +340,11 @@ fn resolve_type(
     Ok(TypeLayout { size, fields })
 }
 
-impl PoolLayout {
+impl AllocatorSchema {
+    pub(crate) fn is_user(&self) -> bool {
+        !self.globals.contains_key("ExPoolState") && self.globals.contains_key("RtlpHpHeapGlobals")
+    }
+
     pub(crate) fn type_layout(&self, name: &str) -> Result<&TypeLayout, LayoutError> {
         self.types
             .get(name)
@@ -337,6 +363,19 @@ impl PoolLayout {
     }
 
     pub(crate) fn pool_header_layout(&self) -> Result<PoolHeaderLayout, LayoutError> {
+        // User Segment Heap blocks do not carry the kernel's `_POOL_HEADER`. A zero-sized
+        // adapter lets the shared LFH/VS/page-range decoder report the block geometry without
+        // inventing a tag header.
+        if self.is_user() {
+            return Ok(PoolHeaderLayout {
+                size: 0,
+                previous_size: 0,
+                pool_index: 0,
+                block_size: 0,
+                pool_type: 0,
+                tag: 0,
+            });
+        }
         Ok(PoolHeaderLayout {
             size: self.type_layout("_POOL_HEADER")?.size as usize,
             previous_size: self.field("_POOL_HEADER", "PreviousSize")?,
@@ -392,11 +431,130 @@ impl PoolLayout {
             types,
         })
     }
+
+    /// Resolve the same Segment Heap decoder schema from `ntdll` rather than `nt`.
+    pub(crate) fn resolve_user(
+        symbols: &impl Symbols,
+        key: LayoutKey,
+    ) -> Result<Self, LayoutError> {
+        let globals = [("RtlpHpHeapGlobals", "ntdll!RtlpHpHeapGlobals")]
+            .into_iter()
+            .map(|(canonical, symbol)| {
+                symbols
+                    .symbol(symbol)
+                    .map(|value| (canonical, value))
+                    .map_err(|_| LayoutError::Missing {
+                        item: canonical.into(),
+                    })
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        let excluded = [
+            "_EX_POOL_HEAP_MANAGER_STATE",
+            "_EX_HEAP_POOL_NODE",
+            "_POOL_HEADER",
+        ];
+        let mut types = HashMap::new();
+        for spec in TYPES.iter().filter(|spec| !excluded.contains(&spec.name)) {
+            types.insert(spec.name, resolve_type(symbols, key.image.base, spec)?);
+        }
+        for spec in USER_TYPES {
+            types.insert(spec.name, resolve_type(symbols, key.image.base, spec)?);
+        }
+        for spec in OPTIONAL_TYPES {
+            if spec.name == "_POOL_TRACKER_BIG_PAGES" {
+                continue;
+            }
+            if let Ok(layout) = resolve_type(symbols, key.image.base, spec) {
+                types.insert(spec.name, layout);
+            }
+        }
+        for &(type_name, canonical, aliases) in OPTIONAL_FIELDS {
+            let Some(layout) = types.get_mut(type_name) else {
+                continue;
+            };
+            let Ok(type_id) = symbols.type_id(key.image.base, type_name) else {
+                continue;
+            };
+            if let Some(offset) = aliases
+                .iter()
+                .find_map(|field| symbols.field(key.image.base, type_id, field).ok())
+            {
+                layout.fields.insert(canonical, offset);
+            }
+        }
+        if !types
+            .get("_SEGMENT_HEAP")
+            .is_some_and(|layout| layout.fields.contains_key("Signature"))
+        {
+            return Err(LayoutError::Missing {
+                item: "_SEGMENT_HEAP.Signature".into(),
+            });
+        }
+        Ok(Self {
+            key,
+            globals,
+            types,
+        })
+    }
+
+    pub(crate) fn provenance(
+        &self,
+        module: ModuleIdentity,
+    ) -> Result<LayoutProvenance, LayoutError> {
+        let mut facts = Vec::new();
+        for (type_name, layout) in &self.types {
+            facts.push(format!("type:{type_name}:size:{:#x}", layout.size));
+            for (field, offset) in &layout.fields {
+                facts.push(format!("field:{type_name}.{field}:{offset:#x}"));
+            }
+        }
+        facts.sort_unstable();
+        let fingerprint = fingerprint(facts.iter().map(String::as_str));
+        let inline = [
+            ("_HEAP_VS_CONTEXT", "FreeChunkTree"),
+            ("_HEAP_VS_CONTEXT", "DelayFreeContext"),
+        ]
+        .into_iter()
+        .all(|(ty, field)| self.field(ty, field).is_ok());
+        let affinity = [
+            ("_HEAP_VS_CONTEXT", "SlotMapRef"),
+            ("_HEAP_VS_CONTEXT", "AffinityMask"),
+            ("_HEAP_VS_AFFINITY_SLOT", "VsContext"),
+            ("_HEAP_VS_AFFINITY_SLOT", "FreeChunkTree"),
+            ("_HEAP_VS_AFFINITY_SLOT", "DelayFreeContext"),
+            ("_HEAP_VS_SLOT_MAP", "SlotRef"),
+        ]
+        .into_iter()
+        .all(|(ty, field)| self.field(ty, field).is_ok());
+        let semantic_family = match (inline, affinity) {
+            (true, false) => VsSemanticFamily::Inline,
+            (false, true) => VsSemanticFamily::AffinitySlots,
+            (false, false) => {
+                return Err(LayoutError::Unsupported {
+                    fingerprint,
+                    detail: "no recognized VS structural family is complete".into(),
+                });
+            }
+            (true, true) => {
+                return Err(LayoutError::Unsupported {
+                    fingerprint,
+                    detail: "both VS structural families are present and the layout is ambiguous"
+                        .into(),
+                });
+            }
+        };
+        Ok(LayoutProvenance {
+            module,
+            fingerprint,
+            semantic_family,
+        })
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct LayoutCache {
-    entries: Mutex<HashMap<LayoutKey, PoolLayout>>,
+    entries: Mutex<HashMap<LayoutKey, AllocatorSchema>>,
 }
 
 impl LayoutCache {
@@ -409,12 +567,12 @@ impl LayoutCache {
         &self,
         symbols: &impl Symbols,
         key: impl Into<LayoutKey>,
-    ) -> Result<PoolLayout, LayoutError> {
+    ) -> Result<AllocatorSchema, LayoutError> {
         let key = key.into();
         if let Some(layout) = self.entries.lock().unwrap().get(&key).cloned() {
             return Ok(layout);
         }
-        let layout = PoolLayout::resolve(symbols, key)?;
+        let layout = AllocatorSchema::resolve(symbols, key)?;
         self.entries.lock().unwrap().insert(key, layout.clone());
         Ok(layout)
     }
@@ -452,9 +610,13 @@ mod tests {
         }
 
         fn type_spec(type_id: u32) -> Option<&'static TypeSpec> {
-            type_id
-                .checked_sub(1)
-                .and_then(|index| TYPES.iter().chain(OPTIONAL_TYPES).nth(index as usize))
+            type_id.checked_sub(1).and_then(|index| {
+                TYPES
+                    .iter()
+                    .chain(OPTIONAL_TYPES)
+                    .chain(USER_TYPES)
+                    .nth(index as usize)
+            })
         }
 
         fn resolve_field(&self, spec: &TypeSpec, name: &str) -> Result<u32, DbgEngError> {
@@ -495,6 +657,9 @@ mod tests {
             if self.missing_global == Some(name) {
                 return Self::error();
             }
+            if name == "ntdll!RtlpHpHeapGlobals" {
+                return Ok(0x0000_7ffb_1234_5000);
+            }
             GLOBALS
                 .iter()
                 .chain(OPTIONAL_GLOBALS)
@@ -510,6 +675,7 @@ mod tests {
             TYPES
                 .iter()
                 .chain(OPTIONAL_TYPES)
+                .chain(USER_TYPES)
                 .position(|spec| spec.name == name)
                 .map(|index| index as u32 + 1)
                 .ok_or(DbgEngError::InvalidCommand)
@@ -595,6 +761,7 @@ mod tests {
     fn missing_item(result: Result<PoolLayout, LayoutError>) -> String {
         match result.unwrap_err() {
             LayoutError::Missing { item } => item,
+            LayoutError::Unsupported { .. } => panic!("expected a missing symbol error"),
         }
     }
 
@@ -670,6 +837,46 @@ mod tests {
                 key(),
             )),
             "_POOL_HEADER.PoolTag"
+        );
+    }
+
+    #[test]
+    fn test_user_schema_requires_ntdll_globals_peb_fields_and_segment_signature() {
+        let symbols = FakeSymbols {
+            optional_fields: true,
+            ..FakeSymbols::default()
+        };
+        let layout = PoolLayout::resolve_user(&symbols, key()).unwrap();
+        assert!(layout.is_user());
+        assert_eq!(layout.pool_header_layout().unwrap().size, 0);
+        assert!(layout.field("_PEB", "ProcessHeaps").is_ok());
+        assert!(layout.field("_SEGMENT_HEAP", "Signature").is_ok());
+
+        assert_eq!(
+            missing_item(PoolLayout::resolve_user(
+                &FakeSymbols {
+                    optional_fields: true,
+                    missing_global: Some("ntdll!RtlpHpHeapGlobals"),
+                    ..FakeSymbols::default()
+                },
+                key(),
+            )),
+            "RtlpHpHeapGlobals"
+        );
+        assert_eq!(
+            missing_item(PoolLayout::resolve_user(
+                &FakeSymbols {
+                    optional_fields: true,
+                    missing_field: Some(("_PEB", "ProcessHeaps")),
+                    ..FakeSymbols::default()
+                },
+                key(),
+            )),
+            "_PEB.ProcessHeaps"
+        );
+        assert_eq!(
+            missing_item(PoolLayout::resolve_user(&FakeSymbols::default(), key(),)),
+            "_SEGMENT_HEAP.Signature"
         );
     }
 
@@ -835,5 +1042,145 @@ mod tests {
 
             assert!(layout.field(missing_field.0, missing_field.1).is_err());
         }
+    }
+
+    fn pdb_module(timestamp: u32) -> ModuleIdentity {
+        ModuleIdentity {
+            name: "nt".into(),
+            image_name: "ntkrnlmp.exe".into(),
+            loaded_image_name: r"C:\Windows\System32\ntoskrnl.exe".into(),
+            symbol_file: r"C:\symbols\ntkrnlmp.pdb".into(),
+            symbols: crate::dbgeng::SymbolKind::Pdb,
+            base: key().image.base,
+            size: key().image.size,
+            timestamp,
+            checksum: key().image.checksum,
+        }
+    }
+
+    /// Compact structural fixture for the inline-VS family in Vergilius' public-PDB-derived
+    /// `10.0.19045.2965-x64.yml` and `10.0.22631.2428-x64.yml` in
+    /// <https://github.com/VergiliusProject/kernels-data>. Runtime selection is exclusively by
+    /// these PDB fields, never by the build labels in this comment.
+    fn inline_vs_fixture() -> PoolLayout {
+        let mut layout = PoolLayout::resolve(&FakeSymbols::default(), key()).unwrap();
+        let context = layout.types.get_mut("_HEAP_VS_CONTEXT").unwrap();
+        context.size = 0xc0;
+        context.fields.insert("FreeChunkTree", 0x10);
+        context.fields.insert("DelayFreeContext", 0x40);
+        layout
+    }
+
+    /// Compact structural fixture for the affinity-slot VS family in Vergilius'
+    /// `10.0.26200.6584-x64.yml` in <https://github.com/VergiliusProject/kernels-data>. The same
+    /// family is measured on the later 26100 kernel recorded in `snapshot.rs`; the earlier
+    /// `10.0.26100.1742` YAML is still inline, which is exactly why runtime selection must not use
+    /// a 26100 build threshold.
+    fn affinity_vs_fixture() -> PoolLayout {
+        let mut layout = PoolLayout::resolve(&FakeSymbols::default(), key()).unwrap();
+        let context = layout.types.get_mut("_HEAP_VS_CONTEXT").unwrap();
+        context.size = 0x60;
+        context.fields.insert("SlotMapRef", 0);
+        context.fields.insert("AffinityMask", 2);
+        let slot = layout.types.get_mut("_HEAP_VS_AFFINITY_SLOT").unwrap();
+        slot.size = 0x80;
+        slot.fields.insert("VsContext", 0);
+        slot.fields.insert("FreeChunkTree", 0x10);
+        slot.fields.insert("DelayFreeContext", 0x40);
+        let map = layout.types.get_mut("_HEAP_VS_SLOT_MAP").unwrap();
+        map.size = 4;
+        map.fields.insert("SlotRef", 0);
+        layout
+    }
+
+    #[test]
+    fn test_provenance_selects_validated_vs_families_without_build_thresholds() {
+        let inline = inline_vs_fixture()
+            .provenance(pdb_module(0x1111_2222))
+            .unwrap();
+        let affinity = affinity_vs_fixture()
+            .provenance(pdb_module(0x3333_4444))
+            .unwrap();
+
+        assert_eq!(inline.semantic_family, VsSemanticFamily::Inline);
+        assert_eq!(affinity.semantic_family, VsSemanticFamily::AffinitySlots);
+        assert_ne!(inline.fingerprint, affinity.fingerprint);
+        assert_eq!(inline.module.symbol_file, r"C:\symbols\ntkrnlmp.pdb");
+        let inline_fixture = inline_vs_fixture();
+        assert_eq!(
+            inline_fixture.type_layout("_HEAP_VS_CONTEXT").unwrap().size,
+            0xc0
+        );
+        assert_eq!(
+            inline_fixture.field("_HEAP_VS_CONTEXT", "DelayFreeContext"),
+            Ok(0x40)
+        );
+        let affinity_fixture = affinity_vs_fixture();
+        assert_eq!(
+            affinity_fixture
+                .type_layout("_HEAP_VS_AFFINITY_SLOT")
+                .unwrap()
+                .size,
+            0x80
+        );
+        assert_eq!(
+            affinity_fixture.field("_HEAP_VS_CONTEXT", "SlotMapRef"),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn test_provenance_fails_closed_for_missing_or_conflicting_families() {
+        let unknown = PoolLayout::resolve(&FakeSymbols::default(), key()).unwrap();
+        assert!(
+            unknown
+                .provenance(pdb_module(0xdead_beef))
+                .unwrap_err()
+                .to_string()
+                .contains("no recognized VS structural family")
+        );
+
+        let mut conflicting = affinity_vs_fixture();
+        conflicting
+            .types
+            .get_mut("_HEAP_VS_CONTEXT")
+            .unwrap()
+            .fields
+            .insert("FreeChunkTree", 0x10);
+        conflicting
+            .types
+            .get_mut("_HEAP_VS_CONTEXT")
+            .unwrap()
+            .fields
+            .insert("DelayFreeContext", 0x40);
+        assert!(
+            conflicting
+                .provenance(pdb_module(0xdead_beef))
+                .unwrap_err()
+                .to_string()
+                .contains("layout is ambiguous")
+        );
+        let unknown_error = unknown
+            .provenance(pdb_module(0xdead_beef))
+            .unwrap_err()
+            .to_string();
+        assert!(unknown_error.contains("fnv1a64:"), "{unknown_error}");
+    }
+
+    #[test]
+    fn test_fingerprint_changes_when_a_pdb_field_offset_changes() {
+        let first = inline_vs_fixture()
+            .provenance(pdb_module(0x1111_2222))
+            .unwrap();
+        let mut changed = inline_vs_fixture();
+        changed
+            .types
+            .get_mut("_HEAP_VS_CONTEXT")
+            .unwrap()
+            .fields
+            .insert("FreeChunkTree", 0x18);
+        let changed = changed.provenance(pdb_module(0x3333_4444)).unwrap();
+
+        assert_ne!(first.fingerprint, changed.fingerprint);
     }
 }

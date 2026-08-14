@@ -164,6 +164,7 @@ fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
         // keeping how much of the pool the walk covered, which is a property of the walk and
         // not of the filter applied to its result.
         let snapshot = crate::pool::PoolSnapshot {
+            layout: filtered.layout,
             complete: filtered.complete,
             budget_expired: filtered.budget_expired,
             stalls: filtered.stalls,
@@ -255,7 +256,7 @@ pub unsafe extern "system" fn DebugExtensionNotify(notify: u32, _argument: u64) 
 }
 
 fn invalidate_session() {
-    query::invalidate_session();
+    query::invalidate_allocator_caches();
 }
 
 #[unsafe(no_mangle)]
