@@ -1198,6 +1198,26 @@ fn discover_segment_context(
                 region_address += first as u64;
                 region_size -= first;
                 block_size = 0;
+                // The bound every VS chunk is checked against is `region_address + region_size`,
+                // derived from the page-range descriptor. The subsegment carries the same number
+                // itself, and it is the one the allocator laid the chunks out to:
+                // `RtlpHpVsSubsegmentCreate` writes `Size = (bytes - first) >> 4` and puts the
+                // first chunk at `+ first`, so the two must agree exactly. Read and thrown away
+                // until now — glslang/win-kexp#103 asked whether the descriptor-derived bound was
+                // systematically short, and this is the check that answers it on any target
+                // rather than by argument.
+                //
+                // Reported, not preferred: `declared` is corroboration from a second source, and
+                // trusting it over the descriptor would let one misread `Size` truncate every VS
+                // region on a build whose field we resolve wrongly. A disagreement here is the
+                // signal to go and look.
+                let declared_size = usize::from(declared) * 16;
+                if declared_size != region_size {
+                    discovery.diagnostics.push(format!(
+                        "VS subsegment {address:#x} declares {declared_size:#x} of chunks where \
+                         its page range leaves room for {region_size:#x}"
+                    ));
+                }
             }
             let descriptor_node = metadata_address + offset as u64 + tree_node_offset as u64;
             // Two independent ways to be free, and either is enough: the range sits in the
@@ -1633,6 +1653,16 @@ pub(crate) struct PoolSnapshot {
     /// Only `walk_vs` feeds it today; LFH subsegments are refused during discovery, one per
     /// subsegment, where the count and the message already agree.
     pub refused_chunks: u64,
+    /// Committed bytes of a VS subsegment the walk declined to decode, because it could not say
+    /// where a chunk began in them.
+    ///
+    /// The cost of [`SnapshotWalker::walk_vs`] refusing to guess, and the number that keeps that
+    /// refusal honest: what it buys is that nothing fabricated enters `spans`, and what it costs
+    /// is coverage, which is invisible unless it is sized. A walk that reports no refusals *and*
+    /// no unplaced bytes decoded every committed byte of every subsegment it reached; one that
+    /// reports a large figure here has lost the chunk chain somewhere, and the chain is the only
+    /// thing that can find a variable-size header.
+    pub unplaced_bytes: u64,
 }
 
 /// What valid-region queries that could not advance cost the walk, and what stepping over them
@@ -1916,6 +1946,12 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         let mut cursor = region.address;
         let mut consecutive_stalls = 0u32;
         let mut stalled_here = false;
+        // Where the next VS chunk header is, carried across the committed extents of one
+        // subsegment. `walk_lfh` and `walk_page_ranges` need no such thing — their slots are a
+        // fixed size, so they index off the region base and are correct wherever an extent starts.
+        // A VS chunk is only findable from the end of the one before it, which is a fact about
+        // the region and not about the extent, so it has to live out here.
+        let mut vs_chunk = Some(region.address);
         while cursor < requested_end {
             check_budget(self.memory)?;
             let remaining = requested_end.saturating_sub(cursor).min(usize::MAX as u64) as usize;
@@ -2036,7 +2072,9 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             }
             match region.backend {
                 PoolBackend::Lfh => self.walk_lfh(region, valid_base, &bytes, snapshot),
-                PoolBackend::Vs => self.walk_vs(region, valid_base, &bytes, snapshot),
+                PoolBackend::Vs => {
+                    vs_chunk = self.walk_vs(region, valid_base, &bytes, vs_chunk, snapshot);
+                }
                 PoolBackend::Segment => self.walk_page_ranges(region, valid_base, &bytes, snapshot),
                 PoolBackend::Large => return Ok(()),
             }
@@ -2291,7 +2329,29 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         }
     }
 
-    /// Decodes one committed extent of a VS subsegment, chunk by chunk.
+    /// Decodes one committed extent of a VS subsegment, chunk by chunk, and says where the
+    /// chunk after the last one it read begins.
+    ///
+    /// **A VS extent can only be decoded from a known chunk boundary.** Chunks vary in size, so
+    /// unlike [`Self::walk_lfh`] and [`Self::walk_page_ranges`] — whose slots are a fixed size,
+    /// making them correct at whatever offset into the region an extent happens to start — the
+    /// only way to know where a header is, is to have walked the one before it. `walk_region`
+    /// hands this one *committed extent* at a time, and a subsegment is routinely committed in
+    /// pieces: `RtlpHpVsSubsegmentCommitPages` commits and decommits page ranges anywhere inside
+    /// the subsegment and records them in `_HEAP_VS_SUBSEGMENT.CommitBitmap`, so holes between
+    /// committed extents are the allocator's steady state and not damage.
+    ///
+    /// Starting each extent at its own first sixteen-byte boundary — which is what this did — is
+    /// therefore a guess on every extent after a hole, and where glslang/win-kexp#103's 106,516
+    /// refusals came from: ~196 per extent, one per sixteen bytes, until the scan wandered onto
+    /// a word that decoded plausibly. The refusals were the harmless half. Whatever the scan
+    /// wandered onto was pushed into `spans` as an allocation, tag and all.
+    ///
+    /// The chain is what crosses the hole. A decommitted range is always the *interior* of a
+    /// free chunk — the allocator has to keep its own headers readable — so the chunk before a
+    /// hole records a size that reaches past it and the next header lands in the next committed
+    /// extent, at an address this walk already knows. `expected` carries that address between
+    /// extents. `None` means the walk lost it, and a walk that has lost it does not guess again.
     ///
     /// A refused header costs more than itself: the walk no longer knows where the next one
     /// starts, so it advances sixteen bytes and tries again, and every header after it in the
@@ -2299,9 +2359,41 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
     /// One header rewritten while we read it and one systematically misdecoded field therefore
     /// look identical from a count — which is why what is reported here is the count of
     /// **chunks** refused rather than of extents that contained a refusal, the failing
-    /// predicate in its own words, and the `Sizes` word as read.
-    fn walk_vs(&self, region: &PoolRegion, base: u64, bytes: &[u8], snapshot: &mut PoolSnapshot) {
-        let mut offset = ((16 - (base as usize & 0xf)) & 0xf).min(bytes.len());
+    /// predicate in its own words, and the `Sizes` word as read. It is also why a refusal ends
+    /// the chain for the whole region: every offset after it rests on that guess.
+    fn walk_vs(
+        &self,
+        region: &PoolRegion,
+        base: u64,
+        bytes: &[u8],
+        expected: Option<u64>,
+        snapshot: &mut PoolSnapshot,
+    ) -> Option<u64> {
+        let extent_end = base.saturating_add(bytes.len() as u64);
+        let Some(next) = expected.filter(|next| *next >= base) else {
+            // Either an earlier extent of this region lost the chain, or the header it pointed
+            // at fell inside the hole just crossed. Both come to the same thing: nothing in
+            // these bytes can be placed. Sized and not merely counted, because what this costs
+            // is coverage — and the alternative, decoding from a guess, costs correctness.
+            snapshot.unplaced_bytes = snapshot.unplaced_bytes.saturating_add(bytes.len() as u64);
+            snapshot.diagnostics.push(format!(
+                "VS extent at {base:#x} does not begin on a chunk boundary; {:#x} bytes not decoded",
+                bytes.len()
+            ));
+            snapshot.complete = false;
+            return None;
+        };
+        if next >= extent_end {
+            // A chunk that began before this extent covers all of it — an ordinary large free
+            // chunk with its interior decommitted. Nothing to decode and nothing lost: the
+            // expectation still names a header further on.
+            return Some(next);
+        }
+        let mut offset = (next - base) as usize;
+        // Where the *next* extent resumes, kept in step with `offset` so every way out of the
+        // loop below leaves it pointing at a header rather than at wherever the bytes ran out.
+        let mut resume = next;
+        let mut lost = false;
         let mut chunks = 0usize;
         let header_bytes = region.vs_header_size + region.pool_header.size;
         let subsegment_end = region.address.saturating_add(region.size as u64);
@@ -2339,6 +2431,11 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                     refused += 1;
                     resync_from.get_or_insert(header_address);
                     previous_chunk = None;
+                    // The sixteen-byte scan below may find its way back onto real headers
+                    // inside this extent, but it cannot *know* that it has — so whatever it
+                    // ends on is not an address to hand the next extent. Sticky, because a
+                    // chunk decoded after the scan resumes is exactly the guess in question.
+                    lost = true;
                     snapshot.complete = false;
                     offset = offset.saturating_add(16);
                     continue;
@@ -2363,6 +2460,15 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             }
             let chunk_size = chunk.size;
             if offset.saturating_add(chunk_size) > bytes.len() {
+                // The chunk reaches past the committed extent, which after the bound check in
+                // `decode_vs_chunk` can only mean a hole ahead of it inside the subsegment —
+                // so this is the ordinary free chunk with a decommitted interior, not a walk
+                // running out of bytes. It carries the chain over the hole, which is the whole
+                // reason the expectation is returned rather than recomputed per extent.
+                //
+                // Still incomplete, and for the reason `complete` exists: no span is emitted for
+                // this chunk, so the snapshot omits it however well the walk understands it.
+                resume = header_address.saturating_add(chunk_size as u64);
                 snapshot.complete = false;
                 break;
             }
@@ -2373,6 +2479,11 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 let Some(header) =
                     adjust_page_end_header(candidate, region.pool_header.size as u64)
                 else {
+                    // Where this chunk's *pool* header sits could not be worked out, so no span
+                    // is emitted for it. Its size decoded and passed the bound check, though, so
+                    // the chunk chain is not what was lost here and the next extent can still be
+                    // placed.
+                    resume = header_address.saturating_add(chunk_size as u64);
                     snapshot.complete = false;
                     break;
                 };
@@ -2410,6 +2521,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             snapshot.spans.push(span);
             previous_chunk = Some(chunk_size);
             offset += chunk_size;
+            resume = base + offset as u64;
             chunks += 1;
         }
         if let Some(from) = resync_from {
@@ -2430,6 +2542,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 .diagnostics
                 .push(format!("VS traversal limit reached at {base:#x}"));
         }
+        (!lost).then_some(resume)
     }
 
     fn walk_page_ranges(
@@ -2691,7 +2804,7 @@ mod tests {
         vs.pool_header = no_pool_header;
         let mut vs_bytes = vs_extent(&[(0x40, 0)]);
         vs_bytes[0x10..0x14].copy_from_slice(b"VS!!");
-        walker.walk_vs(&vs, vs.address, &vs_bytes, &mut snapshot);
+        walker.walk_vs(&vs, vs.address, &vs_bytes, Some(vs.address), &mut snapshot);
 
         let mut page = lfh_region(0x3000, 0x20);
         page.size = 0x20;
@@ -3171,7 +3284,7 @@ mod tests {
             complete: true,
             ..PoolSnapshot::default()
         };
-        walker.walk_vs(&region, VS_BASE, bytes, &mut snapshot);
+        walker.walk_vs(&region, VS_BASE, bytes, Some(VS_BASE), &mut snapshot);
         snapshot
     }
 
@@ -3464,6 +3577,131 @@ mod tests {
             allocated,
             [SPECIAL_PAGE + 0x1f90, SPECIAL_PAGE + 0x2f90],
             "the page immediately after the stall is healthy and must still be walked"
+        );
+    }
+
+    /// A VS subsegment with a hole in it, walked in two committed extents.
+    ///
+    /// `bytes` tiles the whole region with chunks the way the allocator does; `holes` names the
+    /// pages `valid_region` will report as uncommitted. That is what
+    /// `RtlpHpVsSubsegmentCommitPages` produces on a real target — it commits and decommits page
+    /// ranges anywhere inside the subsegment and tracks them in `_HEAP_VS_SUBSEGMENT.CommitBitmap`
+    /// — and it is the shape the old walk had no way to survive.
+    fn walk_vs_with_holes(chunks: &[(usize, usize)], holes: &[u64]) -> PoolSnapshot {
+        let bytes = vs_extent(chunks);
+        let region = vs_region(bytes.len());
+        let mut memory = HoleyMemory::new(VS_BASE, bytes);
+        memory.holes.extend(holes.iter().copied());
+        walk_holey(&memory, &region)
+    }
+
+    /// glslang/win-kexp#103: 106,516 VS chunk headers refused on one live 26100 walk, ~196 per
+    /// extent, every one of them failing the same subsegment-bound check — which read as a bound
+    /// that was wrong. It was not. Nothing was wrong with any of the three predicates: the walk
+    /// was handing them a *guess*, because it started every committed extent at that extent's own
+    /// first sixteen-byte boundary, and only the first extent of a subsegment begins on a chunk.
+    ///
+    /// Here the chunk before the hole is 0x2800 bytes and lands the next header at 0x5800, in the
+    /// middle of the page the walk resumes on. Starting at 0x5000 costs 128 refusals to scan back
+    /// onto it; following the chain costs none.
+    #[test]
+    fn test_a_vs_extent_after_a_hole_resumes_on_the_chunk_the_chain_names() {
+        let snapshot = walk_vs_with_holes(
+            &[
+                (0x800, 0),
+                (0x800, 0x800),
+                // Spans the decommitted page, as the free chunk whose interior was decommitted
+                // always does, and ends part-way into the page after it.
+                (0x2800, 0x800),
+                (0x800, 0x2800),
+            ],
+            &[VS_BASE + 0x2000],
+        );
+
+        assert_eq!(
+            snapshot.refused_chunks,
+            0,
+            "the chain names the header, so nothing has to be scanned for: {:?}",
+            snapshot.diagnostics.examples()
+        );
+        assert_eq!(snapshot.unplaced_bytes, 0);
+        let allocated: Vec<_> = snapshot
+            .spans
+            .iter()
+            .filter(|span| span.state == PoolState::Allocated)
+            .map(|span| span.header_address)
+            .collect();
+        // The chunk that spans the hole is not among them: its header was read and understood,
+        // but the walk emits no span for a chunk it could not read to the end of.
+        assert_eq!(
+            allocated,
+            [VS_BASE + 0x10, VS_BASE + 0x810, VS_BASE + 0x3810],
+            "the chunk on the far side of the hole is found, and nothing else is invented"
+        );
+    }
+
+    /// The other half of the same rule, and the price of it. When the header the chain names
+    /// falls *inside* the hole, the walk has no way to know where a chunk begins in the extent
+    /// after it — so it decodes none of it and says how much that cost. The extent here holds two
+    /// perfectly good chunks; declining them loses coverage, and decoding from a guess would put
+    /// whatever a garbage word decoded to into `spans` as an allocation, which is worse.
+    #[test]
+    fn test_a_vs_extent_whose_chunk_boundary_fell_in_the_hole_is_not_guessed_at() {
+        let snapshot = walk_vs_with_holes(
+            &[
+                (0x1000, 0),
+                (0x1000, 0x1000),
+                (0x1000, 0x1000),
+                (0x1000, 0x1000),
+            ],
+            &[VS_BASE + 0x2000],
+        );
+
+        assert_eq!(snapshot.refused_chunks, 0);
+        assert_eq!(
+            snapshot.unplaced_bytes, 0x1000,
+            "the whole undecodable extent is sized, not just noted"
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .examples()
+                .iter()
+                .any(|message| message.contains("does not begin on a chunk boundary")),
+            "{:?}",
+            snapshot.diagnostics.examples()
+        );
+        let allocated: Vec<_> = snapshot
+            .spans
+            .iter()
+            .filter(|span| span.state == PoolState::Allocated)
+            .map(|span| span.header_address)
+            .collect();
+        assert_eq!(
+            allocated,
+            [VS_BASE + 0x10, VS_BASE + 0x1010],
+            "nothing from the extent the walk could not place reaches the snapshot"
+        );
+    }
+
+    /// An extent entirely inside one chunk. Nothing to decode there and nothing lost: the
+    /// expectation still names a header further on, so this must not be billed as coverage the
+    /// walk gave up — which is the difference between a hole in a large free chunk (ordinary) and
+    /// a chain the walk dropped (not).
+    #[test]
+    fn test_an_extent_inside_a_single_chunk_costs_nothing() {
+        let snapshot = walk_vs_with_holes(&[(0x1000, 0), (0x3000, 0x1000)], &[VS_BASE + 0x2000]);
+
+        assert_eq!(snapshot.unplaced_bytes, 0);
+        assert_eq!(snapshot.refused_chunks, 0);
+        assert!(
+            !snapshot
+                .diagnostics
+                .examples()
+                .iter()
+                .any(|message| message.contains("does not begin on a chunk boundary")),
+            "{:?}",
+            snapshot.diagnostics.examples()
         );
     }
 
@@ -4016,7 +4254,16 @@ mod tests {
         put(bytes, address + 8, tag);
     }
 
+    /// The fixture, with its VS subsegment declaring the chunk area its page range actually
+    /// leaves — `(2 pages - sizeof(_HEAP_VS_SUBSEGMENT rounded)) / 16`, which is what
+    /// `RtlpHpVsSubsegmentCreate` writes. Kept in step deliberately: the walk now cross-checks
+    /// the two, so a fixture that disagreed would put a complaint in every other test's output
+    /// and hide the one case that should raise it.
     fn synthetic_memory() -> SyntheticMemory {
+        synthetic_memory_declaring((0x2000 - 0xfe0) / 16)
+    }
+
+    fn synthetic_memory_declaring(declared: u16) -> SyntheticMemory {
         let mut bytes = Writes::default();
         fill(&mut bytes, STATE, 0x200);
         put_u32(&mut bytes, STATE, 1);
@@ -4082,8 +4329,8 @@ mod tests {
 
         let vs = SEGMENT + 0x3000;
         fill(&mut bytes, vs, 0x2000);
-        put_u16(&mut bytes, vs, 0x8000 | (0x2bed ^ 2));
-        put_u16(&mut bytes, vs + 2, 2);
+        put_u16(&mut bytes, vs, 0x8000 | (0x2bed ^ declared));
+        put_u16(&mut bytes, vs + 2, declared);
         let first_chunk = vs + 0xfe0;
         let cached_chunk = first_chunk + 0x40;
         let free_chunk = cached_chunk + 0x40;
@@ -4178,6 +4425,50 @@ mod tests {
             interrupt_checks: Cell::new(0),
             interrupt_after_checks: None,
         }
+    }
+
+    /// glslang/win-kexp#103 asked whether the bound every VS chunk is checked against —
+    /// `region.address + region.size`, from the page-range descriptor — is systematically short,
+    /// since on a live 26100 walk 106,516 refusals all failed that one check and no other.
+    /// `RtlpHpVsSubsegmentCreate` writes the same quantity into the subsegment itself as
+    /// `Size = (bytes - first) >> 4`, so the two are the same number from two sources and the
+    /// walk can say so on any target instead of anyone arguing it. Both directions, because a
+    /// check that never fires and a check that always fires read identically from a live run.
+    #[test]
+    fn test_a_vs_subsegment_is_measured_against_its_own_declared_size() {
+        let quiet = walk_synthetic(synthetic_memory());
+        let complaint = "declares";
+        assert!(
+            !quiet
+                .diagnostics
+                .examples()
+                .iter()
+                .any(|message| message.contains(complaint)),
+            "a subsegment whose two sizes agree draws no complaint: {:?}",
+            quiet.diagnostics.examples()
+        );
+
+        let short = walk_synthetic(synthetic_memory_declaring((0x2000 - 0xfe0) / 16 - 1));
+        assert!(
+            short
+                .diagnostics
+                .examples()
+                .iter()
+                .any(|message| message.contains(complaint)),
+            "{:?}",
+            short.diagnostics.examples()
+        );
+    }
+
+    fn walk_synthetic(memory: SyntheticMemory) -> PoolSnapshot {
+        let layout = synthetic_layout();
+        SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1024,
+        }
+        .walk(None)
+        .unwrap()
     }
 
     #[test]

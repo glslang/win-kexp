@@ -169,6 +169,7 @@ fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
             budget_expired: filtered.budget_expired,
             stalls: filtered.stalls,
             refused_chunks: filtered.refused_chunks,
+            unplaced_bytes: filtered.unplaced_bytes,
             spans: filtered.spans,
             diagnostics: filtered.diagnostics,
         };
