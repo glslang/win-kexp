@@ -1677,6 +1677,17 @@ pub(crate) struct PoolSnapshot {
 /// `recovered_bytes` is what the change is judged by: committed memory read *after* a stall in
 /// the same region, which is precisely the coverage a walk that gave up at the first stall
 /// reported as nothing at all.
+///
+/// **On live 26100 it has measured zero** — 1,619 stalls, 6,627,520 bytes stepped over, nothing
+/// read behind any of them (glslang/win-kexp#104). That is the number saying what it says, not a
+/// counter that was never wired up: `stalled_here` latches for the rest of the region and any
+/// later extent adds to `recovered_bytes`, which
+/// [`SnapshotWalker::walk_region`]'s own test pins at two pages. So on that target every stall
+/// sits at the end of its region's readable content, and the page-stepping buys nothing there.
+/// It is kept because it is bounded — at most [`MAX_CONSECUTIVE_STALLS`] queries per dead region
+/// — and because the failure it replaced was losing every committed page behind one bad one. The
+/// diagnostic now carries the engine's own answer at each stall, which is what a later run needs
+/// to decide whether stepping can be replaced by stopping.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalkStalls {
     /// How many times a query could not advance and the walk stepped over a page.
@@ -2009,8 +2020,16 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 // without end, which is the reason this used to abandon the region outright.
                 let page_end = (valid_base & !(PAGE_SIZE - 1)).saturating_add(PAGE_SIZE);
                 let skip = page_end.min(requested_end) - valid_base;
+                // The engine's own answer travels with the complaint, because the two shapes
+                // that arrive here need opposite fixes and nothing else can tell them apart: a
+                // region reported *behind* the cursor (`reported_base` below `valid_base`) means
+                // the query is answering about memory already walked, while a zero-length region
+                // reported ahead of it means the engine found something and could not size it.
+                // `PoolDiagnostics` folds numbers into `#`, so this stays one shape however many
+                // times it fires, and the verbatim sample carries the real values.
                 snapshot.diagnostics.push(format!(
-                    "valid-region query made no progress at {valid_base:#x}; stepping over the                      rest of the page"
+                    "valid-region query made no progress at {valid_base:#x}: the engine answered \
+                     {reported_base:#x}+{reported_size:#x}; stepping over the rest of the page"
                 ));
                 self.unreadable(region, valid_base, skip, snapshot);
                 snapshot.stalls.pages += 1;
