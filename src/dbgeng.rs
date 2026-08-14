@@ -15,14 +15,15 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_BREAKPOINT_DATA, DEBUG_BREAKPOINT_DEFERRED, DEBUG_BREAKPOINT_ENABLED,
     DEBUG_BREAKPOINT_ONE_SHOT, DEBUG_CLASS_KERNEL, DEBUG_ENGOPT_INITIAL_BREAK,
     DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_INTERRUPT_ACTIVE, DEBUG_KERNEL_SMALL_DUMP,
-    DEBUG_MODULE_PARAMETERS, DEBUG_MODULE_USER_MODE, DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL,
-    DEBUG_REGISTER_DESCRIPTION, DEBUG_REGISTER_SUB_REGISTER, DEBUG_STACK_FRAME, DEBUG_STATUS_GO,
-    DEBUG_STATUS_NO_DEBUGGEE, DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED,
-    DEBUG_SYMTYPE_DIA, DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_NONE, DEBUG_SYMTYPE_PDB,
-    DEBUG_SYMTYPE_SYM, DEBUG_VALUE, DEBUG_VALUE_FLOAT32, DEBUG_VALUE_FLOAT64, DEBUG_VALUE_FLOAT80,
-    DEBUG_VALUE_FLOAT82, DEBUG_VALUE_FLOAT128, DEBUG_VALUE_INT8, DEBUG_VALUE_INT16,
-    DEBUG_VALUE_INT32, DEBUG_VALUE_INT64, DEBUG_VALUE_VECTOR64, DEBUG_VALUE_VECTOR128,
-    IDebugBreakpoint, IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
+    DEBUG_MODNAME_SYMBOL_FILE, DEBUG_MODULE_PARAMETERS, DEBUG_MODULE_USER_MODE,
+    DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL, DEBUG_REGISTER_DESCRIPTION,
+    DEBUG_REGISTER_SUB_REGISTER, DEBUG_STACK_FRAME, DEBUG_STATUS_GO, DEBUG_STATUS_NO_DEBUGGEE,
+    DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA,
+    DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_NONE, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM, DEBUG_VALUE,
+    DEBUG_VALUE_FLOAT32, DEBUG_VALUE_FLOAT64, DEBUG_VALUE_FLOAT80, DEBUG_VALUE_FLOAT82,
+    DEBUG_VALUE_FLOAT128, DEBUG_VALUE_INT8, DEBUG_VALUE_INT16, DEBUG_VALUE_INT32,
+    DEBUG_VALUE_INT64, DEBUG_VALUE_VECTOR64, DEBUG_VALUE_VECTOR128, IDebugBreakpoint,
+    IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
     IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugRegisters, IDebugSymbols3,
     IDebugSystemObjects,
 };
@@ -333,9 +334,10 @@ pub struct Register {
 }
 
 /// How much symbol information the engine has for a module — the `lm` "symbols" column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum SymbolKind {
     /// No symbols at all.
+    #[default]
     None,
     /// Symbols have not been loaded yet; the engine will fetch them when something needs them.
     /// The most consequential value here, because it is *not* a statement that symbols are
@@ -366,6 +368,12 @@ impl SymbolKind {
             DEBUG_SYMTYPE_DIA => Self::Dia,
             other => Self::Other(other),
         }
+    }
+
+    /// Whether this symbol provider exposes private type information suitable for allocator
+    /// layout resolution.
+    pub fn has_type_info(self) -> bool {
+        matches!(self, Self::Pdb | Self::Dia)
     }
 }
 
@@ -400,6 +408,25 @@ pub struct Module {
     /// the engine's list it came from — the distinction decides whether `base` is where the image
     /// *is* or where it *was*.
     pub unloaded: bool,
+}
+
+/// Stable identity and symbol provenance for one loaded image.
+///
+/// The PE tuple is what DbgEng and symbol servers use to distinguish builds; the base is
+/// included because resolved globals are addresses in this particular target. `symbol_file`
+/// is the exact file DbgEng selected for the module, rather than a path inferred from the
+/// configured symbol search path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct ModuleIdentity {
+    pub name: String,
+    pub image_name: String,
+    pub loaded_image_name: String,
+    pub symbol_file: String,
+    pub symbols: SymbolKind,
+    pub base: u64,
+    pub size: u32,
+    pub timestamp: u32,
+    pub checksum: u32,
 }
 
 impl Module {
@@ -998,6 +1025,82 @@ impl DebugEngine {
         }
         .map_err(|source| DbgEngError::Context {
             operation: format!("resolving field {}", field.to_string_lossy()),
+            source,
+        })
+    }
+
+    /// Resolve a field's PDB type id and byte offset in one DbgEng call.
+    pub fn field_type_and_offset(
+        &self,
+        module: u64,
+        type_id: u32,
+        field: &str,
+    ) -> Result<(u32, u32), DbgEngError> {
+        let field = CString::new(field).map_err(|_| DbgEngError::InvalidCommand)?;
+        let mut field_type = 0u32;
+        let mut offset = 0u32;
+        unsafe {
+            self.symbols.GetFieldTypeAndOffset(
+                module,
+                type_id,
+                PCSTR::from_raw(field.as_ptr().cast()),
+                Some(&mut field_type),
+                Some(&mut offset),
+            )
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: format!(
+                "resolving type and offset of field {}",
+                field.to_string_lossy()
+            ),
+            source,
+        })?;
+        Ok((field_type, offset))
+    }
+
+    /// Enumerate the named fields DbgEng exposes for a PDB type.
+    ///
+    /// DbgEng has no field-count getter. Its documented enumeration contract is consecutive
+    /// indices ending at the first failed `GetFieldName`, so a corrupt provider cannot turn
+    /// this into an unbounded loop.
+    pub fn field_names(&self, module: u64, type_id: u32) -> Result<Vec<String>, DbgEngError> {
+        const MAX_FIELDS: u32 = 4096;
+        let mut fields = Vec::new();
+        for index in 0..MAX_FIELDS {
+            let name = read_engine_string(|buffer, size| unsafe {
+                self.symbols
+                    .GetFieldName(module, type_id, index, buffer, size)
+            });
+            match name {
+                Ok(name) if !name.is_empty() => fields.push(name),
+                Ok(_) | Err(_) => break,
+            }
+        }
+        Ok(fields)
+    }
+
+    /// The PEB of DbgEng's current process.
+    pub fn current_process_peb(&self) -> Result<u64, DbgEngError> {
+        let objects: IDebugSystemObjects =
+            self.client.cast().map_err(|source| DbgEngError::Context {
+                operation: "obtaining the system-objects interface".into(),
+                source,
+            })?;
+        unsafe { objects.GetCurrentProcessPeb() }.map_err(|source| DbgEngError::Context {
+            operation: "reading the current process PEB".into(),
+            source,
+        })
+    }
+
+    /// The operating-system process id of DbgEng's current process.
+    pub fn current_process_system_id(&self) -> Result<u32, DbgEngError> {
+        let objects: IDebugSystemObjects =
+            self.client.cast().map_err(|source| DbgEngError::Context {
+                operation: "obtaining the system-objects interface".into(),
+                source,
+            })?;
+        unsafe { objects.GetCurrentProcessSystemId() }.map_err(|source| DbgEngError::Context {
+            operation: "reading the current process id".into(),
             source,
         })
     }
@@ -2006,6 +2109,69 @@ impl DebugEngine {
     pub fn modules(&self) -> Result<Vec<Module>, DbgEngError> {
         let (loaded, _) = self.module_counts()?;
         self.module_range(0, loaded)
+    }
+
+    /// Locate a loaded module by the name used to qualify its symbols.
+    pub fn module(&self, name: &str) -> Result<Module, DbgEngError> {
+        let name = CString::new(name).map_err(|_| DbgEngError::InvalidCommand)?;
+        let mut index = 0u32;
+        let mut base = 0u64;
+        unsafe {
+            self.symbols.GetModuleByModuleName(
+                PCSTR::from_raw(name.as_ptr().cast()),
+                0,
+                Some(&mut index),
+                Some(&mut base),
+            )
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: format!("locating module {}", name.to_string_lossy()),
+            source,
+        })?;
+        let mut params = DEBUG_MODULE_PARAMETERS::default();
+        unsafe {
+            self.symbols
+                .GetModuleParameters(1, Some(&base), 0, &mut params)
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: format!("reading parameters of module at {base:#x}"),
+            source,
+        })?;
+        Ok(self.named_module(index, &params))
+    }
+
+    /// The exact PDB or symbol file DbgEng selected for `module_base`.
+    pub fn module_symbol_file(&self, module_base: u64) -> Result<String, DbgEngError> {
+        read_engine_string(|buffer, size| unsafe {
+            self.symbols.GetModuleNameString(
+                DEBUG_MODNAME_SYMBOL_FILE,
+                DEBUG_ANY_ID,
+                module_base,
+                buffer,
+                size,
+            )
+        })
+        .map_err(|source| DbgEngError::Context {
+            operation: format!("reading the symbol file for module at {module_base:#x}"),
+            source,
+        })
+    }
+
+    /// Image and symbol identity for a loaded module.
+    pub fn module_identity(&self, name: &str) -> Result<ModuleIdentity, DbgEngError> {
+        let module = self.module(name)?;
+        let symbol_file = self.module_symbol_file(module.base)?;
+        Ok(ModuleIdentity {
+            name: module.name,
+            image_name: module.image_name,
+            loaded_image_name: module.loaded_image_name,
+            symbol_file,
+            symbols: module.symbols,
+            base: module.base,
+            size: module.size,
+            timestamp: module.timestamp,
+            checksum: module.checksum,
+        })
     }
 
     /// The modules that have **unloaded**, which the engine keeps a bounded tail of and `lm`
@@ -3124,6 +3290,10 @@ mod tests {
             SymbolKind::None
         );
         assert_eq!(SymbolKind::from_engine(4242), SymbolKind::Other(4242));
+        assert!(SymbolKind::Pdb.has_type_info());
+        assert!(SymbolKind::Dia.has_type_info());
+        assert!(!SymbolKind::Export.has_type_info());
+        assert!(!SymbolKind::Deferred.has_type_info());
     }
 
     #[test]

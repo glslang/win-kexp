@@ -6,8 +6,8 @@ use thiserror::Error;
 
 use super::decode::{
     PAGE_SIZE, PoolHeaderLayout, SpecialPoolHeader, adjust_page_end_header, big_page_probe,
-    decode_descriptor_at, decode_large_allocation, decode_lfh_subsegment, decode_pool_header,
-    decode_rb_root, decode_slist_header_next, decode_special_pool_header, decode_vs_chunk,
+    decode_descriptor_at, decode_large_requested_size, decode_lfh_subsegment, decode_pool_header,
+    decode_rb_root_for, decode_slist_header_next, decode_special_pool_header, decode_vs_chunk,
     descriptor_backend, lfh_bitmap_state, read_u16, read_u32, read_u64,
     valid_descriptor_tree_signature, valid_page_segment_signature, valid_vs_signature,
 };
@@ -96,6 +96,7 @@ fn missing_layout(item: impl Into<String>) -> SnapshotError {
 pub(crate) struct PoolRegion {
     pub address: u64,
     pub size: usize,
+    pub requested_size: Option<u64>,
     pub pool_kind: PoolKind,
     pub numa_node: u16,
     pub heap: HeapIdentity,
@@ -358,7 +359,12 @@ fn tree_nodes(
     } else {
         false
     };
-    let Some(root) = decode_rb_root(root_value, tree_address, encoded) else {
+    let decoded_root = if layout.is_user() {
+        decode_rb_root_for(root_value, tree_address, encoded, true)
+    } else {
+        super::decode::decode_rb_root(root_value, tree_address, encoded)
+    };
+    let Some(root) = decoded_root else {
         diagnostics.push(format!("rejecting corrupt {label} root {root_value:#x}"));
         return Ok(Vec::new());
     };
@@ -607,9 +613,9 @@ struct VsRoot {
 /// Resolves where a VS context keeps its free-chunk state. Both shapes are supported,
 /// because a debugger host does not get to choose which build it is pointed at:
 ///
-/// * **pre-26100** — `FreeChunkTree`/`DelayFreeContext` are inline in `_HEAP_VS_CONTEXT`,
+/// * **inline family** — `FreeChunkTree`/`DelayFreeContext` are in `_HEAP_VS_CONTEXT`,
 ///   so there is exactly one root: the context itself.
-/// * **26100+** — they moved into `_HEAP_VS_AFFINITY_SLOT`s reached through a slot map.
+/// * **affinity-slot family** — they live in `_HEAP_VS_AFFINITY_SLOT`s reached through a slot map.
 ///   `SlotMapRef` and each `SlotRef` are offsets *from the context*, scaled by 64 bytes,
 ///   and the map holds `AffinityMask + 1` entries. Entries routinely share a slot, so the
 ///   result is deduplicated.
@@ -758,8 +764,8 @@ fn discover_vs_evidence(
         .map_or(0, |value| value.size as u64);
     if let Ok(list_offset) = layout.field("_HEAP_VS_DELAY_FREE_CONTEXT", "ListHead") {
         for root in &roots {
-            // Pre-26100 the delay-free list sits beside the tree in the context; from
-            // 26100 it is per-slot. Either way it is a known offset from `root.base`.
+            // In the inline family the delay-free list sits beside the tree in the context;
+            // in the affinity family it is per-slot. Either way it is known from `root.base`.
             let Some(delay_offset) = root.delay_offset else {
                 continue;
             };
@@ -1204,6 +1210,7 @@ fn discover_segment_context(
             discovery.regions.push(PoolRegion {
                 address: region_address,
                 size: region_size,
+                requested_size: None,
                 pool_kind,
                 numa_node,
                 heap: identity,
@@ -1280,7 +1287,13 @@ fn discover_large_allocations(
         };
         let Some((virtual_address, pages)) = read_u64(&allocation, virtual_offset)
             .zip(read_u64(&allocation, pages_offset))
-            .and_then(|(virtual_address, pages)| decode_large_allocation(virtual_address, pages))
+            .and_then(|(virtual_address, pages)| {
+                if layout.is_user() {
+                    super::decode::decode_large_allocation_for(virtual_address, pages, true)
+                } else {
+                    super::decode::decode_large_allocation(virtual_address, pages)
+                }
+            })
         else {
             continue;
         };
@@ -1291,14 +1304,26 @@ fn discover_large_allocations(
             continue;
         }
         let bytes = pages.saturating_mul(PAGE_SIZE);
-        let (tag, tracked_size) = match lookup_big_page_target(
-            memory,
-            layout,
-            virtual_address,
-            &mut discovery.diagnostics,
-        )? {
-            Some(value) => value,
-            None => (0, bytes),
+        // In the validated x64 layout `UnusedBytes` aliases the low 16 bits of the
+        // `VirtualAddress` word. Only recover an exact request when the PDB confirms that
+        // alias and the encoded value fits inside the allocation.
+        let validated_unused_bytes = layout
+            .field("_HEAP_LARGE_ALLOC_DATA", "UnusedBytes")
+            .is_ok_and(|offset| offset == virtual_offset);
+        let requested_size = read_u64(&allocation, virtual_offset)
+            .and_then(|word| decode_large_requested_size(word, bytes, validated_unused_bytes));
+        let (tag, tracked_size) = if layout.is_user() {
+            (0, bytes)
+        } else {
+            match lookup_big_page_target(
+                memory,
+                layout,
+                virtual_address,
+                &mut discovery.diagnostics,
+            )? {
+                Some(value) => value,
+                None => (0, bytes),
+            }
         };
         let size = tracked_size.min(bytes).min(usize::MAX as u64) as usize;
         let Ok(pool_header) = layout.pool_header_layout() else {
@@ -1307,6 +1332,7 @@ fn discover_large_allocations(
         discovery.regions.push(PoolRegion {
             address: virtual_address,
             size,
+            requested_size: layout.is_user().then_some(requested_size).flatten(),
             pool_kind,
             numa_node,
             heap: identity,
@@ -1581,6 +1607,7 @@ impl FromIterator<String> for PoolDiagnostics {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PoolSnapshot {
+    pub layout: crate::allocator::LayoutProvenance,
     pub spans: Vec<PoolSpan>,
     pub diagnostics: PoolDiagnostics,
     pub complete: bool,
@@ -2085,6 +2112,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             header_address: header,
             usable_address: usable,
             size,
+            requested_size: region.requested_size,
             raw_tag: tag,
             display_tag: super::decode::display_tag(tag),
             pool_kind: region.pool_kind,
@@ -2327,11 +2355,16 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 break;
             }
             let candidate = header_address + region.vs_header_size as u64;
-            let Some(physical_header) =
-                adjust_page_end_header(candidate, region.pool_header.size as u64)
-            else {
-                snapshot.complete = false;
-                break;
+            let physical_header = if region.pool_header.size == 0 {
+                candidate
+            } else {
+                let Some(header) =
+                    adjust_page_end_header(candidate, region.pool_header.size as u64)
+                else {
+                    snapshot.complete = false;
+                    break;
+                };
+                header
             };
             let pool_offset = physical_header.saturating_sub(base) as usize;
             let tag = decode_pool_header(bytes, pool_offset, region.pool_header)
@@ -2348,9 +2381,14 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             let overhead = physical_header
                 .saturating_sub(header_address)
                 .saturating_add(region.pool_header.size as u64);
+            let span_header = if region.pool_header.size == 0 {
+                header_address
+            } else {
+                physical_header
+            };
             let mut span = self.base_span(
                 region,
-                physical_header,
+                span_header,
                 physical_header + region.pool_header.size as u64,
                 (chunk_size as u64).saturating_sub(overhead),
                 tag,
@@ -2449,6 +2487,114 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
     }
 }
 
+/// Walk user-mode Segment Heap roots through the same region discovery and backend decoders
+/// used for kernel pool heaps.
+///
+/// The adapter supplies user addresses and a zero-sized pool header through `layout`; everything
+/// below the root enumeration—page segments, descriptors, LFH bitmaps, VS chains, free-state
+/// evidence, large allocations, diagnostics, caps, and deadlines—is shared.
+pub(crate) fn walk_user_segment_heaps<M: PoolMemory>(
+    memory: &M,
+    layout: &PoolLayout,
+    peb: u64,
+    heaps: &[u64],
+    budget: Option<Duration>,
+    traversal_limit: usize,
+) -> Result<PoolSnapshot, SnapshotError> {
+    let (discovery_deadline, walk_deadline) = budget_deadlines(Instant::now(), budget);
+    let discovery_clock = Budgeted::new(memory, discovery_deadline);
+    let globals_address = *layout
+        .globals
+        .get("RtlpHpHeapGlobals")
+        .ok_or_else(|| missing_layout("RtlpHpHeapGlobals"))?;
+    let heap_key = scalar(
+        &discovery_clock,
+        globals_address + layout.field("_RTLP_HP_HEAP_GLOBALS", "HeapKey")? as u64,
+        8,
+    )?;
+    let lfh_key = scalar(
+        &discovery_clock,
+        globals_address + layout.field("_RTLP_HP_HEAP_GLOBALS", "LfhKey")? as u64,
+        8,
+    )?;
+
+    let mut discovery = Discovery::default();
+    let mut expired = false;
+    for &heap in heaps {
+        let identity = HeapIdentity {
+            pool_state: peb,
+            heap,
+            special: false,
+        };
+        match discover_heap_regions(
+            &discovery_clock,
+            layout,
+            heap,
+            0,
+            PoolKind::NonPagedNx,
+            identity,
+            None,
+            heap_key,
+            lfh_key,
+            traversal_limit,
+            &mut discovery,
+        ) {
+            Ok(()) => {}
+            Err(SnapshotError::BudgetExpired) => {
+                expired = true;
+                break;
+            }
+            Err(error) if error.halts_walk() => return Err(error),
+            Err(error) => discovery
+                .diagnostics
+                .push(format!("cannot fully discover heap {heap:#x}: {error}")),
+        }
+    }
+
+    let mut snapshot = PoolSnapshot {
+        complete: discovery.diagnostics.is_empty(),
+        diagnostics: PoolDiagnostics::from_iter(std::mem::take(&mut discovery.diagnostics)),
+        ..PoolSnapshot::default()
+    };
+    let walk_clock = Budgeted::new(memory, walk_deadline);
+    let walker = SnapshotWalker {
+        memory: &walk_clock,
+        layout,
+        traversal_limit,
+    };
+    let discovered = discovery.regions.len();
+    let mut walked = 0usize;
+    for region in discovery.regions {
+        let outcome = if region.backend == PoolBackend::Large {
+            walker.walk_large(&region, &mut snapshot);
+            Ok(())
+        } else {
+            walker.walk_region(&region, &mut snapshot)
+        };
+        match outcome {
+            Ok(()) => walked += 1,
+            Err(SnapshotError::BudgetExpired) => {
+                expired = true;
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if expired {
+        snapshot.complete = false;
+        snapshot.budget_expired = true;
+        snapshot.diagnostics.push(format!(
+            "the walk ran out of its {:?} budget: {walked} of {discovered} discovered regions \
+             were walked; what is missing is unknown, not absent",
+            budget.unwrap_or_default()
+        ));
+    }
+    snapshot
+        .spans
+        .sort_by_key(|span| (span.heap, span.usable_address));
+    Ok(snapshot)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::Cell, collections::HashMap};
@@ -2461,6 +2607,7 @@ mod tests {
         PoolRegion {
             address,
             size: 0x1000,
+            requested_size: None,
             pool_kind: PoolKind::NonPagedNx,
             numa_node: 0,
             heap: HeapIdentity {
@@ -2528,7 +2675,7 @@ mod tests {
         );
     }
 
-    // ---- VS roots: legacy in-context shape vs 26100 affinity slots ------------------
+    // ---- VS roots: inline context vs affinity slots ----------------------------------
 
     /// Memory backed by one contiguous buffer. Anything outside it fails to read, the way
     /// an unmapped page does.
@@ -2587,7 +2734,7 @@ mod tests {
     const VS_CONTEXT: u64 = 0x1000;
 
     /// A layout carrying only what `vs_roots` consults. `affinity` picks the shape: with
-    /// it, the 26100 slot types exist and `_HEAP_VS_CONTEXT` has no `FreeChunkTree`;
+    /// it, the affinity-slot types exist and `_HEAP_VS_CONTEXT` has no `FreeChunkTree`;
     /// without it, the legacy in-context fields are present instead.
     fn vs_layout(affinity: bool) -> PoolLayout {
         let mut types = HashMap::new();
@@ -2656,7 +2803,7 @@ mod tests {
         );
     }
 
-    /// Pre-26100: the tree is inline in the context, so there is exactly one root and no
+    /// Inline family: the tree is in the context, so there is exactly one root and no
     /// slot map is consulted at all.
     #[test]
     fn test_vs_roots_reads_the_legacy_in_context_shape() {
@@ -2670,7 +2817,7 @@ mod tests {
         assert!(diagnostics.is_empty());
     }
 
-    /// 26100: `slot = VsContext + (SlotRef << 6)`, and entries routinely share a slot.
+    /// Affinity family: `slot = VsContext + (SlotRef << 6)`, and entries routinely share a slot.
     #[test]
     fn test_vs_roots_walks_the_affinity_slots_and_dedups_them() {
         let memory = affinity_fixture();
@@ -2904,6 +3051,7 @@ mod tests {
         PoolRegion {
             address,
             size: pages * PAGE_SIZE as usize,
+            requested_size: None,
             pool_kind: PoolKind::SpecialNonPagedNx,
             numa_node: 0,
             heap: HeapIdentity {
@@ -2933,6 +3081,7 @@ mod tests {
         PoolRegion {
             address: VS_BASE,
             size,
+            requested_size: None,
             pool_kind: PoolKind::NonPagedNx,
             numa_node: 0,
             heap: HeapIdentity {

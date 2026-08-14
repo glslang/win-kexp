@@ -21,6 +21,7 @@ pub(crate) struct Hole {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PoolIndex {
+    pub layout: crate::allocator::LayoutProvenance,
     pub spans: Vec<PoolSpan>,
     pub postings: HashMap<u32, Vec<usize>>,
     pub diagnostics: PoolDiagnostics,
@@ -82,6 +83,7 @@ impl PoolIndex {
             span_rows.push(row);
         }
         Self {
+            layout: snapshot.layout,
             spans: snapshot.spans,
             postings,
             diagnostics: snapshot.diagnostics,

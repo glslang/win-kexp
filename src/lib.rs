@@ -1,4 +1,6 @@
+pub mod allocator;
 pub mod dbgeng;
+pub mod heap;
 pub mod pool;
 mod pool_extension;
 pub mod process;

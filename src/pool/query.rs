@@ -12,6 +12,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use std::time::Instant;
 
 use thiserror::Error;
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
@@ -58,6 +59,22 @@ pub(crate) fn invalidate_session() {
     LayoutCache::global().invalidate();
 }
 
+/// Invalidate every cached allocator snapshot and schema for a programmatic host.
+///
+/// WinDbg extensions receive session notifications and do this automatically. A host that
+/// resumes or replaces a target through the API knows about that transition directly and calls
+/// this at the same boundary.
+pub fn invalidate_allocator_caches() {
+    invalidate_session();
+    crate::heap::invalidate_caches();
+}
+
+/// Invalidate target-memory snapshots after execution while retaining immutable PDB layouts.
+pub fn invalidate_allocator_snapshots() {
+    snapshots().invalidate();
+    crate::heap::invalidate_snapshot();
+}
+
 /// Why a pool query could not be answered.
 ///
 /// These are deliberately distinct variants rather than one string: a caller needs to
@@ -80,7 +97,7 @@ pub enum PoolQueryError {
     #[error("tag must contain 1..4 ASCII bytes")]
     InvalidTag,
 
-    #[error("resolving pool layout failed: {0}")]
+    #[error("resolving pool layout failed ({0}); run `.reload /f nt` and retry")]
     Layout(String),
 
     /// The walk was stopped on request (Ctrl+C / `SetInterrupt`) and its snapshot discarded.
@@ -207,6 +224,7 @@ pub struct PoolTagSummary {
 /// reached almost none of the pool" — those look identical without the walk's own diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolSnapshotReport {
+    pub layout: crate::allocator::LayoutProvenance,
     pub total_chunks: usize,
     pub allocated_chunks: usize,
     /// How much of the pool the walk actually covered, and — when it fell short — what stopped
@@ -284,6 +302,7 @@ pub fn snapshot_report(
 
 fn report_of(index: &PoolIndex) -> PoolSnapshotReport {
     PoolSnapshotReport {
+        layout: index.layout.clone(),
         total_chunks: index.spans.len(),
         allocated_chunks: index
             .spans
@@ -312,6 +331,7 @@ pub(crate) fn prepare_index(
     engine: &DebugEngine,
     walk: PoolWalk,
 ) -> Result<PoolIndex, PoolQueryError> {
+    let started = Instant::now();
     if !engine.is_kernel_target()? {
         return Err(PoolQueryError::NotKernelTarget);
     }
@@ -348,17 +368,31 @@ pub(crate) fn prepare_index(
     let layout = LayoutCache::global()
         .get_or_resolve(engine, key)
         .map_err(|error| PoolQueryError::Layout(error.to_string()))?;
+    let module = engine.module_identity("nt")?;
+    if !module.symbols.has_type_info() || module.symbol_file.is_empty() {
+        return Err(PoolQueryError::Layout(
+            "DbgEng did not load private PDB type information for nt".into(),
+        ));
+    }
+    let provenance = layout
+        .provenance(module)
+        .map_err(|error| PoolQueryError::Layout(error.to_string()))?;
+    let remaining = walk
+        .budget
+        .map(|budget| budget.saturating_sub(started.elapsed()));
 
     // Keyed on the whole `SessionKey`: a programmatic host receives no session
     // notifications, so the generation alone would let a snapshot outlive its target.
     snapshots()
         .get_or_refresh(key, walk.refresh, || {
-            SnapshotWalker {
+            let mut snapshot = SnapshotWalker {
                 memory: engine,
                 layout: &layout,
                 traversal_limit: 1_000_000,
             }
-            .walk(walk.budget)
+            .walk(remaining)?;
+            snapshot.layout = provenance;
+            Ok(snapshot)
         })
         // Mapped from the walk's own error type rather than from a string it was flattened
         // into: an interrupt is the one stop here that is not a failure, and a `to_string()`
@@ -658,6 +692,7 @@ mod tests {
             header_address: chunk + VS_HEADER,
             usable_address: chunk + VS_HEADER + POOL_HEADER,
             size: chunk_size - VS_HEADER - POOL_HEADER,
+            requested_size: None,
             raw_tag,
             display_tag: crate::pool::decode::display_tag(raw_tag),
             pool_kind: PoolKind::NonPagedNx,
@@ -698,6 +733,7 @@ mod tests {
             header_address: slot,
             usable_address: slot + POOL_HEADER,
             size: unit - POOL_HEADER,
+            requested_size: None,
             raw_tag,
             display_tag: crate::pool::decode::display_tag(raw_tag),
             pool_kind: PoolKind::NonPagedNx,

@@ -67,6 +67,9 @@ pub struct PoolSpan {
     pub header_address: u64,
     pub usable_address: u64,
     pub size: u64,
+    /// Exact requested size when allocator metadata validates it. Kernel pool and user LFH/VS
+    /// spans leave this unset rather than guessing from capacity.
+    pub requested_size: Option<u64>,
     pub raw_tag: u32,
     pub display_tag: String,
     pub pool_kind: PoolKind,
@@ -109,6 +112,7 @@ impl PoolSpan {
             header_address: address,
             usable_address: address,
             size,
+            requested_size: None,
             raw_tag: tag,
             display_tag: decode::display_tag(tag),
             pool_kind,
