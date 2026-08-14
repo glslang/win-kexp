@@ -556,6 +556,15 @@ pub(crate) enum LayoutTarget {
     User,
 }
 
+impl LayoutTarget {
+    fn probe_type(self) -> &'static str {
+        match self {
+            Self::Kernel => "_POOL_HEADER",
+            Self::User => "_PEB",
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct LayoutCache {
     entries: Mutex<HashMap<(LayoutTarget, LayoutKey), AllocatorSchema>>,
@@ -574,6 +583,13 @@ impl LayoutCache {
         target: LayoutTarget,
     ) -> Result<AllocatorSchema, LayoutError> {
         let key = key.into();
+        // A cached schema can be shared by multiple DebugEngine instances. Probe a required
+        // type on this engine before accepting the hit so DbgEng loads deferred symbols here,
+        // rather than trusting that the engine which populated the global cache loaded them.
+        let probe = target.probe_type();
+        symbols
+            .type_id(key.image.base, probe)
+            .map_err(|_| LayoutError::Missing { item: probe.into() })?;
         let cache_key = (target, key);
         if let Some(layout) = self.entries.lock().unwrap().get(&cache_key).cloned() {
             return Ok(layout);
@@ -605,6 +621,7 @@ mod tests {
         /// How many times a layout has actually been resolved through these symbols, so a
         /// cache hit can be told from a re-resolution rather than inferred from equal results.
         resolutions: Cell<usize>,
+        type_lookups: Cell<usize>,
         fallback_aliases: bool,
         optional_fields: bool,
         missing_global: Option<&'static str>,
@@ -681,6 +698,7 @@ mod tests {
         }
 
         fn type_id(&self, _module: u64, name: &str) -> Result<u32, DbgEngError> {
+            self.type_lookups.set(self.type_lookups.get() + 1);
             if self.missing_type == Some(name) {
                 return Self::error();
             }
@@ -795,6 +813,46 @@ mod tests {
             symbols.resolutions.get() > resolved_after_kernel,
             "one image key may not alias two module-specific resolver modes"
         );
+    }
+
+    #[test]
+    fn test_layout_cache_hit_still_probes_symbols_on_the_current_engine() {
+        let cache = LayoutCache::default();
+        cache
+            .get_or_resolve(&FakeSymbols::default(), key(), LayoutTarget::Kernel)
+            .unwrap();
+
+        let deferred = FakeSymbols {
+            missing_type: Some(LayoutTarget::Kernel.probe_type()),
+            ..FakeSymbols::default()
+        };
+        assert_eq!(
+            missing_item(cache.get_or_resolve(&deferred, key(), LayoutTarget::Kernel)),
+            "_POOL_HEADER",
+            "a cache hit must probe the current engine instead of inheriting another engine's \
+             symbol-loaded state"
+        );
+        assert_eq!(deferred.type_lookups.get(), 1);
+
+        cache
+            .get_or_resolve(
+                &FakeSymbols {
+                    optional_fields: true,
+                    ..FakeSymbols::default()
+                },
+                key(),
+                LayoutTarget::User,
+            )
+            .unwrap();
+        let deferred_user = FakeSymbols {
+            missing_type: Some(LayoutTarget::User.probe_type()),
+            ..FakeSymbols::default()
+        };
+        assert_eq!(
+            missing_item(cache.get_or_resolve(&deferred_user, key(), LayoutTarget::User)),
+            "_PEB"
+        );
+        assert_eq!(deferred_user.type_lookups.get(), 1);
     }
 
     fn missing_item(result: Result<PoolLayout, LayoutError>) -> String {
