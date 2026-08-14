@@ -230,6 +230,8 @@ struct SnapshotKey {
     peb: u64,
     image: KernelImage,
     generation: u64,
+    /// A scoped diagnostic walk is a different snapshot from the all-heaps walk.
+    heap: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -609,6 +611,16 @@ fn scope_of(roots: &[HeapRoot]) -> HeapScope {
     scope
 }
 
+fn scope_for(roots: &[HeapRoot], heap: Option<u64>) -> HeapScope {
+    let mut scope = scope_of(roots);
+    if let Some(heap) = heap {
+        // Diagnostic shapes deliberately generalise addresses. Narrow the roots handed to the
+        // walker so complaints from another heap never enter this snapshot's aggregation.
+        scope.segment_heaps_walked.retain(|root| *root == heap);
+    }
+    scope
+}
+
 fn from_pool_snapshot(
     snapshot: PoolSnapshot,
 ) -> (Vec<HeapAllocation>, HeapWalkReport, HeapDiagnosticReport) {
@@ -729,6 +741,7 @@ fn walk_snapshot(
     started: Instant,
     target: ValidatedTarget,
     schema: ResolvedSchema,
+    heap: Option<u64>,
 ) -> Result<HeapSnapshot, HeapQueryError> {
     let key = SnapshotKey {
         target: target.target,
@@ -736,6 +749,7 @@ fn walk_snapshot(
         peb: target.peb,
         image: schema.image,
         generation: target.generation,
+        heap,
     };
     if walk.refresh {
         snapshots().invalidate();
@@ -752,7 +766,7 @@ fn walk_snapshot(
         total,
         budget_expired,
     } = enumerate_roots(engine, &schema.layout, target.peb, deadline)?;
-    let mut scope = scope_of(&roots);
+    let mut scope = scope_for(&roots, heap);
     let pool = if budget_expired {
         // These roots were identified but no allocator region was walked after the deadline.
         scope.segment_heaps_walked.clear();
@@ -790,11 +804,19 @@ fn walk_snapshot(
 }
 
 fn prepare(engine: &DebugEngine, walk: HeapWalk) -> Result<HeapSnapshot, HeapQueryError> {
+    prepare_for_heap(engine, None, walk)
+}
+
+fn prepare_for_heap(
+    engine: &DebugEngine,
+    heap: Option<u64>,
+    walk: HeapWalk,
+) -> Result<HeapSnapshot, HeapQueryError> {
     let started = Instant::now();
     let deadline = walk.budget.and_then(|budget| started.checked_add(budget));
     let target = validate_target(engine)?;
     let schema = resolve_schema(engine, target, deadline)?;
-    walk_snapshot(engine, walk, started, target, schema)
+    walk_snapshot(engine, walk, started, target, schema, heap)
 }
 
 fn answer<T>(snapshot: &HeapSnapshot, found: T) -> HeapAnswer<T> {
@@ -921,6 +943,19 @@ pub fn diagnostics(
     Ok(answer(&snapshot, snapshot.diagnostics.clone()))
 }
 
+/// Reports diagnostics from one Segment Heap root.
+///
+/// The heap is selected before walking and before diagnostic shapes generalise addresses, so
+/// category totals and examples both describe only this root. Use [`diagnostics`] for all roots.
+pub fn diagnostics_for_heap(
+    engine: &DebugEngine,
+    heap: u64,
+    walk: impl Into<HeapWalk>,
+) -> Result<HeapAnswer<HeapDiagnosticReport>, HeapQueryError> {
+    let snapshot = prepare_for_heap(engine, Some(heap), walk.into())?;
+    Ok(answer(&snapshot, snapshot.diagnostics.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -982,20 +1017,42 @@ mod tests {
             timestamp: 0x1234_5678,
             checksum: 0x9876,
         };
-        let key = |process_system_id| SnapshotKey {
+        let key = |process_system_id, heap| SnapshotKey {
             target: 7,
             process_system_id,
             peb: 0x0000_7fff_0000_1000,
             image,
             generation: 3,
+            heap,
         };
 
         assert_ne!(
-            key(100),
-            key(200),
+            key(100, None),
+            key(200, None),
             "two current processes may share virtual addresses but never a heap snapshot"
         );
-        assert_eq!(key(100), key(100));
+        assert_eq!(key(100, None), key(100, None));
+    }
+
+    #[test]
+    fn test_snapshot_identity_separates_scoped_diagnostic_walks() {
+        let image = KernelImage {
+            base: 0x0000_7ffb_0000_0000,
+            size: 0x20_0000,
+            timestamp: 0x1234_5678,
+            checksum: 0x9876,
+        };
+        let key = |heap| SnapshotKey {
+            target: 7,
+            process_system_id: 100,
+            peb: 0x0000_7fff_0000_1000,
+            image,
+            generation: 3,
+            heap,
+        };
+
+        assert_ne!(key(None), key(Some(0x10000)));
+        assert_ne!(key(Some(0x10000)), key(Some(0x20000)));
     }
 
     #[test]
@@ -1043,6 +1100,29 @@ mod tests {
         assert_eq!(scope.nt_heaps_skipped, vec![2]);
         assert_eq!(scope.unknown_heaps_skipped, vec![3]);
         assert_eq!(scope.unreadable_heaps_skipped, vec![4]);
+    }
+
+    #[test]
+    fn test_scoped_diagnostics_select_one_heap_before_the_walk() {
+        let roots = vec![
+            HeapRoot {
+                index: 0,
+                address: 0x10000,
+                kind: HeapKind::Segment,
+                supported: true,
+                reason: None,
+            },
+            HeapRoot {
+                index: 1,
+                address: 0x20000,
+                kind: HeapKind::Segment,
+                supported: true,
+                reason: None,
+            },
+        ];
+        let scope = scope_for(&roots, Some(0x20000));
+
+        assert_eq!(scope.segment_heaps_walked, vec![0x20000]);
     }
 
     #[test]
