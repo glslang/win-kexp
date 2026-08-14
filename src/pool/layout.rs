@@ -72,13 +72,46 @@ pub(crate) enum LayoutError {
     Missing { item: String },
     #[error("unsupported allocator layout {fingerprint}: {detail}")]
     Unsupported { fingerprint: String, detail: String },
+    #[error("allocator layout resolution was interrupted on request")]
+    Interrupted,
+    #[error("allocator layout resolution ran out of its walk budget")]
+    BudgetExpired,
+    #[error("polling allocator layout resolution failed: {detail}")]
+    Poll { detail: String },
 }
 
 pub(crate) trait Symbols {
+    fn poll(&self) -> Result<(), LayoutError> {
+        Ok(())
+    }
+
     fn symbol(&self, name: &str) -> Result<u64, DbgEngError>;
     fn type_id(&self, module: u64, name: &str) -> Result<u32, DbgEngError>;
     fn type_size(&self, module: u64, type_id: u32) -> Result<u32, DbgEngError>;
     fn field(&self, module: u64, type_id: u32, name: &str) -> Result<u32, DbgEngError>;
+}
+
+fn polled<T>(
+    symbols: &impl Symbols,
+    lookup: impl FnOnce() -> Result<T, DbgEngError>,
+) -> Result<Result<T, DbgEngError>, LayoutError> {
+    symbols.poll()?;
+    let result = lookup();
+    symbols.poll()?;
+    Ok(result)
+}
+
+fn first_available<T>(
+    symbols: &impl Symbols,
+    aliases: &[&str],
+    mut lookup: impl FnMut(&str) -> Result<T, DbgEngError>,
+) -> Result<Option<T>, LayoutError> {
+    for alias in aliases {
+        if let Ok(value) = polled(symbols, || lookup(alias))? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
 }
 
 impl Symbols for DebugEngine {
@@ -317,24 +350,24 @@ fn resolve_type(
     module: u64,
     spec: &TypeSpec,
 ) -> Result<TypeLayout, LayoutError> {
-    let type_id = symbols
-        .type_id(module, spec.name)
-        .map_err(|_| LayoutError::Missing {
+    let type_id = polled(symbols, || symbols.type_id(module, spec.name))?.map_err(|_| {
+        LayoutError::Missing {
             item: spec.name.into(),
-        })?;
-    let size = symbols
-        .type_size(module, type_id)
-        .map_err(|_| LayoutError::Missing {
+        }
+    })?;
+    let size = polled(symbols, || symbols.type_size(module, type_id))?.map_err(|_| {
+        LayoutError::Missing {
             item: spec.name.into(),
-        })?;
+        }
+    })?;
     let mut fields = HashMap::new();
     for &(canonical, aliases) in spec.fields {
-        let offset = aliases
-            .iter()
-            .find_map(|field| symbols.field(module, type_id, field).ok())
-            .ok_or_else(|| LayoutError::Missing {
-                item: format!("{}.{canonical}", spec.name),
-            })?;
+        let offset = first_available(symbols, aliases, |field| {
+            symbols.field(module, type_id, field)
+        })?
+        .ok_or_else(|| LayoutError::Missing {
+            item: format!("{}.{canonical}", spec.name),
+        })?;
         fields.insert(canonical, offset);
     }
     Ok(TypeLayout { size, fields })
@@ -344,21 +377,21 @@ fn apply_optional_fields(
     symbols: &impl Symbols,
     module: u64,
     types: &mut HashMap<&'static str, TypeLayout>,
-) {
+) -> Result<(), LayoutError> {
     for &(type_name, canonical, aliases) in OPTIONAL_FIELDS {
         let Some(layout) = types.get_mut(type_name) else {
             continue;
         };
-        let Ok(type_id) = symbols.type_id(module, type_name) else {
+        let Ok(type_id) = polled(symbols, || symbols.type_id(module, type_name))? else {
             continue;
         };
-        if let Some(offset) = aliases
-            .iter()
-            .find_map(|field| symbols.field(module, type_id, field).ok())
-        {
+        if let Some(offset) = first_available(symbols, aliases, |field| {
+            symbols.field(module, type_id, field)
+        })? {
             layout.fields.insert(canonical, offset);
         }
     }
+    Ok(())
 }
 
 impl AllocatorSchema {
@@ -410,16 +443,14 @@ impl AllocatorSchema {
     pub(crate) fn resolve(symbols: &impl Symbols, key: LayoutKey) -> Result<Self, LayoutError> {
         let mut globals = HashMap::new();
         for &(canonical, aliases) in GLOBALS {
-            let value = aliases
-                .iter()
-                .find_map(|name| symbols.symbol(name).ok())
+            let value = first_available(symbols, aliases, |name| symbols.symbol(name))?
                 .ok_or_else(|| LayoutError::Missing {
                     item: canonical.into(),
                 })?;
             globals.insert(canonical, value);
         }
         for &(canonical, aliases) in OPTIONAL_GLOBALS {
-            if let Some(value) = aliases.iter().find_map(|name| symbols.symbol(name).ok()) {
+            if let Some(value) = first_available(symbols, aliases, |name| symbols.symbol(name))? {
                 globals.insert(canonical, value);
             }
         }
@@ -428,11 +459,15 @@ impl AllocatorSchema {
             types.insert(spec.name, resolve_type(symbols, key.image.base, spec)?);
         }
         for spec in OPTIONAL_TYPES {
-            if let Ok(layout) = resolve_type(symbols, key.image.base, spec) {
-                types.insert(spec.name, layout);
+            match resolve_type(symbols, key.image.base, spec) {
+                Ok(layout) => {
+                    types.insert(spec.name, layout);
+                }
+                Err(LayoutError::Missing { .. }) => {}
+                Err(error) => return Err(error),
             }
         }
-        apply_optional_fields(symbols, key.image.base, &mut types);
+        apply_optional_fields(symbols, key.image.base, &mut types)?;
         Ok(Self {
             key,
             globals,
@@ -445,17 +480,14 @@ impl AllocatorSchema {
         symbols: &impl Symbols,
         key: LayoutKey,
     ) -> Result<Self, LayoutError> {
-        let globals = [("RtlpHpHeapGlobals", "ntdll!RtlpHpHeapGlobals")]
-            .into_iter()
-            .map(|(canonical, symbol)| {
-                symbols
-                    .symbol(symbol)
-                    .map(|value| (canonical, value))
-                    .map_err(|_| LayoutError::Missing {
-                        item: canonical.into(),
-                    })
-            })
-            .collect::<Result<HashMap<_, _>, _>>()?;
+        let mut globals = HashMap::new();
+        let global =
+            polled(symbols, || symbols.symbol("ntdll!RtlpHpHeapGlobals"))?.map_err(|_| {
+                LayoutError::Missing {
+                    item: "RtlpHpHeapGlobals".into(),
+                }
+            })?;
+        globals.insert("RtlpHpHeapGlobals", global);
 
         let excluded = [
             "_EX_POOL_HEAP_MANAGER_STATE",
@@ -476,11 +508,15 @@ impl AllocatorSchema {
             if spec.name == "_POOL_TRACKER_BIG_PAGES" {
                 continue;
             }
-            if let Ok(layout) = resolve_type(symbols, key.image.base, spec) {
-                types.insert(spec.name, layout);
+            match resolve_type(symbols, key.image.base, spec) {
+                Ok(layout) => {
+                    types.insert(spec.name, layout);
+                }
+                Err(LayoutError::Missing { .. }) => {}
+                Err(error) => return Err(error),
             }
         }
-        apply_optional_fields(symbols, key.image.base, &mut types);
+        apply_optional_fields(symbols, key.image.base, &mut types)?;
         if !types
             .get("_SEGMENT_HEAP")
             .is_some_and(|layout| layout.fields.contains_key("Signature"))
@@ -587,8 +623,7 @@ impl LayoutCache {
         // type on this engine before accepting the hit so DbgEng loads deferred symbols here,
         // rather than trusting that the engine which populated the global cache loaded them.
         let probe = target.probe_type();
-        symbols
-            .type_id(key.image.base, probe)
+        polled(symbols, || symbols.type_id(key.image.base, probe))?
             .map_err(|_| LayoutError::Missing { item: probe.into() })?;
         let cache_key = (target, key);
         if let Some(layout) = self.entries.lock().unwrap().get(&cache_key).cloned() {
@@ -622,6 +657,9 @@ mod tests {
         /// cache hit can be told from a re-resolution rather than inferred from equal results.
         resolutions: Cell<usize>,
         type_lookups: Cell<usize>,
+        polls: Cell<usize>,
+        budget_after_polls: Option<usize>,
+        interrupt_after_polls: Option<usize>,
         fallback_aliases: bool,
         optional_fields: bool,
         missing_global: Option<&'static str>,
@@ -681,6 +719,24 @@ mod tests {
     }
 
     impl Symbols for FakeSymbols {
+        fn poll(&self) -> Result<(), LayoutError> {
+            let polls = self.polls.get();
+            self.polls.set(polls + 1);
+            if self
+                .interrupt_after_polls
+                .is_some_and(|allowed| polls >= allowed)
+            {
+                return Err(LayoutError::Interrupted);
+            }
+            if self
+                .budget_after_polls
+                .is_some_and(|allowed| polls >= allowed)
+            {
+                return Err(LayoutError::BudgetExpired);
+            }
+            Ok(())
+        }
+
         fn symbol(&self, name: &str) -> Result<u64, DbgEngError> {
             self.resolutions.set(self.resolutions.get() + 1);
             if self.missing_global == Some(name) {
@@ -855,10 +911,61 @@ mod tests {
         assert_eq!(deferred_user.type_lookups.get(), 1);
     }
 
+    #[test]
+    fn test_layout_resolution_stops_on_budget_or_interrupt_polls() {
+        let budgeted = FakeSymbols {
+            optional_fields: true,
+            budget_after_polls: Some(6),
+            ..FakeSymbols::default()
+        };
+        assert_eq!(
+            LayoutCache::default().get_or_resolve(&budgeted, key(), LayoutTarget::User),
+            Err(LayoutError::BudgetExpired)
+        );
+        assert_eq!(budgeted.polls.get(), 7);
+
+        let interrupted = FakeSymbols {
+            optional_fields: true,
+            interrupt_after_polls: Some(4),
+            ..FakeSymbols::default()
+        };
+        assert_eq!(
+            LayoutCache::default().get_or_resolve(&interrupted, key(), LayoutTarget::User),
+            Err(LayoutError::Interrupted)
+        );
+        assert_eq!(interrupted.polls.get(), 5);
+    }
+
+    #[test]
+    fn test_cached_layout_still_checks_the_current_resolution_budget() {
+        let cache = LayoutCache::default();
+        cache
+            .get_or_resolve(
+                &FakeSymbols {
+                    optional_fields: true,
+                    ..FakeSymbols::default()
+                },
+                key(),
+                LayoutTarget::User,
+            )
+            .unwrap();
+
+        let expired = FakeSymbols {
+            budget_after_polls: Some(0),
+            ..FakeSymbols::default()
+        };
+        assert_eq!(
+            cache.get_or_resolve(&expired, key(), LayoutTarget::User),
+            Err(LayoutError::BudgetExpired),
+            "a cache hit may not bypass the caller's deadline"
+        );
+        assert_eq!(expired.type_lookups.get(), 0);
+    }
+
     fn missing_item(result: Result<PoolLayout, LayoutError>) -> String {
         match result.unwrap_err() {
             LayoutError::Missing { item } => item,
-            LayoutError::Unsupported { .. } => panic!("expected a missing symbol error"),
+            other => panic!("expected a missing symbol error, got {other}"),
         }
     }
 

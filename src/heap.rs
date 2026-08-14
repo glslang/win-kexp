@@ -15,7 +15,7 @@ use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_AMD64;
 
 use crate::allocator::LayoutProvenance;
 use crate::dbgeng::{DbgEngError, DebugEngine, KernelImage};
-use crate::pool::layout::{LayoutCache, LayoutKey, LayoutTarget, PoolLayout};
+use crate::pool::layout::{LayoutCache, LayoutError, LayoutKey, LayoutTarget, PoolLayout, Symbols};
 use crate::pool::query::WalkCoverage;
 use crate::pool::snapshot::{PoolSnapshot, SnapshotError, walk_user_segment_heaps};
 use crate::pool::{DiagnosticShape, PoolBackend, PoolState, WalkStalls};
@@ -215,6 +215,8 @@ pub enum HeapQueryError {
     Layout(String),
     #[error("the heap walk was interrupted on request")]
     Interrupted,
+    #[error("the heap walk ran out of its budget while resolving the ntdll allocator layout")]
+    BudgetExpired,
     #[error("walking the heap failed: {0}")]
     Walk(String),
     #[error(transparent)]
@@ -224,6 +226,7 @@ pub enum HeapQueryError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SnapshotKey {
     target: u64,
+    process_system_id: u32,
     peb: u64,
     image: KernelImage,
     generation: u64,
@@ -242,6 +245,7 @@ struct HeapSnapshot {
 #[derive(Debug, Clone, Copy)]
 struct ValidatedTarget {
     target: u64,
+    process_system_id: u32,
     peb: u64,
     generation: u64,
 }
@@ -250,6 +254,62 @@ struct ResolvedSchema {
     layout: PoolLayout,
     provenance: LayoutProvenance,
     image: KernelImage,
+}
+
+struct BudgetedSymbols<'a> {
+    engine: &'a DebugEngine,
+    deadline: Option<Instant>,
+}
+
+impl BudgetedSymbols<'_> {
+    fn check(&self) -> Result<(), HeapQueryError> {
+        self.poll().map_err(map_layout_error)
+    }
+}
+
+impl Symbols for BudgetedSymbols<'_> {
+    fn poll(&self) -> Result<(), LayoutError> {
+        if self
+            .engine
+            .interrupted()
+            .map_err(|error| LayoutError::Poll {
+                detail: error.to_string(),
+            })?
+        {
+            return Err(LayoutError::Interrupted);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(LayoutError::BudgetExpired);
+        }
+        Ok(())
+    }
+
+    fn symbol(&self, name: &str) -> Result<u64, DbgEngError> {
+        self.engine.symbol_offset(name)
+    }
+
+    fn type_id(&self, module: u64, name: &str) -> Result<u32, DbgEngError> {
+        self.engine.type_id(module, name)
+    }
+
+    fn type_size(&self, module: u64, type_id: u32) -> Result<u32, DbgEngError> {
+        self.engine.type_size(module, type_id)
+    }
+
+    fn field(&self, module: u64, type_id: u32, name: &str) -> Result<u32, DbgEngError> {
+        self.engine.field_offset(module, type_id, name)
+    }
+}
+
+fn map_layout_error(error: LayoutError) -> HeapQueryError {
+    match error {
+        LayoutError::Interrupted => HeapQueryError::Interrupted,
+        LayoutError::BudgetExpired => HeapQueryError::BudgetExpired,
+        other => HeapQueryError::Layout(other.to_string()),
+    }
 }
 
 #[derive(Default)]
@@ -615,6 +675,7 @@ fn validate_target(engine: &DebugEngine) -> Result<ValidatedTarget, HeapQueryErr
     }
     Ok(ValidatedTarget {
         target: engine.target_identity(),
+        process_system_id: engine.current_process_system_id()?,
         peb,
         generation: crate::pool::query::generation(),
     })
@@ -623,8 +684,13 @@ fn validate_target(engine: &DebugEngine) -> Result<ValidatedTarget, HeapQueryErr
 fn resolve_schema(
     engine: &DebugEngine,
     target: ValidatedTarget,
+    deadline: Option<Instant>,
 ) -> Result<ResolvedSchema, HeapQueryError> {
-    let loaded_module = engine.module("ntdll")?;
+    let symbols = BudgetedSymbols { engine, deadline };
+    symbols.check()?;
+    let loaded_module = engine.module("ntdll");
+    symbols.check()?;
+    let loaded_module = loaded_module?;
     let image = KernelImage {
         base: loaded_module.base,
         size: loaded_module.size,
@@ -636,19 +702,20 @@ fn resolve_schema(
         session: target.generation,
     };
     let layout = LayoutCache::global()
-        .get_or_resolve(engine, layout_key, LayoutTarget::User)
-        .map_err(|error| HeapQueryError::Layout(error.to_string()))?;
+        .get_or_resolve(&symbols, layout_key, LayoutTarget::User)
+        .map_err(map_layout_error)?;
     // Type lookups above force a deferred module to load. Check provenance afterwards so
     // export-only symbols fail explicitly without preventing the normal deferred-load path.
-    let module = engine.module_identity("ntdll")?;
+    symbols.check()?;
+    let module = engine.module_identity("ntdll");
+    symbols.check()?;
+    let module = module?;
     if !module.symbols.has_type_info() || module.symbol_file.is_empty() {
         return Err(HeapQueryError::Layout(
             "DbgEng did not load private PDB type information for ntdll".into(),
         ));
     }
-    let provenance = layout
-        .provenance(module)
-        .map_err(|error| HeapQueryError::Layout(error.to_string()))?;
+    let provenance = layout.provenance(module).map_err(map_layout_error)?;
     Ok(ResolvedSchema {
         layout,
         provenance,
@@ -665,6 +732,7 @@ fn walk_snapshot(
 ) -> Result<HeapSnapshot, HeapQueryError> {
     let key = SnapshotKey {
         target: target.target,
+        process_system_id: target.process_system_id,
         peb: target.peb,
         image: schema.image,
         generation: target.generation,
@@ -723,8 +791,9 @@ fn walk_snapshot(
 
 fn prepare(engine: &DebugEngine, walk: HeapWalk) -> Result<HeapSnapshot, HeapQueryError> {
     let started = Instant::now();
+    let deadline = walk.budget.and_then(|budget| started.checked_add(budget));
     let target = validate_target(engine)?;
-    let schema = resolve_schema(engine, target)?;
+    let schema = resolve_schema(engine, target, deadline)?;
     walk_snapshot(engine, walk, started, target, schema)
 }
 
@@ -903,6 +972,30 @@ mod tests {
         assert!(!user_pointer(0));
         assert!(!user_pointer(0xffff_8000_0000_0000));
         assert!(!user_pointer(0x0000_8000_0000_0000));
+    }
+
+    #[test]
+    fn test_snapshot_identity_separates_current_processes() {
+        let image = KernelImage {
+            base: 0x0000_7ffb_0000_0000,
+            size: 0x20_0000,
+            timestamp: 0x1234_5678,
+            checksum: 0x9876,
+        };
+        let key = |process_system_id| SnapshotKey {
+            target: 7,
+            process_system_id,
+            peb: 0x0000_7fff_0000_1000,
+            image,
+            generation: 3,
+        };
+
+        assert_ne!(
+            key(100),
+            key(200),
+            "two current processes may share virtual addresses but never a heap snapshot"
+        );
+        assert_eq!(key(100), key(100));
     }
 
     #[test]
