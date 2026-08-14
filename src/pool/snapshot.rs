@@ -1198,25 +1198,44 @@ fn discover_segment_context(
                 region_address += first as u64;
                 region_size -= first;
                 block_size = 0;
-                // The bound every VS chunk is checked against is `region_address + region_size`,
-                // derived from the page-range descriptor. The subsegment carries the same number
-                // itself, and it is the one the allocator laid the chunks out to:
-                // `RtlpHpVsSubsegmentCreate` writes `Size = (bytes - first) >> 4` and puts the
-                // first chunk at `+ first`, so the two must agree exactly. Read and thrown away
-                // until now — glslang/win-kexp#103 asked whether the descriptor-derived bound was
-                // systematically short, and this is the check that answers it on any target
-                // rather than by argument.
+                // **The page range is not the subsegment, and is routinely larger.** The chunk
+                // area is what `nt!RtlpHpVsSubsegmentInitialize` lays out — `Size = (bytes -
+                // first) >> 4` sixteen-byte units starting at `+ first` — and the descriptor
+                // sizes the *range that holds it*, which on 26100 is one unit more:
                 //
-                // Reported, not preferred: `declared` is corroboration from a second source, and
-                // trusting it over the descriptor would let one misread `Size` truncate every VS
-                // region on a build whose field we resolve wrongly. A disagreement here is the
-                // signal to go and look.
+                // ```text
+                //   053 flags=0f UnitSize=11 UnitOffset=00   <- a VS range: 17 pages
+                //   054..063     UnitSize=00 UnitOffset=01..10  <- its 16 continuation units
+                //   064 flags=03 UnitSize=01                 <- and the next range begins
+                // ```
+                //
+                // while the subsegment at 0x53000 declared Size 0xffd — 0xffd0 bytes of chunks,
+                // plus `first`, is 0x10000. One spare page, every time, at both 0x10000 and
+                // 0x20000 subsegment sizes.
+                //
+                // Bounding by the range is what raised glslang/win-kexp#103: where that spare
+                // page happened to be committed, the walk decoded it, and since nothing there is
+                // a chunk it refused a header every sixteen bytes to the end — 0x1000/16 = 256
+                // per subsegment, against 248 measured. The remaining refusals on a live walk
+                // were, to a rounding error, exactly this page.
+                //
+                // `declared` is preferred over the descriptor rather than merely compared with
+                // it, because it is the number the chunks were laid out to *and* it is checked:
+                // this subsegment is only accepted at all if `Signature ^ Size == 0x2bed`, so a
+                // `Size` we resolved from the wrong offset cannot reach here. Clamped anyway —
+                // it may only ever shrink the region, never point the walk outside the range it
+                // was given.
                 let declared_size = usize::from(declared) * 16;
-                if declared_size != region_size {
+                if declared_size == 0 || declared_size > region_size {
+                    // Not the ordinary spare page: the subsegment is claiming no chunks at all,
+                    // or more than its range can hold. Its signature checked out, so this is
+                    // worth a line rather than a silent clamp.
                     discovery.diagnostics.push(format!(
                         "VS subsegment {address:#x} declares {declared_size:#x} of chunks where \
                          its page range leaves room for {region_size:#x}"
                     ));
+                } else {
+                    region_size = declared_size;
                 }
             }
             let descriptor_node = metadata_address + offset as u64 + tree_node_offset as u64;
@@ -2361,10 +2380,15 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
     /// committed extents are the allocator's steady state and not damage.
     ///
     /// Starting each extent at its own first sixteen-byte boundary — which is what this did — is
-    /// therefore a guess on every extent after a hole, and where glslang/win-kexp#103's 106,516
-    /// refusals came from: ~196 per extent, one per sixteen bytes, until the scan wandered onto
-    /// a word that decoded plausibly. The refusals were the harmless half. Whatever the scan
-    /// wandered onto was pushed into `spans` as an allocation, tag and all.
+    /// therefore a guess on every extent after a hole, and one of the two sources of
+    /// glslang/win-kexp#103's 106,516 refusals: one per sixteen bytes, until the scan wandered
+    /// onto a word that decoded plausibly. The refusals were the harmless half. Whatever the
+    /// scan wandered onto was pushed into `spans` as an allocation, tag and all.
+    ///
+    /// It was the smaller half. A live 26100 walk with this fixed still refused 76,398 headers,
+    /// and the rest were the *bound*: the page range holding a VS subsegment is a unit larger
+    /// than the subsegment, so the walk was decoding a page that holds no chunks. See
+    /// [`discover_segment_context`], which now sizes the region from the subsegment.
     ///
     /// The chain is what crosses the hole. A decommitted range is always the *interior* of a
     /// free chunk — the allocator has to keep its own headers readable — so the chunk before a
@@ -4446,37 +4470,91 @@ mod tests {
         }
     }
 
-    /// glslang/win-kexp#103 asked whether the bound every VS chunk is checked against —
-    /// `region.address + region.size`, from the page-range descriptor — is systematically short,
-    /// since on a live 26100 walk 106,516 refusals all failed that one check and no other.
-    /// `RtlpHpVsSubsegmentCreate` writes the same quantity into the subsegment itself as
-    /// `Size = (bytes - first) >> 4`, so the two are the same number from two sources and the
-    /// walk can say so on any target instead of anyone arguing it. Both directions, because a
-    /// check that never fires and a check that always fires read identically from a live run.
+    /// glslang/win-kexp#103, settled on a live 26100 kernel: the page range holding a VS
+    /// subsegment is **larger than the subsegment**, by one unit every time, so a walk bounded by
+    /// the descriptor decodes a page that holds no chunks and refuses a header every sixteen
+    /// bytes across it. The subsegment's own `Size` is the chunk area, and it is only reachable
+    /// through a signature check that would have rejected a misread — so it is preferred, and
+    /// clamped so it can never point the walk outside the range it was given.
     #[test]
-    fn test_a_vs_subsegment_is_measured_against_its_own_declared_size() {
-        let quiet = walk_synthetic(synthetic_memory());
+    fn test_a_vs_subsegment_is_bounded_by_its_own_declared_size() {
         let complaint = "declares";
+        let quiet = walk_synthetic(synthetic_memory());
         assert!(
             !quiet
                 .diagnostics
                 .examples()
                 .iter()
                 .any(|message| message.contains(complaint)),
-            "a subsegment whose two sizes agree draws no complaint: {:?}",
+            "a subsegment sized like the real ones draws no complaint: {:?}",
             quiet.diagnostics.examples()
         );
+        let all = vs_chunks(&quiet);
 
-        let short = walk_synthetic(synthetic_memory_declaring((0x2000 - 0xfe0) / 16 - 1));
+        // The live shape: chunks end before the range does. What sits past the declared end is
+        // not part of this subsegment and must not be decoded — which is the entire finding.
+        let bounded = walk_synthetic(synthetic_memory_declaring(8));
+        // `first` is the fixture's `_HEAP_VS_SUBSEGMENT` size rounded up, and eight units past it
+        // is where the chunk area now ends — well short of the page range, exactly as a real one
+        // does. Nothing at or beyond that address is part of this subsegment.
+        let declared_end = SEGMENT + 0x3000 + 0xfe0 + 8 * 16;
         assert!(
-            short
+            vs_chunks(&bounded) < all,
+            "bounding the subsegment has to cost the chunks past its end: {:?}",
+            bounded.diagnostics.examples()
+        );
+        assert!(
+            snapshot_vs_spans(&bounded).all(|span| span.header_address < declared_end),
+            "nothing past {declared_end:#x} may be decoded: {:?}",
+            snapshot_vs_spans(&bounded)
+                .map(|span| span.header_address)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            snapshot_vs_spans(&quiet).any(|span| span.header_address >= declared_end),
+            "and the check is only worth anything if the wider bound did reach past it"
+        );
+        assert!(
+            !bounded
                 .diagnostics
                 .examples()
                 .iter()
                 .any(|message| message.contains(complaint)),
-            "{:?}",
-            short.diagnostics.examples()
+            "and that is the ordinary shape, not something to complain about once per \
+             subsegment: {:?}",
+            bounded.diagnostics.examples()
         );
+
+        // Neither of these can be the chunk area, and both would be silent damage if clamped
+        // without a word: no chunks at all, and more than the range can hold.
+        for declared in [0, 0x200] {
+            let bogus = walk_synthetic(synthetic_memory_declaring(declared));
+            assert!(
+                bogus
+                    .diagnostics
+                    .examples()
+                    .iter()
+                    .any(|message| message.contains(complaint)),
+                "declared {declared:#x}: {:?}",
+                bogus.diagnostics.examples()
+            );
+            assert_eq!(
+                vs_chunks(&bogus),
+                all,
+                "an unusable declaration falls back to the descriptor's bound"
+            );
+        }
+    }
+
+    fn snapshot_vs_spans(snapshot: &PoolSnapshot) -> impl Iterator<Item = &PoolSpan> {
+        snapshot
+            .spans
+            .iter()
+            .filter(|span| span.backend == PoolBackend::Vs && span.state != PoolState::Unreadable)
+    }
+
+    fn vs_chunks(snapshot: &PoolSnapshot) -> usize {
+        snapshot_vs_spans(snapshot).count()
     }
 
     fn walk_synthetic(memory: SyntheticMemory) -> PoolSnapshot {
