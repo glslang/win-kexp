@@ -159,6 +159,9 @@ pub struct HeapWalkReport {
     pub diagnostic_count: usize,
     pub unreadable_gaps: usize,
     pub refused_headers: u64,
+    /// Committed VS bytes the walk declined to decode because it could not place a chunk
+    /// boundary in them; see [`crate::pool::PoolSnapshot::unplaced_bytes`].
+    pub unplaced_bytes: u64,
     pub stalls: WalkStalls,
 }
 
@@ -669,6 +672,7 @@ fn from_pool_snapshot(
             .filter(|allocation| allocation.state == HeapState::Unreadable)
             .count(),
         refused_headers: snapshot.refused_chunks,
+        unplaced_bytes: snapshot.unplaced_bytes,
         stalls: snapshot.stalls,
     };
     let diagnostics = HeapDiagnosticReport {
