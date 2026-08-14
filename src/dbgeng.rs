@@ -691,8 +691,6 @@ pub struct DebugEngine {
     /// responsible for ending it on `Drop`. False when wrapping a borrowed WinDbg
     /// client, so going out of scope can't stop the host's active session.
     owns_session: bool,
-    /// Identifies the target this engine currently holds; see [`next_target_identity`].
-    target_identity: AtomicU64,
     /// Input buffers handed to DbgEng by a *deferred* call — `CreateProcessWide`, which
     /// spawns at the next `WaitForEvent` and reads the command line then, and the kernel
     /// connection string, whose link is likewise established during the wait.
@@ -744,9 +742,7 @@ impl DebugEngine {
         // A client this new cannot be one anything holds a cached view of — whatever address
         // it landed on. Reissuing rather than adopting whatever `identity_of` found there is
         // what makes a recycled pointer harmless for the case we control.
-        engine
-            .target_identity
-            .store(reissue_identity(&engine.client), Ordering::Release);
+        reissue_identity(&engine.client);
         engine
     }
 
@@ -779,9 +775,7 @@ impl DebugEngine {
         // Adopting what `identity_of` found there would inherit a released client's identity
         // the moment the allocator reused its address.
         let engine = Self::from_client_interface(new_client);
-        engine
-            .target_identity
-            .store(reissue_identity(&engine.client), Ordering::Release);
+        reissue_identity(&engine.client);
         engine
     }
 
@@ -798,12 +792,6 @@ impl DebugEngine {
             .cast::<IDebugSymbols3>()
             .expect("[-] Failed to get debug symbols interface");
 
-        // Looked up by client rather than counted per wrapper: a borrowed engine is wrapped
-        // afresh per extension command, so a per-wrapper counter would miss the caches every
-        // time — while a shared constant would collide across two programmatic hosts holding
-        // unrelated targets that happen to share a kernel base. See `client_identities` for
-        // why this is a registry and not the client pointer it used to be.
-        let identity = identity_of(&client);
         Self {
             client,
             control,
@@ -812,7 +800,6 @@ impl DebugEngine {
             // Default to "borrowed": constructors that wrap an existing WinDbg client
             // go through here, and only `new()` (which calls `DebugCreate`) sets this.
             owns_session: false,
-            target_identity: AtomicU64::new(identity),
             deferred_inputs: Mutex::new(Vec::new()),
             interrupt_raised: Arc::new(AtomicBool::new(false)),
         }
@@ -838,14 +825,12 @@ impl DebugEngine {
                 operation: "querying IDebugSymbols3".into(),
                 source,
             })?;
-        let identity = identity_of(&client);
         Ok(Self {
             client,
             control,
             dataspaces,
             symbols,
             owns_session: false,
-            target_identity: AtomicU64::new(identity),
             deferred_inputs: Mutex::new(Vec::new()),
             interrupt_raised: Arc::new(AtomicBool::new(false)),
         })
@@ -869,12 +854,24 @@ impl DebugEngine {
     /// keyed on it cannot serve data gathered from a previous target. The kernel base is
     /// not sufficient on its own: two dumps from the same boot share it.
     ///
-    /// Held against the *client* rather than in this wrapper — see [`client_identities`] — so
-    /// that a host which rebuilds its engine around one client, as a WinDbg extension does per
-    /// command, both keeps its caches and cannot lose a release that happened in an earlier
-    /// wrapper.
+    /// Read from the registry keyed on this engine's *client* — see [`client_identities`] —
+    /// rather than from a copy taken when this wrapper was built. Two things follow, and both
+    /// are the point:
+    ///
+    /// - a host that rebuilds its engine around one client, as a WinDbg extension does per
+    ///   command, keeps its caches across the rebuild *and* cannot lose a release an earlier
+    ///   wrapper performed;
+    /// - two wrappers coexisting around one client agree. A copy in each would not: an
+    ///   `end_session` through one would move that one and the registry, leaving the other
+    ///   answering with an identity whose target is gone, and a cache keyed on it would be
+    ///   served for whatever was opened next.
+    ///
+    /// A client whose entry was dropped to keep the registry bounded is issued a later
+    /// identity here, never an earlier one. That costs a re-walk, and — in the one case that
+    /// compares two reads, [`Self::set_scope`] — a restore refused rather than a restore onto
+    /// the wrong target. Both are the safe direction.
     pub fn target_identity(&self) -> u64 {
-        self.target_identity.load(Ordering::Acquire)
+        identity_of(&self.client)
     }
 
     pub fn read_memory(&self, address: u64, size: usize) -> Result<Vec<u8>, DbgEngError> {
@@ -2594,11 +2591,9 @@ impl DebugEngine {
     /// reused for another target.
     pub fn end_session(&self) -> Result<(), DbgEngError> {
         // The target is going away, so anything cached against it must not be reused for
-        // whatever this engine holds next — nor by the next wrapper built around this same
-        // client, which is why the new identity is recorded against the client and not only
-        // in this engine's own field.
-        self.target_identity
-            .store(reissue_identity(&self.client), Ordering::Release);
+        // whatever this engine holds next — nor by any other wrapper around this same client,
+        // which is why the identity is recorded against the client rather than in this engine.
+        reissue_identity(&self.client);
         // A live kernel left halted (at a break) and detached *passively* stays FROZEN —
         // one CPU halted, the rest spinning — because a passive detach never tells the
         // target to run. Resume it and actively detach instead, leaving it running.
@@ -3165,6 +3160,41 @@ mod tests {
         println!("Debug engine created successfully");
 
         // DebugEngine's Drop impl will handle cleanup and detach
+    }
+
+    /// The half of glslang/win-kexp#82 that a registry alone does not close, and the reason the
+    /// identity is not a field: two wrappers can be live around one client at once.
+    ///
+    /// With a copy in each, an `end_session` through one moves that one and the registry and
+    /// leaves the other answering with an identity whose target is gone — so a snapshot or
+    /// layout cached against it is served for whatever is opened next, which is the same stale
+    /// read the issue was about arriving through a second wrapper instead of a later one.
+    #[cfg(not(miri))]
+    #[test]
+    fn test_every_live_wrapper_sees_a_release_through_any_of_them() {
+        // Serialized like every other engine test: this one's `Drop` ends the process-wide
+        // debuggee session.
+        let _debuggee = one_debuggee();
+        let owner = DebugEngine::new();
+        // A second wrapper around the *same* client, which is what an extension builds per
+        // command. `clone` bumps the COM refcount and keeps the pointer, so both agree.
+        let borrowed = DebugEngine::from_client_interface(owner.client.clone());
+        let before = owner.target_identity();
+        assert_eq!(borrowed.target_identity(), before);
+
+        // There is no target to end, so the call itself fails. The identity moves before it
+        // tries, which is the half this is about.
+        let _ = owner.end_session();
+        assert_ne!(
+            owner.target_identity(),
+            before,
+            "a release moves the identity"
+        );
+        assert_eq!(
+            borrowed.target_identity(),
+            owner.target_identity(),
+            "a wrapper that did not perform the release still has to observe it"
+        );
     }
 
     /// Reads a debugger pseudo-register (`$t0`, …) as a number, via `? <expr>` — whose output
