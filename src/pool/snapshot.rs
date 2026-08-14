@@ -2020,6 +2020,29 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 if valid_base >= requested_end {
                     break;
                 }
+                // The same answer in the engine's other encoding, and the same response. A query
+                // that finds nothing valid in the span it was given may say so either by naming a
+                // base past the end — handled just above — or by answering `0x0+0x0`, which is
+                // not a region at zero but the absence of one. Either way the engine has already
+                // reported on every byte from here to `requested_end`, so stepping a page and
+                // asking again asks a question that has been answered.
+                //
+                // Measured on live 26100 (glslang/win-kexp#104): every stall sample carried
+                // `0x0+0x0`, eight of them consecutive — one dead region stepping itself into the
+                // give-up bound, eight KD round trips to learn what the first answer said. Across
+                // the walk that was ~1,100 stalled pages, and `recovered_bytes` was zero on four
+                // separate runs, which is what this predicts and what it costs nothing to keep
+                // reporting.
+                //
+                // Quiet, like its sibling above and for the same reason: a region running out of
+                // readable content is not a fault, and #94 was raised because saying so 3,285
+                // times drowned out the diagnostics that meant something. The bytes are still
+                // filed as unreadable and `complete` still clears — the tail has not been walked,
+                // and nothing here claims otherwise.
+                if reported_base == 0 && reported_size == 0 {
+                    self.unreadable(region, valid_base, requested_end - valid_base, snapshot);
+                    break;
+                }
                 // The rest is a real stall: a valid region was reported inside the span and it
                 // ends at or before where the cursor already is. Step over the page it stalled
                 // on and ask again, rather than giving up on every committed page behind it —
@@ -3453,6 +3476,11 @@ mod tests {
         bytes: Vec<u8>,
         holes: HashSet<u64>,
         stalls: HashSet<u64>,
+        /// Pages where the query answers `0x0+0x0` — the engine's way of saying it found
+        /// nothing valid in the whole span, as opposed to `stalls`, which model it finding
+        /// something and failing to size it. The two look alike at the call site and mean
+        /// opposite things about what lies behind them.
+        blind: HashSet<u64>,
         queries: Cell<usize>,
     }
 
@@ -3463,6 +3491,7 @@ mod tests {
                 bytes,
                 holes: HashSet::new(),
                 stalls: HashSet::new(),
+                blind: HashSet::new(),
                 queries: Cell::new(0),
             }
         }
@@ -3476,6 +3505,7 @@ mod tests {
                 && page < self.end()
                 && !self.holes.contains(&page)
                 && !self.stalls.contains(&page)
+                && !self.blind.contains(&page)
         }
     }
 
@@ -3493,6 +3523,9 @@ mod tests {
         fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError> {
             self.queries.set(self.queries.get() + 1);
             let page = address & !(PAGE_SIZE - 1);
+            if self.blind.contains(&page) {
+                return Ok((0, 0));
+            }
             if self.stalls.contains(&page) {
                 return Ok((address, 0));
             }
@@ -3745,6 +3778,66 @@ mod tests {
                 .any(|message| message.contains("does not begin on a chunk boundary")),
             "{:?}",
             snapshot.diagnostics.examples()
+        );
+    }
+
+    /// glslang/win-kexp#104, settled on live 26100: every stall the walk met answered `0x0+0x0`,
+    /// and the eight verbatim samples were eight *consecutive* pages — one dead region stepping
+    /// itself into the give-up bound, paying eight KD round trips to be told eight times what the
+    /// first answer already said. `0x0+0x0` is not a region at zero; it is the engine reporting
+    /// nothing valid in the span it was asked about, which is a statement about every byte
+    /// through to the end of it.
+    ///
+    /// So it ends the region, exactly like the sibling answer that names a base past the end.
+    /// The distinction that matters is with [`Self::test_a_stalled_query_costs_a_page_not_the_region`]:
+    /// a query that reports a region and cannot size it has said nothing about what lies behind
+    /// it, and there the page step stays.
+    #[test]
+    fn test_a_query_that_finds_nothing_ends_the_region_rather_than_stepping() {
+        let mut memory = HoleyMemory::new(SPECIAL_PAGE, special_pages(8));
+        for page in 4..8 {
+            memory.blind.insert(SPECIAL_PAGE + page * PAGE_SIZE);
+        }
+        let snapshot = walk_holey(&memory, &special_region(SPECIAL_PAGE, 8));
+
+        assert_eq!(
+            memory.queries.get(),
+            2,
+            "one query to walk the committed run, one to be told nothing follows it — a page \
+             step would have cost four more and learnt nothing"
+        );
+        assert_eq!(
+            snapshot.stalls,
+            WalkStalls::default(),
+            "nothing was stepped over, so nothing is billed as stepped over"
+        );
+        assert!(
+            !snapshot
+                .diagnostics
+                .examples()
+                .iter()
+                .any(|message| message.contains("made no progress")),
+            "a region running out of readable content is not a fault: {:?}",
+            snapshot.diagnostics.examples()
+        );
+        // Still accounted for, and still incomplete: those pages were not walked, and the walk
+        // says so rather than reporting the region as fully covered.
+        assert!(!snapshot.complete);
+        let unreadable: u64 = snapshot
+            .spans
+            .iter()
+            .filter(|span| span.state == PoolState::Unreadable)
+            .map(|span| span.size)
+            .sum();
+        assert_eq!(unreadable, 4 * PAGE_SIZE);
+        let allocated = snapshot
+            .spans
+            .iter()
+            .filter(|span| span.state == PoolState::Allocated)
+            .count();
+        assert_eq!(
+            allocated, 4,
+            "the readable pages in front of it are still walked"
         );
     }
 
