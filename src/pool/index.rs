@@ -39,6 +39,8 @@ pub(crate) struct PoolIndex {
     pub stalls: WalkStalls,
     /// Carried through from [`PoolSnapshot::refused_chunks`].
     pub refused_chunks: u64,
+    /// Carried through from [`PoolSnapshot::unplaced_bytes`].
+    pub unplaced_bytes: u64,
     row_postings: HashMap<RowIdentity, Vec<usize>>,
     span_rows: Vec<RowIdentity>,
 }
@@ -91,6 +93,7 @@ impl PoolIndex {
             budget_expired: snapshot.budget_expired,
             stalls: snapshot.stalls,
             refused_chunks: snapshot.refused_chunks,
+            unplaced_bytes: snapshot.unplaced_bytes,
             row_postings,
             span_rows,
         }

@@ -241,6 +241,9 @@ pub struct PoolSnapshotReport {
     /// Chunk headers the walk refused and resynchronised past; see
     /// [`crate::pool::PoolSnapshot::refused_chunks`] for why this is not read off a diagnostic.
     pub refused_chunks: u64,
+    /// Committed VS bytes the walk declined to decode because it could not place a chunk
+    /// boundary in them; see [`crate::pool::PoolSnapshot::unplaced_bytes`].
+    pub unplaced_bytes: u64,
 }
 
 /// How much of the pool a walk covered.
@@ -319,6 +322,7 @@ fn report_of(index: &PoolIndex) -> PoolSnapshotReport {
         diagnostics: index.diagnostics.clone(),
         stalls: index.stalls,
         refused_chunks: index.refused_chunks,
+        unplaced_bytes: index.unplaced_bytes,
     }
 }
 
