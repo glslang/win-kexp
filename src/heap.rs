@@ -209,6 +209,8 @@ pub enum HeapQueryError {
     UnsupportedArchitecture { machine: u32 },
     #[error("invalid PEB heap metadata: {0}")]
     InvalidPeb(String),
+    #[error("heap selector {heap:#x} is not a supported Segment Heap root in the current PEB")]
+    UnsupportedHeap { heap: u64 },
     #[error(
         "missing or unsupported ntdll allocator layout ({0}); run `.reload /f ntdll.dll` and retry"
     )]
@@ -611,14 +613,24 @@ fn scope_of(roots: &[HeapRoot]) -> HeapScope {
     scope
 }
 
-fn scope_for(roots: &[HeapRoot], heap: Option<u64>) -> HeapScope {
+fn scope_for(
+    roots: &[HeapRoot],
+    heap: Option<u64>,
+    enumeration_complete: bool,
+) -> Result<HeapScope, HeapQueryError> {
     let mut scope = scope_of(roots);
     if let Some(heap) = heap {
+        let selected = roots.iter().find(|root| root.address == heap);
+        if selected.is_some_and(|root| root.kind != HeapKind::Segment)
+            || (selected.is_none() && enumeration_complete)
+        {
+            return Err(HeapQueryError::UnsupportedHeap { heap });
+        }
         // Diagnostic shapes deliberately generalise addresses. Narrow the roots handed to the
         // walker so complaints from another heap never enter this snapshot's aggregation.
         scope.segment_heaps_walked.retain(|root| *root == heap);
     }
-    scope
+    Ok(scope)
 }
 
 fn from_pool_snapshot(
@@ -766,7 +778,7 @@ fn walk_snapshot(
         total,
         budget_expired,
     } = enumerate_roots(engine, &schema.layout, target.peb, deadline)?;
-    let mut scope = scope_for(&roots, heap);
+    let mut scope = scope_for(&roots, heap, !budget_expired)?;
     let pool = if budget_expired {
         // These roots were identified but no allocator region was walked after the deadline.
         scope.segment_heaps_walked.clear();
@@ -1120,9 +1132,43 @@ mod tests {
                 reason: None,
             },
         ];
-        let scope = scope_for(&roots, Some(0x20000));
+        let scope = scope_for(&roots, Some(0x20000), true).unwrap();
 
         assert_eq!(scope.segment_heaps_walked, vec![0x20000]);
+    }
+
+    #[test]
+    fn test_scoped_diagnostics_reject_unsupported_or_missing_heap() {
+        let roots = vec![
+            HeapRoot {
+                index: 0,
+                address: 0x10000,
+                kind: HeapKind::Nt,
+                supported: false,
+                reason: Some("classic".into()),
+            },
+            HeapRoot {
+                index: 1,
+                address: 0x20000,
+                kind: HeapKind::Unreadable,
+                supported: false,
+                reason: Some("unreadable".into()),
+            },
+        ];
+
+        for heap in [0x10000, 0x20000, 0x30000] {
+            assert!(matches!(
+                scope_for(&roots, Some(heap), true),
+                Err(HeapQueryError::UnsupportedHeap { heap: rejected }) if rejected == heap
+            ));
+        }
+    }
+
+    #[test]
+    fn test_scoped_diagnostics_leave_unseen_heap_unknown_when_enumeration_expires() {
+        let scope = scope_for(&[], Some(0x30000), false).unwrap();
+
+        assert!(scope.segment_heaps_walked.is_empty());
     }
 
     #[test]
