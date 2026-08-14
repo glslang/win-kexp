@@ -381,11 +381,74 @@ fn read_root_signatures(
     (decode(segment_offset), decode(nt_offset))
 }
 
+struct RootEnumeration {
+    roots: Vec<HeapRoot>,
+    total: Option<usize>,
+    budget_expired: bool,
+}
+
+impl RootEnumeration {
+    fn expired(roots: Vec<HeapRoot>, total: Option<usize>) -> Self {
+        Self {
+            roots,
+            total,
+            budget_expired: true,
+        }
+    }
+
+    fn complete(roots: Vec<HeapRoot>, total: usize) -> Self {
+        Self {
+            roots,
+            total: Some(total),
+            budget_expired: false,
+        }
+    }
+}
+
+fn root_read_budget_expired(
+    engine: &DebugEngine,
+    deadline: Option<Instant>,
+) -> Result<bool, HeapQueryError> {
+    if engine.interrupted()? {
+        return Err(HeapQueryError::Interrupted);
+    }
+    Ok(deadline.is_some_and(|deadline| Instant::now() >= deadline))
+}
+
+fn truncated_root_snapshot(
+    classified: usize,
+    total: Option<usize>,
+    budget: Option<Duration>,
+) -> PoolSnapshot {
+    let mut snapshot = PoolSnapshot {
+        complete: false,
+        budget_expired: true,
+        ..PoolSnapshot::default()
+    };
+    let allowed = budget.map_or_else(
+        || "walk budget".into(),
+        |budget| format!("{budget:?} budget"),
+    );
+    let coverage = total.map_or_else(
+        || format!("{classified} roots classified before the PEB heap count was read"),
+        |total| format!("{classified} of {total} PEB heap roots classified"),
+    );
+    snapshot.diagnostics.push(format!(
+        "the walk ran out of its {allowed} while enumerating heap roots: {coverage}; what is \
+         missing is unknown, not absent"
+    ));
+    snapshot
+}
+
 fn enumerate_roots(
     engine: &DebugEngine,
     layout: &PoolLayout,
     peb: u64,
-) -> Result<Vec<HeapRoot>, HeapQueryError> {
+    deadline: Option<Instant>,
+) -> Result<RootEnumeration, HeapQueryError> {
+    if root_read_budget_expired(engine, deadline)? {
+        return Ok(RootEnumeration::expired(Vec::new(), None));
+    }
     let count = read_u32(
         engine,
         peb + layout
@@ -396,6 +459,9 @@ fn enumerate_roots(
         return Err(HeapQueryError::InvalidPeb(format!(
             "NumberOfHeaps is {count}, maximum is {MAX_PROCESS_HEAPS}"
         )));
+    }
+    if root_read_budget_expired(engine, deadline)? {
+        return Ok(RootEnumeration::expired(Vec::new(), Some(count)));
     }
     let array = read_u64(
         engine,
@@ -409,12 +475,15 @@ fn enumerate_roots(
         ));
     }
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok(RootEnumeration::complete(Vec::new(), 0));
     }
     if !user_pointer(array) {
         return Err(HeapQueryError::InvalidPeb(format!(
             "ProcessHeaps {array:#x} is outside the x64 user address range"
         )));
+    }
+    if root_read_budget_expired(engine, deadline)? {
+        return Ok(RootEnumeration::expired(Vec::new(), Some(count)));
     }
     let bytes = engine.read_memory(array, count.saturating_mul(8))?;
     let segment_offset = layout
@@ -451,6 +520,9 @@ fn enumerate_roots(
             });
             continue;
         }
+        if root_read_budget_expired(engine, deadline)? {
+            return Ok(RootEnumeration::expired(roots, Some(count)));
+        }
         let (segment, nt) = read_root_signatures(engine, address, segment_offset, nt_offset);
         let (kind, reason) = classify_root(segment, nt);
         roots.push(HeapRoot {
@@ -461,7 +533,7 @@ fn enumerate_roots(
             reason,
         });
     }
-    Ok(roots)
+    Ok(RootEnumeration::complete(roots, count))
 }
 
 fn scope_of(roots: &[HeapRoot]) -> HeapScope {
@@ -603,23 +675,37 @@ fn walk_snapshot(
         return Ok(snapshot);
     }
 
-    let roots = enumerate_roots(engine, &schema.layout, target.peb)?;
-    let scope = scope_of(&roots);
-    let remaining = walk
-        .budget
-        .map(|budget| budget.saturating_sub(started.elapsed()));
-    let pool = walk_user_segment_heaps(
-        engine,
-        &schema.layout,
-        target.peb,
-        &scope.segment_heaps_walked,
-        remaining,
-        1_000_000,
-    )
-    .map_err(|error| match error {
-        SnapshotError::Interrupted => HeapQueryError::Interrupted,
-        other => HeapQueryError::Walk(other.to_string()),
-    })?;
+    // The absolute deadline keeps schema resolution and PEB enumeration inside the caller's
+    // one budget. An unrepresentably large duration has the same unbounded meaning as the
+    // shared walker gives it.
+    let deadline = walk.budget.and_then(|budget| started.checked_add(budget));
+    let RootEnumeration {
+        roots,
+        total,
+        budget_expired,
+    } = enumerate_roots(engine, &schema.layout, target.peb, deadline)?;
+    let mut scope = scope_of(&roots);
+    let pool = if budget_expired {
+        // These roots were identified but no allocator region was walked after the deadline.
+        scope.segment_heaps_walked.clear();
+        truncated_root_snapshot(roots.len(), total, walk.budget)
+    } else {
+        let remaining = walk
+            .budget
+            .map(|budget| budget.saturating_sub(started.elapsed()));
+        walk_user_segment_heaps(
+            engine,
+            &schema.layout,
+            target.peb,
+            &scope.segment_heaps_walked,
+            remaining,
+            1_000_000,
+        )
+        .map_err(|error| match error {
+            SnapshotError::Interrupted => HeapQueryError::Interrupted,
+            other => HeapQueryError::Walk(other.to_string()),
+        })?
+    };
     let (allocations, report, diagnostics) = from_pool_snapshot(pool);
     let snapshot = HeapSnapshot {
         roots,
@@ -864,6 +950,20 @@ mod tests {
         assert_eq!(scope.nt_heaps_skipped, vec![2]);
         assert_eq!(scope.unknown_heaps_skipped, vec![3]);
         assert_eq!(scope.unreadable_heaps_skipped, vec![4]);
+    }
+
+    #[test]
+    fn test_root_enumeration_deadline_reports_partial_coverage() {
+        let snapshot = truncated_root_snapshot(3, Some(12), Some(Duration::from_secs(2)));
+        let (allocations, walk, diagnostics) = from_pool_snapshot(snapshot);
+
+        assert!(allocations.is_empty());
+        assert_eq!(walk.coverage, WalkCoverage::BudgetExpired);
+        assert_eq!(walk.diagnostic_count, 1);
+        assert_eq!(diagnostics.examples.len(), 1);
+        assert!(diagnostics.examples[0].contains("2s budget"));
+        assert!(diagnostics.examples[0].contains("3 of 12 PEB heap roots classified"));
+        assert!(diagnostics.examples[0].contains("unknown, not absent"));
     }
 
     #[test]
