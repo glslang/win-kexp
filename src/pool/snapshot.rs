@@ -2413,11 +2413,20 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
     /// than the subsegment, so the walk was decoding a page that holds no chunks. See
     /// [`discover_segment_context`], which now sizes the region from the subsegment.
     ///
-    /// The chain is what crosses the hole. A decommitted range is always the *interior* of a
-    /// free chunk — the allocator has to keep its own headers readable — so the chunk before a
-    /// hole records a size that reaches past it and the next header lands in the next committed
-    /// extent, at an address this walk already knows. `expected` carries that address between
-    /// extents. `None` means the walk lost it, and a walk that has lost it does not guess again.
+    /// The chain is what crosses the hole. The chunk before one records a size that reaches past
+    /// it and so names the header on the far side, at an address this walk already knows.
+    /// `expected` carries that address between extents. `None` means the walk lost it, and a walk
+    /// that has lost it does not guess again.
+    ///
+    /// It can lose it, and the reason is worth knowing before reading `unplaced_bytes` as damage.
+    /// A *decommitted* range is the interior of a free chunk — the allocator has to keep its own
+    /// headers reachable — so the chain crosses those. But a hole here is not only decommitted
+    /// memory: on paged pool it is also memory that is committed and **paged out**, and nothing
+    /// stops a chunk header being in it. Every unreadable header on a live 26100 walk was exactly
+    /// that — `!pte` on each named address gave a pagefile PTE, `Protect: 4 - ReadWrite`, not a
+    /// zero one — and a KD link cannot fault a page in. So those bytes are unreachable from a
+    /// live target rather than absent from the pool, and the walk reports them instead of
+    /// inventing chunks in them.
     ///
     /// A refused header costs more than itself: the walk no longer knows where the next one
     /// starts, so it advances sixteen bytes and tries again, and every header after it in the
@@ -2442,10 +2451,22 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             // these bytes can be placed. Sized and not merely counted, because what this costs
             // is coverage — and the alternative, decoding from a guess, costs correctness.
             snapshot.unplaced_bytes = snapshot.unplaced_bytes.saturating_add(bytes.len() as u64);
-            snapshot.diagnostics.push(format!(
-                "VS extent at {base:#x} does not begin on a chunk boundary; {:#x} bytes not decoded",
-                bytes.len()
-            ));
+            // Two causes, kept as two shapes so a walk says which — `PoolDiagnostics` folds
+            // numbers but not words, so this is the only way the split survives to a live run.
+            snapshot.diagnostics.push(match expected {
+                Some(next) => format!(
+                    "VS extent at {base:#x} does not begin on a chunk boundary: the chunk chain \
+                     names {next:#x}, {:#x} bytes back inside unreadable memory; {:#x} bytes not \
+                     decoded",
+                    base - next,
+                    bytes.len()
+                ),
+                None => format!(
+                    "VS extent at {base:#x} cannot be placed: the chain was already lost earlier \
+                     in this region; {:#x} bytes not decoded",
+                    bytes.len()
+                ),
+            });
             snapshot.complete = false;
             return None;
         };
