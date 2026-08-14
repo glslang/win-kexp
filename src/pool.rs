@@ -87,6 +87,15 @@ impl PoolSpan {
         address >= self.header_address && address < self.end()
     }
 
+    /// A span with **synthetic geometry**: `header_address == usable_address`, which no walker
+    /// ever emits — `walk_lfh`, `walk_vs` and `walk_page_ranges` all put the usable bytes a
+    /// pool header past the header.
+    ///
+    /// Fine for tests about tags, filters and identity. Not fine for a test about *geometry*,
+    /// and this has now hidden two bugs in `chunk_at`'s contiguity check by being the only
+    /// thing that satisfied it (glslang/win-kexp#85, then the gate that replaced it). Build a
+    /// backend-shaped span by hand for those, as `query`'s `lfh_allocation` and `vs_allocation`
+    /// do.
     #[cfg(test)]
     pub(crate) fn allocation(
         address: u64,

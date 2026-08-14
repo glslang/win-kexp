@@ -22,7 +22,7 @@ use super::decode::parse_tag;
 use super::index::{PoolIndex, SnapshotCache};
 use super::layout::{LayoutCache, SessionKey};
 use super::snapshot::{SnapshotError, SnapshotWalker, WalkStalls};
-use super::{PoolDiagnostics, PoolSpan, PoolState};
+use super::{PoolBackend, PoolDiagnostics, PoolSpan, PoolState};
 use crate::dbgeng::{DbgEngError, DebugEngine};
 
 const IMAGE_FILE_MACHINE_AMD64: u32 = 0x8664;
@@ -435,16 +435,20 @@ fn neighbourhood_at(index: &PoolIndex, address: u64) -> Option<PoolNeighbourhood
     // the identity check with a gap between them. Reporting those as bordering would
     // misstate the very geometry this API exists to describe.
     let chunk = index.spans[position].clone();
-    // Contiguity is only meaningful where `end()` and the next span's `header_address`
-    // measure the same boundary. LFH and Segment spans report `header_address ==
-    // usable_address`, so they do. A VS span carries a chunk header between the two, so the
-    // comparison is off by its width and would reject *every* genuine VS neighbour. The gap
-    // this guards against — a slot the allocator skipped because it would straddle a page —
-    // only arises in LFH, so restricting the check there loses nothing.
+    // Contiguity compares one span's end with the next one's start. `end()` is the raw chunk
+    // end for every backend, and `header_address` is the raw chunk *start* for every backend
+    // but VS, where the chunk header sits in front of the pool header this records. Comparing
+    // across that offset would reject every genuine VS neighbour, so VS is exempt and LFH —
+    // the only backend where the allocator leaves slack — keeps the check.
+    //
+    // Exempting it by backend, and not by testing `header_address == usable_address` as this
+    // did: no walker emits a span where those are equal. `walk_lfh` and `walk_page_ranges` put
+    // the usable bytes a pool header past the header exactly as `walk_vs` does, so that test
+    // was false for every real span and the check it gated never ran outside the fixtures.
+    // Only the `#[cfg(test)]` `PoolSpan::allocation` builds spans it held for.
     let touching = |left: &PoolSpan, right: &PoolSpan| {
-        let comparable = left.header_address == left.usable_address
-            && right.header_address == right.usable_address;
-        !comparable || left.end() == right.header_address
+        // `predecessor`/`successor` pair spans from one backend, so testing either is both.
+        left.backend == PoolBackend::Vs || left.end() == right.header_address
     };
     Some(PoolNeighbourhood {
         previous: index
@@ -515,7 +519,7 @@ fn summarize_tags(index: &PoolIndex) -> Vec<PoolTagSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pool::{HeapIdentity, PoolBackend, PoolKind};
+    use crate::pool::{HeapIdentity, PoolKind};
 
     fn heap(id: u64) -> HeapIdentity {
         HeapIdentity {
@@ -684,15 +688,43 @@ mod tests {
         assert_eq!(found.next.unwrap().display_tag, "Cccc");
     }
 
+    /// An LFH block as `walk_lfh` reports one: the slot start is the header, and the usable
+    /// bytes begin a pool header past it. `PoolSpan::allocation` puts both at the same
+    /// address, which no walker ever does.
+    fn lfh_allocation(slot: u64, unit: u64, tag: &[u8; 4], heap_id: u64) -> PoolSpan {
+        const POOL_HEADER: u64 = 0x10;
+        let raw_tag = u32::from_le_bytes(*tag);
+        PoolSpan {
+            header_address: slot,
+            usable_address: slot + POOL_HEADER,
+            size: unit - POOL_HEADER,
+            raw_tag,
+            display_tag: crate::pool::decode::display_tag(raw_tag),
+            pool_kind: PoolKind::NonPagedNx,
+            numa_node: 0,
+            heap: heap(heap_id),
+            subsegment: Some(0x8000),
+            backend: PoolBackend::Lfh,
+            state: PoolState::Allocated,
+            size_class: unit as u32,
+        }
+    }
+
     /// Allocator slack separates these two: `walk_lfh` omits a slot that would straddle a
     /// page, so spans can share every allocator identity and still not touch. Reporting
     /// them as bordering would misstate the grooming geometry this API exists to describe.
+    ///
+    /// With **real** LFH geometry, which is the whole point. Gating the check on
+    /// `header_address == usable_address` — as it was — turned it off for every span a walker
+    /// emits, since all of them put the usable bytes a pool header past the header. The
+    /// fixture was the only thing that ever satisfied the gate, so the check passed its test
+    /// and did nothing on a target.
     #[test]
     fn test_neighbours_must_actually_touch() {
         let index = index_of(vec![
-            allocation(0x1000, 0x100, b"Aaaa", PoolKind::NonPagedNx, 1),
-            // 0x1100..0x1200 is slack the allocator skipped.
-            allocation(0x1200, 0x100, b"Bbbb", PoolKind::NonPagedNx, 1),
+            lfh_allocation(0x1000, 0x100, b"Aaaa", 1),
+            // 0x1100..0x1200 is the slot the allocator skipped.
+            lfh_allocation(0x1200, 0x100, b"Bbbb", 1),
         ]);
         let found = neighbourhood_at(&index, 0x1250).expect("address is covered");
         assert_eq!(found.chunk.display_tag, "Bbbb");
@@ -700,6 +732,15 @@ mod tests {
             found.previous.is_none(),
             "slack between spans must not count as bordering"
         );
+
+        // And the check has to stay off the other foot: two LFH slots that really do abut are
+        // neighbours, or the fix for the above is just the VS bug moved one backend over.
+        let index = index_of(vec![
+            lfh_allocation(0x1000, 0x100, b"Aaaa", 1),
+            lfh_allocation(0x1100, 0x100, b"Bbbb", 1),
+        ]);
+        let found = neighbourhood_at(&index, 0x1150).expect("address is covered");
+        assert_eq!(found.previous.unwrap().display_tag, "Aaaa");
     }
 
     #[test]
