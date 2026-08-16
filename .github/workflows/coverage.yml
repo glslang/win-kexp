@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: microsoft/setup-msbuild@v3
-      - uses: glslang/setup-masm@v1
+      - uses: glslang/setup-masm@v1.4
 
       - name: Install Rust
         run: rustup update stable && rustup default stable

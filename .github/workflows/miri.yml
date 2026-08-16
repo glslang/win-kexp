@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: microsoft/setup-msbuild@v3
-      - uses: glslang/setup-masm@v1.2
+      - uses: glslang/setup-masm@v1.4
         with:
           vs-architecture: x64
       - name: Install nightly Rust with Miri

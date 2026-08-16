@@ -7,7 +7,13 @@ updates:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 5
-    reviewers:
+    # Cargo.lock is gitignored (library convention), so Dependabot can only edit
+    # the requirement in Cargo.toml. The default `auto` strategy resolves to
+    # `widen` for libraries, which is a no-op whenever the existing caret range
+    # already admits the new release -- so patch bumps never raise a PR.
+    # `increase` moves the floor to match each new release instead.
+    versioning-strategy: increase
+    assignees:
       - "glslang"
     labels:
       - "dependencies"
@@ -23,7 +29,7 @@ updates:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 3
-    reviewers:
+    assignees:
       - "glslang"
     labels:
       - "dependencies"
