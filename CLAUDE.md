@@ -97,7 +97,7 @@ When touching this module, mind the `owns_session` invariant, the stdout-isolati
 - Custom error types use `thiserror`; prefer `Result`/`Option` over panics in library code
 - Windows API via the `windows` crate (currently `0.62.2`); add required feature flags in `Cargo.toml` under `[dependencies.windows]`
 - `unsafe` is expected at Windows FFI boundaries; keep unsafe blocks minimal and localized
-- Key dependencies: `windows`/`windows-core`/`windows-strings` (FFI), `goblin` (COFF/PE parsing), `thiserror` (errors), `byte-strings` (NUL-terminated literals), `hex`
+- Key dependencies: `windows`/`windows-core` (FFI), `goblin` (COFF/PE parsing), `thiserror` (errors), `byte-strings` (NUL-terminated literals), `hex`
 
 ### Git Commit Prefixes
 
@@ -110,7 +110,7 @@ Three workflows run on **Windows runners only**:
 - **coverage.yml**: grcov + LLVM instrumentation → Codecov upload
 - **miri.yml**: `cargo miri nextest run` on nightly with `MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"`, plus a `cargo miri test --doc` step for the doctests nextest cannot run
 
-CI installs MASM/ARMASM tooling via `glslang/setup-masm` (`ci.yml` uses `@v1.4`, `coverage.yml` uses `@v1`, `miri.yml` uses `@v1.2`), so assemblers are always available there. Local builds without assemblers silently activate `shellcode_fallback`.
+CI installs MASM/ARMASM tooling via `glslang/setup-masm@v1.4` in all three workflows, so assemblers are always available there. Local builds without assemblers silently activate `shellcode_fallback`.
 
 ## Related Docs
 
