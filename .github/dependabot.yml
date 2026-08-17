@@ -7,12 +7,36 @@ updates:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 5
-    # Cargo.lock is gitignored (library convention), so Dependabot can only edit
-    # the requirement in Cargo.toml. The default `auto` strategy resolves to
-    # `widen` for libraries, which is a no-op whenever the existing caret range
-    # already admits the new release -- so patch bumps never raise a PR.
-    # `increase` moves the floor to match each new release instead.
-    versioning-strategy: increase
+    # No `versioning-strategy` here on purpose. Cargo accepts only `auto` and
+    # `lockfile-only`; `increase` is rejected by Dependabot's schema, and a
+    # rejected value invalidates the entire file -- so setting it stopped
+    # Dependabot for the github-actions block below too, not just for this one.
+    #
+    # Unset means `auto`, which is what we want now that Cargo.lock is tracked:
+    # a patch release inside the existing caret range shows up as a lockfile
+    # update and raises a PR, and a release outside it also widens Cargo.toml.
+    # While the lockfile was gitignored neither happened, since widening a range
+    # that already admits the new version is a no-op.
+    groups:
+      # `windows` and `windows-core` are both direct dependencies, and `windows`
+      # vendors its own copy of `windows-core`. Bump one alone and Cargo resolves
+      # two incompatible copies: `win32k.rs` names `windows_core::Error` from the
+      # direct dependency while `dbgeng.rs` names `windows::core::Error` from the
+      # one `windows` pulled in, and those stop being the same type. The pattern
+      # also covers any further `windows-*` crate promoted to a direct dependency.
+      windows:
+        patterns:
+          - "windows"
+          - "windows-*"
+      # Everything else in one PR too. Each PR fans out to four workflows, one
+      # of which is a ~10 minute Miri run, and a weekly patch sweep across four
+      # crates has no reason to pay that four times.
+      cargo:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "windows"
+          - "windows-*"
     assignees:
       - "glslang"
     labels:
@@ -29,6 +53,10 @@ updates:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns:
+          - "*"
     assignees:
       - "glslang"
     labels:
