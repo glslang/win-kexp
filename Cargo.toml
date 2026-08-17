@@ -15,7 +15,6 @@ goblin = "0.10.5"
 hex = "0.4.3"
 thiserror = "2.0.18"
 windows-core = "0.62.2"
-windows-strings = "0.5.1"
 
 [dependencies.windows]
 version = "0.62.2"
