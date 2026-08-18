@@ -18,15 +18,16 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_MODNAME_SYMBOL_FILE, DEBUG_MODULE_PARAMETERS, DEBUG_MODULE_USER_MODE,
     DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL, DEBUG_REGISTER_DESCRIPTION,
     DEBUG_REGISTER_SUB_REGISTER, DEBUG_STACK_FRAME, DEBUG_STATUS_GO, DEBUG_STATUS_NO_DEBUGGEE,
-    DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA,
-    DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_NONE, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM, DEBUG_VALUE,
-    DEBUG_VALUE_FLOAT32, DEBUG_VALUE_FLOAT64, DEBUG_VALUE_FLOAT80, DEBUG_VALUE_FLOAT82,
-    DEBUG_VALUE_FLOAT128, DEBUG_VALUE_INT8, DEBUG_VALUE_INT16, DEBUG_VALUE_INT32,
-    DEBUG_VALUE_INT64, DEBUG_VALUE_VECTOR64, DEBUG_VALUE_VECTOR128, IDebugBreakpoint,
-    IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
-    IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugRegisters, IDebugSymbols3,
-    IDebugSystemObjects,
+    DEBUG_SYMINFO_IMAGEHLP_MODULEW64, DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF,
+    DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA, DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_NONE,
+    DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM, DEBUG_VALUE, DEBUG_VALUE_FLOAT32, DEBUG_VALUE_FLOAT64,
+    DEBUG_VALUE_FLOAT80, DEBUG_VALUE_FLOAT82, DEBUG_VALUE_FLOAT128, DEBUG_VALUE_INT8,
+    DEBUG_VALUE_INT16, DEBUG_VALUE_INT32, DEBUG_VALUE_INT64, DEBUG_VALUE_VECTOR64,
+    DEBUG_VALUE_VECTOR128, IDebugAdvanced2, IDebugBreakpoint, IDebugBreakpoint2, IDebugClient6,
+    IDebugControl4, IDebugDataSpaces4, IDebugEventContextCallbacks, IDebugOutputCallbacks,
+    IDebugRegisters, IDebugSymbols3, IDebugSystemObjects,
 };
+use windows::Win32::System::Diagnostics::Debug::IMAGEHLP_MODULEW64;
 
 /// Callback type for breakpoint events that receives the breakpoint, context, and flags
 pub type BreakpointCallback =
@@ -429,6 +430,26 @@ pub struct ModuleIdentity {
     pub checksum: u32,
 }
 
+/// Which PDB the engine has for a module, in the form a symbol server is keyed by.
+///
+/// The *image* is identified by `TimeDateStamp` + `SizeOfImage` ([`Module`]); its symbols are
+/// identified by this pair instead, and the two are not interchangeable — a build can be rebuilt
+/// with the same timestamp and a new PDB signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdbIdentity {
+    /// The signature as a symbol server path spells it: 32 uppercase hex digits, no braces and no
+    /// dashes. Deliberately not the braced form `Debug` would print — this is the string that goes
+    /// in `<pdb>/<guid><age>/<pdb>`, and reformatting it is the caller's least useful job.
+    pub guid: String,
+    /// The age, which the same path appends to the GUID in hex.
+    pub age: u32,
+    /// Whether the engine matched a PDB it then found did **not** belong to this image. A caller
+    /// reading symbols from it is reading another build's names.
+    pub unmatched: bool,
+    /// The file the engine actually loaded, where it says. Empty when it has none.
+    pub file: String,
+}
+
 impl Module {
     /// One past the last byte of the image — the end of the `start end` pair `lm` prints.
     pub fn end(&self) -> u64 {
@@ -670,6 +691,26 @@ fn split_instruction(address: u64, line: &str) -> Instruction {
 /// the alignment means nothing once the columns are separate fields.
 fn collapse_spaces(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A PDB signature as a symbol server path spells it: 32 uppercase hex digits.
+///
+/// Not `{:?}` on the GUID, which prints the braced, dashed form no path uses, and not a
+/// byte-order-preserving hex dump either — the first three fields are written as the numbers they
+/// are and only the trailing eight bytes are laid out in order. Getting that wrong produces a URL
+/// that 404s, which is a hard failure to read backwards.
+fn format_pdb_guid(guid: &windows::core::GUID) -> String {
+    let mut out = format!("{:08X}{:04X}{:04X}", guid.data1, guid.data2, guid.data3);
+    for byte in guid.data4 {
+        out.push_str(&format!("{byte:02X}"));
+    }
+    out
+}
+
+/// A NUL-terminated wide string out of a fixed engine buffer.
+fn wide_to_string(buffer: &[u16]) -> String {
+    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..end])
 }
 
 /// The text up to the first NUL in an engine-filled buffer.
@@ -2215,6 +2256,67 @@ impl DebugEngine {
     }
 
     /// Image and symbol identity for a loaded module.
+    /// The **PDB** identity for a loaded module — the `GUID` + `age` a symbol server is keyed by.
+    ///
+    /// `Ok(None)` when the engine has no PDB signature for the module, which is the ordinary case
+    /// for one whose symbols are still deferred: this reports what the engine *has*, and it has
+    /// nothing until something has made it look. It is not an error, and it is not "this module
+    /// has no symbols" either — the two are told apart by [`Module::symbols`].
+    ///
+    /// Read through `IDebugAdvanced2::GetSymbolInformation`, which fills dbghelp's own
+    /// `IMAGEHLP_MODULEW64`. The interface is cast per call rather than held: this is asked once
+    /// per module that has symbols, not once per operation, and a `QueryInterface` is cheaper than
+    /// another field on every engine that never asks.
+    pub fn module_pdb(&self, base: u64) -> Result<Option<PdbIdentity>, DbgEngError> {
+        let advanced =
+            self.client
+                .cast::<IDebugAdvanced2>()
+                .map_err(|source| DbgEngError::Context {
+                    operation: "querying IDebugAdvanced2".into(),
+                    source,
+                })?;
+        let mut info = IMAGEHLP_MODULEW64 {
+            SizeOfStruct: std::mem::size_of::<IMAGEHLP_MODULEW64>() as u32,
+            ..Default::default()
+        };
+        let filled = unsafe {
+            advanced.GetSymbolInformation(
+                DEBUG_SYMINFO_IMAGEHLP_MODULEW64,
+                base,
+                0,
+                Some((&raw mut info).cast()),
+                std::mem::size_of::<IMAGEHLP_MODULEW64>() as u32,
+                None,
+                None,
+                None,
+            )
+        };
+        // **No not-found mapping here, deliberately.** `module_at` treats `E_INVALIDARG` as "no
+        // module holds this offset" because that is measurably what the engine means *there*, and
+        // copying the convention across looked natural. It is wrong here: this call's plausible
+        // failures are the call itself being wrong — a struct size this dbghelp does not
+        // recognise, an interface it does not implement — and reporting those as "this module has
+        // no PDB" would be a quiet, believable claim about the target made out of a broken call.
+        // An engine with nothing to say fills the struct and leaves the signature zeroed, which is
+        // the check below; it does not fail.
+        filled.map_err(|source| DbgEngError::Context {
+            operation: format!("reading the PDB identity of the module at {base:#x}"),
+            source,
+        })?;
+        let guid = info.PdbSig70;
+        // An all-zero signature is the engine saying it has none — a module whose symbols are
+        // deferred fills the struct and leaves this empty rather than failing the call.
+        if guid.data1 == 0 && guid.data2 == 0 && guid.data3 == 0 && guid.data4 == [0; 8] {
+            return Ok(None);
+        }
+        Ok(Some(PdbIdentity {
+            guid: format_pdb_guid(&guid),
+            age: info.PdbAge,
+            unmatched: info.PdbUnmatched.as_bool(),
+            file: wide_to_string(&info.LoadedPdbName),
+        }))
+    }
+
     pub fn module_identity(&self, name: &str) -> Result<ModuleIdentity, DbgEngError> {
         let module = self.module(name)?;
         let symbol_file = self.module_symbol_file(module.base)?;
@@ -3237,6 +3339,24 @@ mod tests {
     };
 
     use super::*;
+
+    /// The spelling a symbol server path uses, which is **not** the braced, dashed form `Debug`
+    /// prints and not a byte-order-preserving dump either: the first three fields are written as
+    /// the numbers they are, and only the trailing eight bytes are laid out in order.
+    ///
+    /// The value is `ntkrnlmp.pdb`'s for the ARM64 kernel in windbg-mcp's own sample dump, taken
+    /// from the image's CodeView record — so this test pins the convention against a string that
+    /// is known to fetch the right file rather than against a hand-built one.
+    #[test]
+    fn test_a_pdb_guid_is_spelled_the_way_a_symbol_server_path_is() {
+        let guid = windows::core::GUID {
+            data1: 0xFE3F_58BD,
+            data2: 0xA39D,
+            data3: 0x2FC1,
+            data4: [0x3C, 0x37, 0x06, 0x18, 0xD1, 0xDB, 0xDF, 0x22],
+        };
+        assert_eq!(format_pdb_guid(&guid), "FE3F58BDA39D2FC13C370618D1DBDF22");
+    }
 
     /// The engine renders one instruction as three columns. The split has to survive both
     /// architectures' padding, and it must take the address from the walk rather than from the
