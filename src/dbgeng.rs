@@ -482,6 +482,27 @@ pub struct StackFrame {
     pub displacement: u64,
 }
 
+/// One disassembled instruction, as [`DebugEngine::disassemble`] reports it.
+///
+/// The engine has no structured disassembly — `IDebugControl::Disassemble` renders one line of
+/// text and says where the next instruction starts — so this is that line split at its two column
+/// boundaries, with the address taken from the walk rather than parsed back out of it. A line the
+/// split does not recognise keeps everything after the address in [`Self::text`] and leaves
+/// [`Self::bytes`] empty, rather than guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Instruction {
+    /// Where the instruction is. **Not** parsed from the rendered line: it is the offset this
+    /// walk asked about, which is the previous instruction's end.
+    pub address: u64,
+    /// The encoding, as the engine prints it — `48895c2408`. Empty when the line carried no byte
+    /// column, which is not a shape any current engine produces for a readable address.
+    pub bytes: String,
+    /// The mnemonic and its operands — `mov qword ptr [rsp+8],rbx` — with the engine's column
+    /// padding collapsed to single spaces, since the columns it was aligning are separate fields
+    /// here. Operand symbols are the engine's own (`call nt!KeBugCheckEx (fffff803`...)`).
+    pub text: String,
+}
+
 /// The engine's current **scope**: which instruction, which frame, and the register context
 /// those are read through — what `.frame`, `.cxr`, `.ecxr` and `.trap` set, and what `dt`, `dv`,
 /// `k` and every register read are answered against.
@@ -613,6 +634,42 @@ fn read_engine_string(
     let mut buffer = vec![0u8; needed as usize];
     get(Some(&mut buffer), None)?;
     Ok(nul_terminated(&buffer))
+}
+
+/// Splits one rendered disassembly line into its byte and mnemonic columns.
+///
+/// The line is `<address> <bytes> <mnemonic and operands>`, whitespace-separated, and the address
+/// is discarded because the walk already knows it — reading it back would make the record depend
+/// on a rendering it does not otherwise trust. Anything the shape does not fit keeps its whole
+/// remainder as text, so an engine that renders differently loses a column rather than an
+/// instruction.
+fn split_instruction(address: u64, line: &str) -> Instruction {
+    let mut columns = line.trim().splitn(3, char::is_whitespace);
+    let (_address, bytes, rest) = (columns.next(), columns.next(), columns.next());
+    match (bytes, rest) {
+        (Some(bytes), Some(rest)) => Instruction {
+            address,
+            bytes: bytes.to_string(),
+            text: collapse_spaces(rest),
+        },
+        // One column past the address, or none: keep it whole rather than calling it an encoding.
+        (Some(only), None) => Instruction {
+            address,
+            bytes: String::new(),
+            text: collapse_spaces(only),
+        },
+        _ => Instruction {
+            address,
+            bytes: String::new(),
+            text: collapse_spaces(line),
+        },
+    }
+}
+
+/// Runs of whitespace as one space. The engine pads its columns to align them in a listing, and
+/// the alignment means nothing once the columns are separate fields.
+fn collapse_spaces(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The text up to the first NUL in an engine-filled buffer.
@@ -2429,6 +2486,59 @@ impl DebugEngine {
             .collect())
     }
 
+    /// Disassembles `count` instructions from `address` — what `u` renders, as data.
+    ///
+    /// Walks forward the way the engine does: each instruction's end is the next one's start, so
+    /// every address here is the engine's own arithmetic rather than a length this code guessed.
+    /// `count` bounds the walk; zero is a legitimate ask and returns nothing without touching the
+    /// engine.
+    ///
+    /// **A short answer is a fact about the target, not an error.** Disassembly runs forward into
+    /// whatever follows, and what follows the end of a function may be unmapped, unreadable, or
+    /// not code at all. So a walk that cannot render its *first* instruction fails — there is
+    /// nothing to report and the caller asked about that address specifically — while one that
+    /// stops later returns what it has. A caller that needs to know compares the length it got
+    /// with the length it asked for, exactly as [`Self::stack_frames`] expects.
+    ///
+    /// Flags are zero: the same rendering `u` produces by default, without the effective-address
+    /// annotation, which is a fact about the *current register context* rather than about the
+    /// instruction and would make two identical calls differ.
+    pub fn disassemble(&self, address: u64, count: usize) -> Result<Vec<Instruction>, DbgEngError> {
+        let mut out = Vec::with_capacity(count.min(64));
+        let mut at = address;
+        for _ in 0..count {
+            let mut next = 0u64;
+            let line = read_engine_string(|buffer, size| unsafe {
+                self.control.Disassemble(at, 0, buffer, size, &mut next)
+            });
+            let line = match line {
+                Ok(line) if !line.trim().is_empty() => line,
+                // The first one failing is the caller's own question going unanswered; a later one
+                // is the end of what can be read, and the instructions before it are still good.
+                Ok(_) | Err(_) if !out.is_empty() => break,
+                Ok(_) => {
+                    return Err(DbgEngError::Context {
+                        operation: format!("disassembling {at:#x}"),
+                        source: S_FALSE.into(),
+                    });
+                }
+                Err(source) => {
+                    return Err(DbgEngError::Context {
+                        operation: format!("disassembling {at:#x}"),
+                        source,
+                    });
+                }
+            };
+            out.push(split_instruction(at, &line));
+            // An engine that does not advance would spin here forever rendering one instruction.
+            if next <= at {
+                break;
+            }
+            at = next;
+        }
+        Ok(out)
+    }
+
     /// The `module!Symbol` an address resolves to and how far past it the address is.
     ///
     /// Infallible: an address that resolves to nothing is the normal case for a module without
@@ -3127,6 +3237,49 @@ mod tests {
     };
 
     use super::*;
+
+    /// The engine renders one instruction as three columns. The split has to survive both
+    /// architectures' padding, and it must take the address from the walk rather than from the
+    /// line — the point of the record is that it is not a re-parse of a rendering.
+    #[test]
+    fn test_an_instruction_splits_into_its_encoding_and_its_mnemonic() {
+        let x64 = split_instruction(
+            0xfffff803_89201234,
+            "fffff803`89201234 48895c2408      mov     qword ptr [rsp+8],rbx\n",
+        );
+        assert_eq!(x64.address, 0xfffff803_89201234);
+        assert_eq!(x64.bytes, "48895c2408");
+        assert_eq!(x64.text, "mov qword ptr [rsp+8],rbx");
+
+        let arm64 = split_instruction(
+            0xfffff803_89201234,
+            "fffff803`89201234 a9bf7bfd     stp         fp,lr,[sp,#-0x10]!\n",
+        );
+        assert_eq!(arm64.bytes, "a9bf7bfd");
+        assert_eq!(arm64.text, "stp fp,lr,[sp,#-0x10]!");
+    }
+
+    /// The address is the walk's, not the line's. Asserted against a line that disagrees, because
+    /// agreeing lines cannot tell the two sources apart.
+    #[test]
+    fn test_an_instructions_address_comes_from_the_walk_not_the_rendering() {
+        let one = split_instruction(0x1000, "deadbeef`deadbeef 90    nop");
+        assert_eq!(one.address, 0x1000);
+        assert_eq!(one.text, "nop");
+    }
+
+    /// An engine that renders a shape this does not know loses a column, never an instruction:
+    /// the remainder is kept as text and nothing is presented as an encoding that is not one.
+    #[test]
+    fn test_an_unrecognised_line_keeps_its_text_rather_than_inventing_an_encoding() {
+        let two_columns = split_instruction(0x1000, "fffff803`89201234 ????");
+        assert!(two_columns.bytes.is_empty(), "{two_columns:?}");
+        assert_eq!(two_columns.text, "????");
+
+        let one_column = split_instruction(0x1000, "???");
+        assert!(one_column.bytes.is_empty(), "{one_column:?}");
+        assert_eq!(one_column.text, "???");
+    }
 
     /// glslang/win-kexp#82: a borrowed engine's lifecycle used to die with the wrapper.
     ///
