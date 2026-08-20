@@ -52,16 +52,15 @@ fn parse_args(args: &str) -> Result<PoolCommand, String> {
         match tokens[index] {
             "-tag" => {
                 index += 1;
-                let text = tokens
-                    .get(index)
-                    .ok_or_else(|| "-tag requires 1..4 ASCII bytes".to_string())?;
+                let text = tokens.get(index).ok_or_else(|| {
+                    "-tag requires 1..4 ASCII bytes or 0x+8 hex digits".to_string()
+                })?;
                 if tag.is_some() {
                     return Err("-tag may be specified only once".into());
                 }
-                tag = Some(
-                    parse_tag(text)
-                        .ok_or_else(|| "tag must contain 1..4 ASCII bytes".to_string())?,
-                );
+                tag = Some(parse_tag(text).ok_or_else(|| {
+                    "tag must be 1..4 ASCII bytes or 0x+8 hex digits".to_string()
+                })?);
             }
             "-paged" => {
                 if filter.replace(PoolFilter::Paged).is_some() {
