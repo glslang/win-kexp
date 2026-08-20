@@ -12,6 +12,13 @@ pub(crate) mod snapshot;
 
 pub mod query;
 
+/// The two forms a pool tag takes, and the question of which one identifies it.
+///
+/// A caller that renders [`PoolSpan::display_tag`] and hands the result back to
+/// [`query::find_tag`] has a round trip that silently breaks on any tag `display_tag` cannot
+/// render — so a consumer showing tags to a human should show [`raw_tag_hex`] wherever
+/// [`display_is_ambiguous`] holds, and `parse_tag` takes either form back.
+pub use decode::{display_is_ambiguous, parse_tag, raw_tag_hex};
 pub(crate) use index::PoolIndex;
 pub(crate) use snapshot::PoolSnapshot;
 pub use snapshot::{DIAGNOSTIC_EXAMPLES, DiagnosticShape, PoolDiagnostics, WalkStalls};

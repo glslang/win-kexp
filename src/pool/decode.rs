@@ -661,7 +661,50 @@ pub(crate) fn display_tag(tag: u32) -> String {
         .collect()
 }
 
-pub(crate) fn parse_tag(text: &str) -> Option<u32> {
+/// Whether [`display_tag`]'s rendering of `tag` identifies it.
+///
+/// It does not whenever a `.` appears, and that is not only the unprintable case: `.` is itself
+/// `ascii_graphic`, so a tag whose bytes really are `.` renders identically to one nothing can
+/// print. A caller holding `....` cannot tell which of 2^32 tags it came from, so the rendering
+/// is a label and [`raw_tag_hex`] is the identifier.
+pub fn display_is_ambiguous(tag: u32) -> bool {
+    tag.to_le_bytes()
+        .iter()
+        .any(|&byte| byte == b'.' || !(byte.is_ascii_graphic() || byte == b' '))
+}
+
+/// The tag's four bytes as hex, **in memory order**: `0x` then two digits per byte.
+///
+/// Memory order rather than the `u32`'s numeric order, so this reads in the same direction as
+/// [`display_tag`] and as the debugger's own output — `Tgsm` is `0x5467736d`, not `0x6d736754`.
+/// The two forms are the same fact, and `parse_tag` takes either.
+pub fn raw_tag_hex(tag: u32) -> String {
+    let [a, b, c, d] = tag.to_le_bytes();
+    format!("0x{a:02x}{b:02x}{c:02x}{d:02x}")
+}
+
+/// A tag from either form: the four displayed bytes, or [`raw_tag_hex`]'s `0x` + 8 hex digits.
+///
+/// The two cannot collide, which is what makes accepting both safe rather than a guess: the raw
+/// form is exactly 10 characters and a displayed tag is at most 4, so a string that parses as one
+/// can never be the other. `"0x2e"` stays the literal four-byte tag it has always been.
+///
+/// The raw form exists because the displayed one is lossy (see [`display_is_ambiguous`]) and
+/// because this parser only ever accepted ASCII: before it, a tag with a byte outside ASCII could
+/// not be named at all, so the pool's heaviest tag could be one no query could ask for.
+pub fn parse_tag(text: &str) -> Option<u32> {
+    if let Some(digits) = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .filter(|digits| digits.len() == 8 && digits.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        let mut raw = [0u8; 4];
+        for (byte, pair) in raw.iter_mut().zip(digits.as_bytes().chunks_exact(2)) {
+            // Each pair is two verified hex digits, so this cannot fail.
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+        }
+        return Some(u32::from_le_bytes(raw));
+    }
     let bytes = text.as_bytes();
     if bytes.is_empty() || bytes.len() > 4 || !bytes.iter().all(u8::is_ascii) {
         return None;
@@ -899,6 +942,49 @@ mod tests {
             context,
             heap_key
         ));
+    }
+
+    /// Every tag can be named, and naming it is what `display_tag` alone cannot do.
+    ///
+    /// The round trip is the whole point: a census renders a tag, a caller hands the rendering
+    /// back, and the query must find the same tag. Over the displayed form that holds only while
+    /// every byte is printable, so the raw form has to hold over all 2^32 — checked here on the
+    /// byte patterns that break the displayed one, plus an exhaustive sweep of one byte position.
+    #[test]
+    fn test_raw_tag_round_trips_where_the_displayed_one_cannot() {
+        // Memory order, so the hex reads in the same direction as the rendering.
+        assert_eq!(raw_tag_hex(u32::from_le_bytes(*b"Tgsm")), "0x5467736d");
+        assert_eq!(parse_tag("0x5467736d"), Some(u32::from_le_bytes(*b"Tgsm")));
+        assert_eq!(parse_tag("0X5467736D"), Some(u32::from_le_bytes(*b"Tgsm")));
+
+        // The collision the raw form exists for: an unprintable tag and a literal `....` render
+        // identically, and `parse_tag` on that rendering silently returns the *other* one.
+        let binary = u32::from_le_bytes([0x00, 0x01, 0x80, 0xff]);
+        let dots = u32::from_le_bytes(*b"....");
+        assert_eq!(display_tag(binary), display_tag(dots));
+        assert_ne!(binary, dots);
+        assert_eq!(parse_tag(&display_tag(binary)), Some(dots));
+        assert_eq!(parse_tag(&raw_tag_hex(binary)), Some(binary));
+        assert!(display_is_ambiguous(binary));
+        assert!(display_is_ambiguous(dots), "a literal `.` is ambiguous too");
+        assert!(!display_is_ambiguous(u32::from_le_bytes(*b"Tgsm")));
+        assert!(!display_is_ambiguous(u32::from_le_bytes(*b"Ntf ")));
+
+        // A displayed tag is at most 4 characters and the raw form is exactly 10, so the two
+        // can never collide -- `0x2e` stays the four-byte tag it has always been.
+        assert_eq!(parse_tag("0x2e"), Some(u32::from_le_bytes(*b"0x2e")));
+        assert_eq!(parse_tag("0x5467736"), None, "9 characters is neither form");
+        assert_eq!(parse_tag("0xzzzzzzzz"), None, "not hex digits");
+        assert_eq!(parse_tag(""), None);
+
+        for byte in 0..=u8::MAX {
+            let tag = u32::from_le_bytes([b'A', byte, b'C', b'D']);
+            assert_eq!(
+                parse_tag(&raw_tag_hex(tag)),
+                Some(tag),
+                "raw form must round-trip byte {byte:#04x}"
+            );
+        }
     }
 
     #[test]

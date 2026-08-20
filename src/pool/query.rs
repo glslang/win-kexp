@@ -94,7 +94,9 @@ pub enum PoolQueryError {
     #[error("pool walking supports x64 targets only (machine {machine:#x})")]
     UnsupportedArchitecture { machine: u32 },
 
-    #[error("tag must contain 1..4 ASCII bytes")]
+    #[error(
+        "tag must be 1..4 ASCII bytes (\"Tgsm\") or the raw form 0x + 8 hex digits (\"0x5467736d\")"
+    )]
     InvalidTag,
 
     #[error("resolving pool layout failed ({0}); run `.reload /f nt` and retry")]
@@ -407,7 +409,13 @@ pub(crate) fn prepare_index(
         })
 }
 
-/// Every *allocated* chunk carrying `tag` (1..4 ASCII bytes, e.g. `"Tgsm"`).
+/// Every *allocated* chunk carrying `tag`, named either way [`crate::pool::parse_tag`] accepts:
+/// 1..4 ASCII bytes (`"Tgsm"`), or the raw form `0x` + 8 hex digits (`"0x5467736d"`).
+///
+/// Prefer the raw form for anything read back out of a [`PoolSpan`], because the displayed one
+/// is lossy — a tag with an unprintable byte renders as `.` and so does a literal `.`, and
+/// feeding *that* rendering back here finds a different tag rather than failing. See
+/// [`crate::pool::display_is_ambiguous`].
 ///
 /// Only allocated chunks are indexed by tag: a freed chunk's tag is not reliably
 /// preserved by the allocator, so returning "freed chunks with this tag" would be
@@ -639,6 +647,38 @@ mod tests {
         let found = collect_tag(&index, u32::from_le_bytes(*b"Tgsm"), None);
         assert_eq!(found.len(), 2);
         assert!(found.iter().all(|span| span.display_tag == "Tgsm"));
+    }
+
+    /// A tag nothing can print is still a tag, and only the raw form can ask for it.
+    ///
+    /// Both allocations below render `....`, so the rendering cannot be the key: handed back as
+    /// a tag it parses as four literal `.` bytes and finds the *other* allocation — an answer,
+    /// not an error, which is what made this worth a test rather than a doc note.
+    #[test]
+    fn test_a_binary_tag_is_found_by_its_bytes_not_by_its_rendering() {
+        let binary = [0x00u8, 0x01, 0x80, 0xff];
+        let index = index_of(vec![
+            allocation(0x1000, 0x68, &binary, PoolKind::NonPagedNx, 1),
+            allocation(0x2000, 0x40, b"....", PoolKind::NonPagedNx, 1),
+        ]);
+        assert_eq!(
+            crate::pool::decode::display_tag(u32::from_le_bytes(binary)),
+            crate::pool::decode::display_tag(u32::from_le_bytes(*b"....")),
+            "the premise: these two are indistinguishable once rendered"
+        );
+
+        // The rendering finds the literal dots, and says nothing about the tag above it.
+        let rendered = parse_tag("....").expect("four ASCII bytes parse");
+        let by_rendering = collect_tag(&index, rendered, None);
+        assert_eq!(by_rendering.len(), 1);
+        assert_eq!(by_rendering[0].usable_address, 0x2000);
+
+        // The raw form finds the one that has no other name.
+        let raw = parse_tag(&crate::pool::raw_tag_hex(u32::from_le_bytes(binary)))
+            .expect("the raw form parses");
+        let by_bytes = collect_tag(&index, raw, None);
+        assert_eq!(by_bytes.len(), 1);
+        assert_eq!(by_bytes[0].usable_address, 0x1000);
     }
 
     #[test]
