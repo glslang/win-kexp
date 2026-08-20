@@ -683,19 +683,59 @@ pub fn raw_tag_hex(tag: u32) -> String {
     format!("0x{a:02x}{b:02x}{c:02x}{d:02x}")
 }
 
+/// Whether [`display_tag`]'s rendering can be handed back and name the same tag again.
+///
+/// Two separate ways it cannot, and collapsing them would get the reason wrong:
+///
+/// * it does not identify the tag at all — [`display_is_ambiguous`];
+/// * it identifies it but cannot survive the trip. `!win_kexp.poolmap` splits its arguments on
+///   whitespace, so a tag with a leading or embedded space — raw bytes `A BC` — comes back as the
+///   tag `A` with `BC` left over as a stray argument, and an all-space tag comes back as no
+///   argument at all. Only a nonempty run of non-space bytes followed by nothing but spaces
+///   survives, which is exactly the shape [`parse_tag`] rebuilds when it pads a short tag out to
+///   four bytes: `Ntf ` round-trips, `A BC` does not.
+pub fn display_round_trips(tag: u32) -> bool {
+    if display_is_ambiguous(tag) {
+        return false;
+    }
+    let bytes = tag.to_le_bytes();
+    let leading = bytes.iter().take_while(|&&byte| byte != b' ').count();
+    leading > 0 && bytes[leading..].iter().all(|&byte| byte == b' ')
+}
+
 /// How a tag should be shown to someone who might hand it back.
 ///
-/// [`display_tag`] where it identifies the tag, [`raw_tag_hex`] where it does not. Every place
-/// that prints a tag for a human should go through this rather than reaching for `display_tag`:
-/// printing a rendering that cannot be queried is what made `....` an unusable answer, and having
-/// one rule here is what stops the extension's output and a programmatic host's from disagreeing
-/// about the same chunk.
+/// [`display_tag`] where that survives the round trip, [`raw_tag_hex`] where it does not. Every
+/// place that prints a tag for a human should go through this rather than reaching for
+/// `display_tag`: printing a rendering that cannot be queried is what made `....` an unusable
+/// answer, and having one rule here is what stops the extension's output and a programmatic
+/// host's from disagreeing about the same chunk.
 pub fn tag_label(tag: u32) -> String {
-    if display_is_ambiguous(tag) {
-        raw_tag_hex(tag)
-    } else {
+    if display_round_trips(tag) {
         display_tag(tag)
+    } else {
+        raw_tag_hex(tag)
     }
+}
+
+/// The **raw form alone**: `0x` and exactly eight hex digits, the four bytes in memory order.
+///
+/// Public because a caller that treats the two forms differently — explaining that a *rendering*
+/// found nothing, say — has to ask exactly the question [`parse_tag`] asks, and a `0x` prefix is
+/// not that question. `0x2e` is four printable bytes and a perfectly ordinary tag; so is `0x..`,
+/// which is *ambiguous* and needs that explaining rather than being waved through as raw. Sharing
+/// this predicate is what keeps the two from disagreeing about which inputs are which.
+pub fn parse_raw_tag(text: &str) -> Option<u32> {
+    let digits = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .filter(|digits| digits.len() == 8 && digits.bytes().all(|b| b.is_ascii_hexdigit()))?;
+    let mut raw = [0u8; 4];
+    for (byte, pair) in raw.iter_mut().zip(digits.as_bytes().chunks_exact(2)) {
+        // Each pair is two verified hex digits, so this cannot fail.
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(u32::from_le_bytes(raw))
 }
 
 /// A tag from either form: the four displayed bytes, or [`raw_tag_hex`]'s `0x` + 8 hex digits.
@@ -708,17 +748,8 @@ pub fn tag_label(tag: u32) -> String {
 /// because this parser only ever accepted ASCII: before it, a tag with a byte outside ASCII could
 /// not be named at all, so the pool's heaviest tag could be one no query could ask for.
 pub fn parse_tag(text: &str) -> Option<u32> {
-    if let Some(digits) = text
-        .strip_prefix("0x")
-        .or_else(|| text.strip_prefix("0X"))
-        .filter(|digits| digits.len() == 8 && digits.bytes().all(|b| b.is_ascii_hexdigit()))
-    {
-        let mut raw = [0u8; 4];
-        for (byte, pair) in raw.iter_mut().zip(digits.as_bytes().chunks_exact(2)) {
-            // Each pair is two verified hex digits, so this cannot fail.
-            *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
-        }
-        return Some(u32::from_le_bytes(raw));
+    if let Some(raw) = parse_raw_tag(text) {
+        return Some(raw);
     }
     let bytes = text.as_bytes();
     if bytes.is_empty() || bytes.len() > 4 || !bytes.iter().all(u8::is_ascii) {
@@ -998,7 +1029,61 @@ mod tests {
             parse_tag(&tag_label(u32::from_le_bytes(*b"Tgsm"))),
             Some(u32::from_le_bytes(*b"Tgsm"))
         );
+    }
 
+    /// A rendering can identify a tag and still not survive being handed back.
+    ///
+    /// The extension splits its arguments on whitespace, so a space that is not trailing padding
+    /// breaks the round trip even though nothing about the rendering is ambiguous. These labels
+    /// have to be the raw form for a different reason than `....` does.
+    #[test]
+    fn test_a_space_that_is_not_padding_costs_the_printed_form() {
+        let trailing = u32::from_le_bytes(*b"Ntf ");
+        let embedded = u32::from_le_bytes(*b"A BC");
+        let leading = u32::from_le_bytes(*b" ABC");
+        let blank = u32::from_le_bytes(*b"    ");
+
+        // None of these is ambiguous -- each rendering names exactly one tag.
+        for tag in [trailing, embedded, leading, blank] {
+            assert!(!display_is_ambiguous(tag), "{}", display_tag(tag));
+        }
+
+        // Padding is the shape `parse_tag` rebuilds, so it alone survives.
+        assert!(display_round_trips(trailing));
+        assert_eq!(tag_label(trailing), "Ntf ");
+        assert_eq!(parse_tag("Ntf"), Some(trailing), "the split drops padding");
+
+        for tag in [embedded, leading, blank] {
+            assert!(
+                !display_round_trips(tag),
+                "`{}` cannot come back through a whitespace split",
+                display_tag(tag)
+            );
+            assert_eq!(tag_label(tag), raw_tag_hex(tag));
+            assert_eq!(parse_tag(&tag_label(tag)), Some(tag));
+        }
+    }
+
+    /// A `0x` prefix is not the raw form, and the difference decides who gets an explanation.
+    #[test]
+    fn test_only_the_complete_raw_form_counts_as_raw() {
+        assert_eq!(parse_raw_tag("0x000180ff"), Some(0xff80_0100));
+        assert_eq!(parse_raw_tag("0X000180FF"), Some(0xff80_0100));
+
+        // Ordinary four-byte tags that merely start with `0x`. The second is ambiguous, and a
+        // caller treating a `0x` prefix as proof of rawness would skip explaining it.
+        assert_eq!(parse_raw_tag("0x2e"), None);
+        assert_eq!(parse_raw_tag("0x.."), None);
+        assert_eq!(parse_tag("0x.."), Some(u32::from_le_bytes(*b"0x..")));
+        assert!(display_is_ambiguous(u32::from_le_bytes(*b"0x..")));
+
+        assert_eq!(parse_raw_tag("0x5467736"), None, "nine characters");
+        assert_eq!(parse_raw_tag("0xzzzzzzzz"), None, "not hex");
+        assert_eq!(parse_raw_tag("5467736d"), None, "no prefix");
+    }
+
+    #[test]
+    fn test_the_two_tag_forms_cannot_collide() {
         // A displayed tag is at most 4 characters and the raw form is exactly 10, so the two
         // can never collide -- `0x2e` stays the four-byte tag it has always been.
         assert_eq!(parse_tag("0x2e"), Some(u32::from_le_bytes(*b"0x2e")));

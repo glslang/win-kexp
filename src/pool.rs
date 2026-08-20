@@ -18,7 +18,9 @@ pub mod query;
 /// [`query::find_tag`] has a round trip that silently breaks on any tag `display_tag` cannot
 /// render — so a consumer showing tags to a human should show [`raw_tag_hex`] wherever
 /// [`display_is_ambiguous`] holds, and `parse_tag` takes either form back.
-pub use decode::{display_is_ambiguous, parse_tag, raw_tag_hex, tag_label};
+pub use decode::{
+    display_is_ambiguous, display_round_trips, parse_raw_tag, parse_tag, raw_tag_hex, tag_label,
+};
 pub(crate) use index::PoolIndex;
 pub(crate) use snapshot::PoolSnapshot;
 pub use snapshot::{DIAGNOSTIC_EXAMPLES, DiagnosticShape, PoolDiagnostics, WalkStalls};
