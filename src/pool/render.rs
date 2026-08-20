@@ -269,9 +269,9 @@ pub(crate) fn render_advice(index: &PoolIndex, tag: u32, dml: bool) -> String {
             kind_name(span.pool_kind),
             backend_name(span.backend),
             if dml {
-                escape_dml(&span.display_tag)
+                escape_dml(&crate::pool::tag_label(span.raw_tag))
             } else {
-                span.display_tag.clone()
+                crate::pool::tag_label(span.raw_tag)
             },
             span.usable_address,
             span.size,

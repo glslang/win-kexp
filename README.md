@@ -84,9 +84,17 @@ The primary command is:
 !win_kexp.poolmap ffff800012345678
 ```
 
-`-tag` accepts one through four ASCII bytes. Internally the tag remains the exact
-four-byte raw little-endian value; printable display text is only a rendering. The
-tag map retains nearby unrelated allocations and holes. `-paged` and `-nonpaged`
+`-tag` accepts one through four ASCII bytes, or the **raw form** — `0x` and the four
+bytes as hex, in memory order, so it reads in the same direction as the printed tag
+(`Tgsm` is `0x5467736d`). Internally the tag remains the exact four-byte raw
+little-endian value; printable display text is only a rendering, and a lossy one: every
+byte that does not print becomes `.`, and so does a literal `.`. A tag shown with a `.`
+in it therefore names no particular tag, and passing that rendering to `-tag` asks about
+literal `.` bytes rather than about what was displayed — which is why output prints the
+raw form instead wherever the rendering would be ambiguous. Query that. The two forms
+cannot be confused: the raw form is exactly ten characters and a printed tag is at most
+four, so `0x2e` is still the four-byte tag `0x2e`. The tag map retains nearby unrelated
+allocations and holes. `-paged` and `-nonpaged`
 filter exact pool identities and cannot be combined. An address query prints detail
 for the allocation or hole containing that address. `-refresh` discards a complete
 cached snapshot and walks again.
