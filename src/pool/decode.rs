@@ -683,6 +683,21 @@ pub fn raw_tag_hex(tag: u32) -> String {
     format!("0x{a:02x}{b:02x}{c:02x}{d:02x}")
 }
 
+/// How a tag should be shown to someone who might hand it back.
+///
+/// [`display_tag`] where it identifies the tag, [`raw_tag_hex`] where it does not. Every place
+/// that prints a tag for a human should go through this rather than reaching for `display_tag`:
+/// printing a rendering that cannot be queried is what made `....` an unusable answer, and having
+/// one rule here is what stops the extension's output and a programmatic host's from disagreeing
+/// about the same chunk.
+pub fn tag_label(tag: u32) -> String {
+    if display_is_ambiguous(tag) {
+        raw_tag_hex(tag)
+    } else {
+        display_tag(tag)
+    }
+}
+
 /// A tag from either form: the four displayed bytes, or [`raw_tag_hex`]'s `0x` + 8 hex digits.
 ///
 /// The two cannot collide, which is what makes accepting both safe rather than a guess: the raw
@@ -969,6 +984,20 @@ mod tests {
         assert!(display_is_ambiguous(dots), "a literal `.` is ambiguous too");
         assert!(!display_is_ambiguous(u32::from_le_bytes(*b"Tgsm")));
         assert!(!display_is_ambiguous(u32::from_le_bytes(*b"Ntf ")));
+
+        // What every output site shows: the printed form where it identifies the tag, the raw
+        // bytes where it does not — and never two different tags under one label.
+        assert_eq!(tag_label(u32::from_le_bytes(*b"Tgsm")), "Tgsm");
+        assert_eq!(tag_label(u32::from_le_bytes(*b"Ntf ")), "Ntf ");
+        assert_eq!(tag_label(binary), "0x000180ff");
+        assert_eq!(tag_label(dots), "0x2e2e2e2e");
+        assert_ne!(tag_label(binary), tag_label(dots));
+        // And whatever it shows can be handed straight back.
+        assert_eq!(parse_tag(&tag_label(binary)), Some(binary));
+        assert_eq!(
+            parse_tag(&tag_label(u32::from_le_bytes(*b"Tgsm"))),
+            Some(u32::from_le_bytes(*b"Tgsm"))
+        );
 
         // A displayed tag is at most 4 characters and the raw form is exactly 10, so the two
         // can never collide -- `0x2e` stays the four-byte tag it has always been.
