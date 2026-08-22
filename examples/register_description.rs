@@ -13,6 +13,9 @@
 use win_kexp::dbgeng::DebugEngine;
 
 /// `DEBUG_VALUE_*`, so the `Type` column reads as something.
+///
+/// Note `FLOAT82` at 8, which is easy to leave out and shifts every label above it by one — this
+/// table did, and printed `VECTOR64` as `vector128`.
 fn kind(value: u32) -> &'static str {
     match value {
         1 => "int8",
@@ -22,9 +25,10 @@ fn kind(value: u32) -> &'static str {
         5 => "float32",
         6 => "float64",
         7 => "float80",
-        8 => "float128",
-        9 => "vector64",
-        10 => "vector128",
+        8 => "float82",
+        9 => "float128",
+        10 => "vector64",
+        11 => "vector128",
         other => Box::leak(format!("type{other}").into_boxed_str()),
     }
 }
@@ -87,18 +91,23 @@ fn main() {
         .iter()
         .filter(|d| d.flags & SUB_REGISTER != 0)
         .count();
-    let unflagged_with_master = descriptions
+    // **Not `subreg_master != 0`.** Index 0 is a real register — `rax` on x64, `x0` on ARM64 — and
+    // it is precisely the master the interesting rows would name if they named one, so a test that
+    // treats 0 as "unset" throws away the case it was written to find. What says "the engine filled
+    // nothing in here" is the whole sub-register group being zero.
+    let unflagged_carrying_anything = descriptions
         .iter()
-        .enumerate()
-        .filter(|(index, d)| {
+        .filter(|d| {
             d.flags & SUB_REGISTER == 0
-                && d.subreg_master as usize != *index
-                && d.subreg_master != 0
+                && (d.subreg_master != 0
+                    || d.subreg_length != 0
+                    || d.subreg_shift != 0
+                    || d.subreg_mask != 0)
         })
         .count();
     println!(
-        "\nflagged as sub-registers: {flagged}\nunflagged but naming another master: \
-         {unflagged_with_master}"
+        "\nflagged as sub-registers: {flagged}\nunflagged, with any sub-register field set: \
+         {unflagged_carrying_anything}"
     );
     for name in ["xmm0/0", "w0", "eax"] {
         if let Some(d) = descriptions.iter().find(|d| d.name == name) {
