@@ -322,6 +322,32 @@ impl RegisterValue {
     }
 }
 
+/// What the engine says a register **is**, as distinct from what it currently holds.
+///
+/// [`DebugEngine::register_values`] reports one field of this — [`Register::subregister`], the
+/// `DEBUG_REGISTER_SUB_REGISTER` flag — because that is the one a caller filtering "real
+/// registers" from "views of them" reaches for. This is the whole of
+/// `DEBUG_REGISTER_DESCRIPTION`, for a caller who has found that flag insufficient and needs to
+/// see what else the engine offers: it is clear for `xmm0/0`…`xmm0/3` on x64 and for `w0`–`w30`
+/// on ARM64, both of which are pieces of wider registers by every other measure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterDescription {
+    /// The engine's own name for it, lowercase.
+    pub name: String,
+    /// The `DEBUG_VALUE_*` type the engine reports this register's value as.
+    pub kind: u32,
+    /// `DEBUG_REGISTER_SUB_REGISTER`, and whatever else this engine sets.
+    pub flags: u32,
+    /// The index of the register this one is a piece of. **The engine documents this as
+    /// meaningful only when [`Self::flags`] says the register is a sub-register**, which is
+    /// exactly the limitation a caller needs to be able to check rather than assume.
+    pub subreg_master: u32,
+    /// How many bytes of the master this register covers, under the same condition.
+    pub subreg_length: u32,
+    pub subreg_mask: u64,
+    pub subreg_shift: u32,
+}
+
 /// One register of the target's context, as [`DebugEngine::register_values`] reports it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Register {
@@ -2171,6 +2197,51 @@ impl DebugEngine {
                 name,
                 value,
                 subregister: description.Flags & DEBUG_REGISTER_SUB_REGISTER != 0,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every register's **description**, without reading a value for any of them.
+    ///
+    /// The same enumeration [`Self::register_values`] performs, minus the per-register `GetValue`
+    /// — so it is cheap, and it answers a different question: not "what is in this register" but
+    /// "what does the engine say this register is". A caller that wants to know whether `w0` is a
+    /// view of `x0`, or whether `xmm0/0` is a piece of `xmm0`, has to be able to look at
+    /// `SubregMaster` and decide for itself, because the flag beside it does not say so on either
+    /// architecture.
+    ///
+    /// Indexes are positions in this list, which is the engine's own register order — so
+    /// [`RegisterDescription::subreg_master`] indexes the same `Vec` it came from.
+    pub fn register_descriptions(&self) -> Result<Vec<RegisterDescription>, DbgEngError> {
+        let registers: IDebugRegisters =
+            self.client.cast().map_err(|source| DbgEngError::Context {
+                operation: "obtaining the register interface".into(),
+                source,
+            })?;
+        let count =
+            unsafe { registers.GetNumberRegisters() }.map_err(|source| DbgEngError::Context {
+                operation: "counting the target's registers".into(),
+                source,
+            })?;
+        let mut out = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let mut description = DEBUG_REGISTER_DESCRIPTION::default();
+            let name = read_engine_string(|buffer, size| unsafe {
+                registers.GetDescription(index, buffer, size, Some(&mut description))
+            })
+            .map_err(|source| DbgEngError::Context {
+                operation: format!("describing register {index}"),
+                source,
+            })?;
+            out.push(RegisterDescription {
+                name,
+                kind: description.Type,
+                flags: description.Flags,
+                subreg_master: description.SubregMaster,
+                subreg_length: description.SubregLength,
+                subreg_mask: description.SubregMask,
+                subreg_shift: description.SubregShift,
             });
         }
         Ok(out)
