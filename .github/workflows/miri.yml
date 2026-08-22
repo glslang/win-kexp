@@ -1,28 +1,52 @@
 # Miri: Rust undefined behavior detector
 # Runs tests under the Miri interpreter to catch UB, invalid memory access,
 # and unsafe code issues that normal test runs cannot detect.
+#
+# **Not on pull requests**, since 2026-08-22. It is the longest job in this repo by a wide margin —
+# a median of 9 minutes against `ci.yml`'s 1 and `coverage.yml`'s 4 — and running it on the PR *and*
+# on the merge meant paying that twice for every change. It has never failed: 92 successes and 6
+# runs cancelled by the rule below, across the last hundred. So it moves to where one run per change
+# is enough, and stops being the thing a PR waits on.
+#
+# A **path filter** was the first proposal and was measured rather than adopted. Skipping Miri for
+# changes that cannot affect it does not work in this crate: filtering to the obviously-unsafe
+# modules would have to exclude `dbgeng.rs` (23 tests Miri executes) and `pool/**` (81, decoding raw
+# kernel structures out of byte slices), which is the most UB-prone code here; and a filter that
+# keeps everything Miri's run could depend on — `src/**`, `Cargo.*`, `build.rs` — would have skipped
+# 2 of the last 30 merged pull requests. Nearly every change here touches `src/`.
+#
+# What this costs: a UB regression is found on `main` rather than on the branch. That is a small
+# difference in a repo where `main` is not protected and the author merges their own work, and
+# `workflow_dispatch` runs it against a branch when a change is one Miri would have something to say
+# about.
 
 name: Miri
 
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+
+  # The toolchain is the other thing that can turn this red, and it moves on its own: Miri ships
+  # with nightly, and a nightly that tightens a rule finds the same code newly wrong. A weekly run
+  # separates "the code changed" from "the checker changed", which a push-only schedule cannot.
+  schedule:
+    - cron: "0 6 * * 1"
 
   workflow_dispatch:
 
 concurrency:
-  # A superseded push or PR update should cancel its predecessor. Without this every push to a
-  # PR left its predecessor running to completion — five pushes to one PR meant five concurrent
-  # Miri runs, which back when a run took ~28 minutes was most of an hour of runner time nobody
-  # would read. The run is far shorter now, but the reasoning does not depend on the duration.
+  # A superseded push should cancel its predecessor: two merges landing minutes apart otherwise
+  # leave the first still checking code nobody has any more. The rule was written for pull
+  # requests, where five pushes to one PR meant five concurrent Miri runs — most of an hour of
+  # runner time nobody would read, back when a run took ~28 minutes — and it outlives them because
+  # the shape is the same and the reasoning never depended on the duration.
   #
-  # Manual dispatches are deliberately excluded. A dispatch shares `github.ref` with the
-  # branch's own run, so a shared group would have the two cancel each other, and a repeat
-  # dispatch would kill the run someone had just asked for. Keying dispatches by run id gives
-  # each one a group of its own: never cancelled, never cancelling.
-  group: miri-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
+  # Manual dispatches and scheduled runs are deliberately excluded. Both share `github.ref` with
+  # the branch's own run — `main`, in the scheduled case — so a shared group would have them cancel
+  # each other: a Monday run would kill the merge that happened to land beside it, or be killed by
+  # it, and a repeat dispatch would kill the run someone had just asked for. Keying them by run id
+  # gives each one a group of its own: never cancelled, never cancelling.
+  group: miri-${{ github.ref }}-${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.run_id || 'auto' }}
   cancel-in-progress: true
 
 permissions:

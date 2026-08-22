@@ -14,7 +14,7 @@ The crate is Windows-only in practice: most modules use the `windows` crate dire
 - `cargo fmt --all`: apply Rust formatting.
 - `cargo nextest run --verbose`: preferred test runner and CI path.
 - `cargo test`: standard fallback test runner.
-- `cargo miri test --verbose`: nightly/Miri check used by CI for unsafe-code issues.
+- `cargo miri test --verbose`: nightly/Miri check for unsafe-code issues. CI runs it on merges to `main`, weekly, and on demand — **not on pull requests** (see `.github/workflows/miri.yml`), so run it yourself when a change touches unsafe code.
 - `cargo run --example kdtest -- "<kd connection>"`: run the kernel-debugging smoke test.
 
 Local builds use `ml64` for x86_64 or `armasm64` for ARM64 when available. Without assemblers, `build.rs` enables the shellcode fallback path.

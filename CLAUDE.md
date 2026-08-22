@@ -108,7 +108,7 @@ When touching this module, mind the `owns_session` invariant, the stdout-isolati
 Three workflows run on **Windows runners only**:
 - **ci.yml**: fmt check → build → `cargo nextest run` on both `windows-latest` (x64) and `windows-11-arm` (ARM64) with stable Rust
 - **coverage.yml**: grcov + LLVM instrumentation → Codecov upload
-- **miri.yml**: `cargo miri nextest run` on nightly with `MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"`, plus a `cargo miri test --doc` step for the doctests nextest cannot run
+- **miri.yml**: `cargo miri nextest run` on nightly with `MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"`, plus a `cargo miri test --doc` step for the doctests nextest cannot run. **It does not run on pull requests** — it is the longest job here by a wide margin (9 minutes median against ci.yml's 1) and had never failed in a hundred runs, so it runs on the merge to `main`, weekly for toolchain drift, and on `workflow_dispatch` for a branch worth checking before it lands. A green PR therefore says nothing about Miri; run it by hand when a change is one Miri would have something to say about. The workflow's own header records why a path filter was measured and rejected
 
 CI installs MASM/ARMASM tooling via `glslang/setup-masm@v1.4` in all three workflows, so assemblers are always available there. Local builds without assemblers silently activate `shellcode_fallback`.
 
