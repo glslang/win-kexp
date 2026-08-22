@@ -342,7 +342,8 @@ pub struct RegisterDescription {
     /// meaningful only when [`Self::flags`] says the register is a sub-register**, which is
     /// exactly the limitation a caller needs to be able to check rather than assume.
     pub subreg_master: u32,
-    /// How many bytes of the master this register covers, under the same condition.
+    /// How many **bits** of the master this register covers, under the same condition — the unit
+    /// is the engine's, and it is the one a reader assumes wrongly: `eax` reports 32.
     pub subreg_length: u32,
     pub subreg_mask: u64,
     pub subreg_shift: u32,
