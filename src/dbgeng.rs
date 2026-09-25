@@ -4929,6 +4929,36 @@ impl DebugEngine {
         Ok(DebuggeeType { class, qualifier })
     }
 
+    /// The connection string a **live kernel** session is dialled on, as DbgEng holds it —
+    /// `net:port=…,key=…`, `com:port=COM1,baud=115200`, and the rest.
+    ///
+    /// **It is the only thing that tells two live kernel targets apart.** Everything else a caller
+    /// can read about one is identical between any two of them: the class and qualifier are
+    /// `DEBUG_CLASS_KERNEL` / `DEBUG_KERNEL_CONNECTION` for both, there are no dump files, and
+    /// there is no process set. So a caller fingerprinting its target is blind to a live kernel
+    /// being swapped for another unless it reads this.
+    ///
+    /// # It can carry a secret
+    ///
+    /// **A KDNET connection string contains the debug `key=`**, which is the credential for the
+    /// target machine. This returns it unredacted, because a library that mangled it would be
+    /// useless for dialling — but it means a caller must not log this, put it in an error
+    /// message, or derive a `Debug` that prints it. A caller that only needs *identity* should
+    /// hash it and keep the hash.
+    ///
+    /// Empty, or an error, on a target that is not a live kernel; refuses an engine with no
+    /// debuggee for [`Self::dump_files`]'s reason.
+    pub fn kernel_connection_options(&self) -> Result<String, DbgEngError> {
+        self.refuse_without_a_debuggee()?;
+        read_engine_string(|buffer, size| unsafe {
+            self.client.GetKernelConnectionOptions(buffer, size)
+        })
+        .map_err(|source| DbgEngError::Context {
+            operation: "reading the kernel connection options".into(),
+            source,
+        })
+    }
+
     /// Whether the current target is a kernel one, live connection or kernel dump alike.
     pub fn is_kernel_target(&self) -> Result<bool, DbgEngError> {
         Ok(self.debuggee_type()?.is_kernel())
