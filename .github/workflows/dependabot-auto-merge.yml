@@ -1,0 +1,42 @@
+# Dependabot opens PRs that this repo's review requirement will not let it merge: ci goes green
+# and the PR then sits indefinitely, waiting for the one approving review a bot cannot give
+# itself. This workflow supplies that review and queues the merge, so a routine version bump
+# lands on its own instead of collecting in the queue until someone clears it by hand.
+#
+# Major bumps are deliberately excluded. A semver-major change can compile, pass every test and
+# still have altered behaviour under it, so those keep waiting for a person to read the diff.
+
+name: Dependabot auto-merge
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Approve the pull request
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        run: gh pr review --approve "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # --auto queues the merge behind required checks rather than merging immediately, so this
+      # does not race the ci run triggered by the same push.
+      - name: Enable auto-merge
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
