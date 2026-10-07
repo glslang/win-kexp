@@ -113,6 +113,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **A walk that reached the end of the pool is cached even where some of it would not read.**
+  Only a `complete` snapshot was kept, and on a live kernel no walk is complete — paged pool the
+  memory manager has trimmed does not read over KD, and 3,442 extents on one 29671 guest were in
+  that state — so every query walked the whole pool again: four questions on `ctf-vm` were four
+  walks of ~80 s each, and windbg-mcp's live pool tier, twenty-odd questions against one halted
+  target, took 2,665 s. A trimmed page reads no better on the next walk, and the target has not
+  moved between questions, so the snapshot is kept. What is still never cached is a walk **cut
+  short** — by its budget or by a match threshold — because what it did not reach is unwalked
+  rather than unreadable; the index carries `complete`, `budget_expired` and
+  `stopped_after_matches` with it, and `refresh` walks again as before. Same sequence afterwards:
+  the second `pool_chunk` 79.8 s → 0 s, `pool_find_tag` 76.8 s → 0.1 s, and that tier
+  2,665 s → 1,032 s.
+
 - **A heap walk no longer calls reserved address space a hole in its own coverage.** A user-mode
   walk came back `coverage: Partial` on every healthy live process, because the tails of
   subsegments and page ranges — reserved and never committed — read the same way a paged-out
