@@ -256,15 +256,17 @@ information for `nt`. Configure a symbol server, break in, and force-load kernel
 argument is always parsed as an address, so `!dbgscope.poolmap 0x5467736d` asks about that
 address rather than about `Tgsm`. `-paged` and `-nonpaged` filter exact pool identities and
 cannot be combined; the map retains nearby unrelated allocations and holes. An address argument
-prints detail for the allocation or hole containing it. `-refresh` discards a complete cached snapshot
+prints detail for the allocation or hole containing it. `-refresh` discards the cached snapshot
 and walks again. Where WinDbg accepts DML, map cells have colours and clickable address links;
 the same rows use ASCII glyphs and carry a legend when DML is stripped or the output is
 captured as plain text.
 
 "Snapshot" is literal: the extension examines current allocations, reusable frees, and
 cached/delay-free spans while the target is stopped. It does not install allocation breakpoints
-or reconstruct history. The cache is invalidated when execution resumes or the session changes,
-and incomplete or Ctrl+C-interrupted walks are never cached.
+or reconstruct history. The cache is invalidated when execution resumes or the session changes.
+A walk cut short — by Ctrl+C, by its budget or by a match threshold — is never cached; one that
+reached the end of the pool is kept even where some of it would not read, because a page the
+target has trimmed reads no better on the next walk, and on a live kernel some always are.
 
 A walk is thousands of debugger reads plus every committed pool page, so over a live KDNET link
 it can run for minutes. The extension lets it run to completion, because there is an operator at

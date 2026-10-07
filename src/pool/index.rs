@@ -237,9 +237,19 @@ impl SnapshotCache {
             return Ok(cached.index.clone());
         }
         let snapshot = build()?;
-        let complete = snapshot.complete;
+        // Cached unless the walk was **cut short**. A budget that ran out or a match threshold
+        // that fired left pool unwalked that the next query may need, and a snapshot that stops
+        // where the target does not is the one kind a cache must not serve. A walk that
+        // reached the end of the pool and found some of it unreadable is not that: a page a
+        // live kernel has trimmed is as unreadable on the next walk as on this one, and on a
+        // live kernel some always are — measured on two guests (2026-10-07), every walk ended
+        // partial, so nothing was ever cached and a test asking twenty questions paid twenty
+        // walks of 136 s each for one halted target that had not changed. The index carries
+        // `complete`, `budget_expired` and `stopped_after_matches` with it, so a caller can
+        // still read what the cached walk did not reach.
+        let cacheable = !snapshot.budget_expired && snapshot.stopped_after_matches.is_none();
         let index = PoolIndex::build(snapshot);
-        if complete {
+        if cacheable {
             *self.entry.lock().unwrap() = Some(CachedSnapshot {
                 key,
                 index: index.clone(),
@@ -366,6 +376,9 @@ mod tests {
         cache.get_or_refresh(session(8), false, make).unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 4);
 
+        // A walk that reached the end of the pool and found some of it unreadable is cached:
+        // on a live kernel every walk ends that way, and the next question is about the same
+        // halted target.
         let incomplete_builds = AtomicUsize::new(0);
         let make_incomplete = || -> Result<PoolSnapshot, String> {
             incomplete_builds.fetch_add(1, Ordering::SeqCst);
@@ -380,16 +393,35 @@ mod tests {
         cache
             .get_or_refresh(session(9), false, make_incomplete)
             .unwrap();
-        assert_eq!(incomplete_builds.load(Ordering::SeqCst), 2);
+        assert_eq!(incomplete_builds.load(Ordering::SeqCst), 1);
+
+        // A walk cut short by its budget is not: what it did not reach is unwalked rather than
+        // unreadable, and the next query may be the one that needs it.
+        let expired_builds = AtomicUsize::new(0);
+        let make_expired = || -> Result<PoolSnapshot, String> {
+            expired_builds.fetch_add(1, Ordering::SeqCst);
+            let mut value = snapshot.clone();
+            value.complete = false;
+            value.budget_expired = true;
+            Ok(value)
+        };
+        cache.invalidate();
+        cache
+            .get_or_refresh(session(9), false, make_expired)
+            .unwrap();
+        cache
+            .get_or_refresh(session(9), false, make_expired)
+            .unwrap();
+        assert_eq!(expired_builds.load(Ordering::SeqCst), 2);
 
         cache.invalidate();
         cache.get_or_refresh(session(10), false, make).unwrap();
         cache
-            .get_or_refresh(session(10), true, make_incomplete)
+            .get_or_refresh(session(10), true, make_expired)
             .unwrap();
         cache.get_or_refresh(session(10), false, make).unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 6);
-        assert_eq!(incomplete_builds.load(Ordering::SeqCst), 3);
+        assert_eq!(expired_builds.load(Ordering::SeqCst), 3);
 
         let failed_refresh: Result<PoolIndex, String> =
             cache.get_or_refresh(session(10), true, || Err("interrupted".into()));

@@ -241,7 +241,7 @@ pub struct PoolSnapshotReport {
     /// it. See [`WalkCoverage`]; [`WalkCoverage::complete`] is the plain bool.
     pub coverage: WalkCoverage,
     /// The requested number of matches that intentionally stopped this walk. Absent when the
-    /// threshold was not requested, was not reached, or a complete cached snapshot answered.
+    /// threshold was not requested, was not reached, or a cached snapshot answered.
     pub stopped_after_matches: Option<usize>,
     /// What the walk complained about, grouped by shape.
     ///
@@ -292,10 +292,10 @@ impl WalkCoverage {
 ///
 /// The two travel together because they have to be *the same walk*. A query that walks and a
 /// caller that then asks for the walk's state are two calls, and between them the snapshot may
-/// not exist: an incomplete walk is deliberately not cached, so the second call finds nothing and
-/// walks again. The caller then holds a count from one walk and a coverage figure from another,
-/// and reports them as if they described each other — which is exactly the mistake coverage
-/// exists to prevent, arriving through the reporting instead of through the walk.
+/// not exist: a walk cut short by its budget is deliberately not cached, so the second call finds
+/// nothing and walks again. The caller then holds a count from one walk and a coverage figure
+/// from another, and reports them as if they described each other — which is exactly the mistake
+/// coverage exists to prevent, arriving through the reporting instead of through the walk.
 ///
 /// So the pairing is made here, where both come from one `PoolIndex`, and cannot be made anywhere
 /// else.
