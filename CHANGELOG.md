@@ -166,6 +166,32 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A big-pool allocation on a page the memory manager had trimmed lost its name, in both of the
+  places the table names one.** The table was consulted correctly — on two live guests the hash
+  landed on each failing entry's own slot, zero probes — and the walk then never asked it for a
+  span it could not *read*. A segment page range the table names was read anyway, only to run a
+  decoder the name makes unnecessary, and where the read failed the range was filed as an untagged
+  unreadable gap. A VS chunk the table names whose tail runs into a trimmed page was dropped by the
+  "runs past the committed extent" rule before the containment match could run, and its pages
+  filed the same way; `pool_chunk` at the allocation's own address then answered `....`, 4096
+  bytes, `unreadable`. Measured on 2026-10-07: `Gcac` at `0xffffa4b05e1b5000` (8 KB, segment) on a
+  29671 lab kernel and `CIcr` at `0xffffa9099c86f000` (0x12a0 bytes, 0x20 into a 0x12c0-byte VS
+  chunk with a resident header) on `ctf-vm` 26100.33438, `!pool` naming both from the table.
+  Neither is a regression: the code was identical at every pin since the entries below, and the
+  same test had passed on the same guests' previous boots — which allocation the oracle samples,
+  and whether its page is resident, is a property of the boot. A named segment range is now
+  answered from the table without reading its pages at all, and a VS chunk is matched against the
+  table *before* the extent check, with the extent loop told not to file the hole a matched chunk
+  covers as a gap. The first of those is also most of a walk's wasted reads: the live entries
+  summed to 111 MB on the 29671 guest and 89 MB on `ctf-vm`, every byte read and then discarded.
+  Same guest, same sequence, the previous build against this one on `ctf-vm`: a full walk
+  82.8 s → 61.9 s, and `pool_find_tag CIcr` 40 matches → 104, the other 64 having been dropped
+  over trimmed tails; on the 29671 guest a full walk 136 s → 79.7 s. One of the five entries
+  windbg-mcp's tier sampled there still has no span, and it is not this case: `smCB` at
+  `0xffffe67bde598000`, a nonpaged 0x1000-byte entry, lies in no region the walk discovers at
+  all — `pool_chunk` answers `covered: false` and `pool_find_tag smCB` finds nothing — which is a
+  discovery gap, reported by that tier rather than asserted. windbg-mcp `FOLLOWUPS.md` item 99.
+
 - **And a big-pool allocation served out of a VS subsegment kept no tag either.** The fix above
   asked the page range descriptor which allocations have no `_POOL_HEADER`, and that is only where
   *most* of them are: `nt` also puts them inside VS subsegments, where the descriptor says `0x0f`
