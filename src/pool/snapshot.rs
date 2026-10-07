@@ -2066,6 +2066,20 @@ pub struct WalkStalls {
     pub recovered_bytes: u64,
 }
 
+/// What one committed extent of a VS subsegment hands the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VsResume {
+    /// Where the chain names the next header — past this extent when the last chunk ran
+    /// over its end, which is how the chain crosses a hole at all.
+    next: u64,
+    /// How far the spans filed in this extent reach, when the last of them runs past its
+    /// end: a big-pool chunk the table named, emitted whole although its tail is in the hole
+    /// ahead. Bytes below this were accounted for, and the extent loop must not file them as
+    /// a gap on its way to the next readable extent — a gap span over a chunk the index
+    /// already holds would answer for its addresses in the gap's place. At most `next`.
+    covered_through: u64,
+}
+
 pub(crate) struct SnapshotWalker<'a, M> {
     pub memory: &'a M,
     pub layout: &'a PoolLayout,
@@ -2332,6 +2346,35 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         region: &PoolRegion,
         snapshot: &mut PoolSnapshot,
     ) -> Result<(), SnapshotError> {
+        // **A page range `nt!PoolBigPageTable` names needs no reading at all.** It is one
+        // allocation with no header: discovery took its tag and length from the table, and
+        // nothing on its pages adds to that — `walk_page_ranges` emits the one span and skips
+        // the header decode. Reading the pages anyway cost two things. On a live 29671 kernel
+        // (lab, 2026-10-07) the live entries summed to 111 MB, every byte of it read and then
+        // discarded, over a link that moves a few MB a second. And on a page the memory
+        // manager had trimmed the read failed, the range was filed as an unreadable gap with
+        // no tag, and the name the table had for it went unused: `!pool` called
+        // 0xffffa4b05e1b5000 an 8 KB `Gcac` and this walk called it `....` (`windbg-mcp`
+        // FOLLOWUPS item 99, the paged-out half). Resident or not, the table's answer is the
+        // same, so it is given without asking the pages.
+        if region.backend == PoolBackend::Segment
+            && let Some(tag) = region.known_tag
+        {
+            let state = region
+                .states
+                .first()
+                .copied()
+                .unwrap_or(PoolState::Allocated);
+            snapshot.record_span(self.base_span(
+                region,
+                region.address,
+                region.address,
+                region.size as u64,
+                tag,
+                state,
+            ));
+            return Ok(());
+        }
         let requested_end = region.address.saturating_add(region.size as u64);
         let mut cursor = region.address;
         let mut consecutive_stalls = 0u32;
@@ -2342,6 +2385,10 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         // A VS chunk is only findable from the end of the one before it, which is a fact about
         // the region and not about the extent, so it has to live out here.
         let mut vs_chunk = Some(region.address);
+        // How far the VS spans already filed reach past the extent that filed them; see
+        // [`VsResume::covered_through`]. A high-water mark, because a chunk that crosses one
+        // hole may cross the next as well.
+        let mut vs_covered = region.address;
         while cursor < requested_end {
             check_budget(self.memory)?;
             let remaining = requested_end.saturating_sub(cursor).min(usize::MAX as u64) as usize;
@@ -2363,13 +2410,18 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             // diagnostic that both describes nothing wrong and is wrong about what it
             // describes. Emitting it after the spans rather than before them is what lets it
             // be conditional at all: only filing them establishes which kind this is.
-            if valid_base > cursor && self.unreadable(region, cursor, valid_base - cursor, snapshot)
+            // Less whatever a span already covers: a VS chunk the big-page table named can
+            // end inside this hole, and its span was filed from the table with nothing left
+            // to learn from the pages.
+            let gap_start = cursor.max(vs_covered).min(valid_base);
+            if valid_base > gap_start
+                && self.unreadable(region, gap_start, valid_base - gap_start, snapshot)
             {
                 snapshot.diagnostics.push(format!(
-                    "region {:#x}+{:#x} is only committed through {cursor:#x}; unreadable space extends {:#x} bytes",
+                    "region {:#x}+{:#x} is only committed through {gap_start:#x}; unreadable space extends {:#x} bytes",
                     region.address,
                     region.size,
-                    valid_base - cursor
+                    valid_base - gap_start
                 ));
             }
             let valid_end = reported_base
@@ -2407,7 +2459,8 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 // filed as unreadable and `complete` still clears — the tail has not been walked,
                 // and nothing here claims otherwise.
                 if reported_base == 0 && reported_size == 0 {
-                    self.unreadable(region, valid_base, requested_end - valid_base, snapshot);
+                    let gap_start = valid_base.max(vs_covered).min(requested_end);
+                    self.unreadable(region, gap_start, requested_end - gap_start, snapshot);
                     break;
                 }
                 // The rest is a real stall: a valid region was reported inside the span and it
@@ -2440,7 +2493,8 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                     "valid-region query made no progress at {valid_base:#x}: the engine answered \
                      {reported_base:#x}+{reported_size:#x}; stepping over the rest of the page"
                 ));
-                self.unreadable(region, valid_base, skip, snapshot);
+                let gap_start = valid_base.max(vs_covered).min(valid_base + skip);
+                self.unreadable(region, gap_start, valid_base + skip - gap_start, snapshot);
                 snapshot.stalls.pages += 1;
                 snapshot.stalls.skipped_bytes = snapshot.stalls.skipped_bytes.saturating_add(skip);
                 stalled_here = true;
@@ -2504,7 +2558,11 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             match region.backend {
                 PoolBackend::Lfh => self.walk_lfh(region, valid_base, &bytes, snapshot),
                 PoolBackend::Vs => {
-                    vs_chunk = self.walk_vs(region, valid_base, &bytes, vs_chunk, snapshot);
+                    let resumed = self.walk_vs(region, valid_base, &bytes, vs_chunk, snapshot);
+                    vs_chunk = resumed.map(|resume| resume.next);
+                    if let Some(resume) = resumed {
+                        vs_covered = vs_covered.max(resume.covered_through);
+                    }
                 }
                 PoolBackend::Segment => self.walk_page_ranges(region, valid_base, &bytes, snapshot),
                 PoolBackend::Large => return Ok(()),
@@ -2887,7 +2945,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         bytes: &[u8],
         expected: Option<u64>,
         snapshot: &mut PoolSnapshot,
-    ) -> Option<u64> {
+    ) -> Option<VsResume> {
         let extent_end = base.saturating_add(bytes.len() as u64);
         let Some(next) = expected.filter(|next| *next >= base) else {
             // Either an earlier extent of this region lost the chain, or the header it pointed
@@ -2918,7 +2976,10 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             // A chunk that began before this extent covers all of it — an ordinary large free
             // chunk with its interior decommitted. Nothing to decode and nothing lost: the
             // expectation still names a header further on.
-            return Some(next);
+            return Some(VsResume {
+                next,
+                covered_through: base,
+            });
         }
         let mut offset = (next - base) as usize;
         // Where the *next* extent resumes, kept in step with `offset` so every way out of the
@@ -2935,6 +2996,8 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         // nothing to compare against: at the start of an extent, and after a resynchronisation,
         // where the walk no longer knows which chunk it is standing on.
         let mut previous_chunk = None;
+        // See [`VsResume::covered_through`]: raised only by a span filed past the extent.
+        let mut covered_through = base;
         while offset
             .saturating_add(region.vs_header_size)
             .saturating_add(region.pool_header.size)
@@ -2990,6 +3053,63 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 snapshot.complete = false;
             }
             let chunk_size = chunk.size;
+            let state = if region.cached_chunks.contains(&header_address) {
+                PoolState::CachedFree
+            } else if region.reusable_chunks.contains(&header_address) {
+                PoolState::ReusableFree
+            } else if chunk.allocated {
+                PoolState::Allocated
+            } else {
+                PoolState::ReusableFree
+            };
+            // **A chunk too large for `_POOL_HEADER.BlockSize` carries no header**, so decoding
+            // one out of it reads the caller's own first sixteen bytes as a tag. Its name is in
+            // `nt!PoolBigPageTable`, which discovery resolved into `region.big_pool`.
+            //
+            // Matched by **containment** rather than by arithmetic on the chunk header: the
+            // table's `Va` is where the allocation starts, and taking it as given costs nothing
+            // and assumes nothing about what sits between the two — which is the one thing here
+            // that is measured and not yet explained (`windbg-mcp` FOLLOWUPS item 99). The size
+            // has to fit inside the chunk as well, so an entry can only be claimed by a chunk
+            // that could really hold it.
+            //
+            // **Asked before the extent check below, not after it.** Everything the span
+            // carries is in hand once the header has decoded: the tag and the length are the
+            // table's, the state is the free tree's, and the chunk's own bytes were never going
+            // to be read. So a tail that runs into a page the memory manager has trimmed takes
+            // nothing from the answer — and asked afterwards, the chunk was dropped for that
+            // tail and its pages filed as an untagged gap instead, which is what `pool_chunk`
+            // then answered for the allocation's own address. Measured on a live 26100 kernel
+            // (`ctf-vm`, 2026-10-07): the `CIcr` allocation at 0xffffa9099c86f000 sits 0x20
+            // into a 0x12c0-byte chunk whose header is resident and whose tail is not, and
+            // `!pool` named it from the table while this walk answered `....`.
+            let big_pool = (chunk_size as u64 > MAX_POOL_HEADER_CHUNK)
+                .then(|| {
+                    let end = header_address.saturating_add(chunk_size as u64);
+                    region.big_pool.iter().find(|(address, entry)| {
+                        (header_address..end).contains(*address)
+                            && address.saturating_add(entry.size) <= end
+                    })
+                })
+                .flatten()
+                .map(|(address, entry)| (*address, *entry));
+            if let Some((address, entry)) = big_pool {
+                let mut span =
+                    self.base_span(region, address, address, entry.size, entry.tag, state);
+                span.size_class = chunk_size.min(u32::MAX as usize) as u32;
+                snapshot.record_span(span);
+                previous_chunk = Some(chunk_size);
+                offset += chunk_size;
+                resume = base + offset as u64;
+                // Past the extent when the tail is in the hole ahead, which is what tells the
+                // extent loop not to file that hole over this span.
+                covered_through = resume;
+                chunks += 1;
+                if snapshot.match_limit_reached() {
+                    break;
+                }
+                continue;
+            }
             // The chunk reaches past the committed extent, which after the bound check in
             // `decode_vs_chunk` can only mean a hole ahead of it inside the subsegment — so
             // this is the ordinary free chunk with a decommitted interior, not a walk running
@@ -3024,49 +3144,6 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 ));
                 snapshot.complete = false;
                 break;
-            }
-            let state = if region.cached_chunks.contains(&header_address) {
-                PoolState::CachedFree
-            } else if region.reusable_chunks.contains(&header_address) {
-                PoolState::ReusableFree
-            } else if chunk.allocated {
-                PoolState::Allocated
-            } else {
-                PoolState::ReusableFree
-            };
-            // **A chunk too large for `_POOL_HEADER.BlockSize` carries no header**, so decoding
-            // one out of it reads the caller's own first sixteen bytes as a tag. Its name is in
-            // `nt!PoolBigPageTable`, which discovery resolved into `region.big_pool`.
-            //
-            // Matched by **containment** rather than by arithmetic on the chunk header: the
-            // table's `Va` is where the allocation starts, and taking it as given costs nothing
-            // and assumes nothing about what sits between the two — which is the one thing here
-            // that is measured and not yet explained (`windbg-mcp` FOLLOWUPS item 99). The size
-            // has to fit inside the chunk as well, so an entry can only be claimed by a chunk
-            // that could really hold it.
-            let big_pool = (chunk_size as u64 > MAX_POOL_HEADER_CHUNK)
-                .then(|| {
-                    let end = header_address.saturating_add(chunk_size as u64);
-                    region.big_pool.iter().find(|(address, entry)| {
-                        (header_address..end).contains(*address)
-                            && address.saturating_add(entry.size) <= end
-                    })
-                })
-                .flatten()
-                .map(|(address, entry)| (*address, *entry));
-            if let Some((address, entry)) = big_pool {
-                let mut span =
-                    self.base_span(region, address, address, entry.size, entry.tag, state);
-                span.size_class = chunk_size.min(u32::MAX as usize) as u32;
-                snapshot.record_span(span);
-                previous_chunk = Some(chunk_size);
-                offset += chunk_size;
-                resume = base + offset as u64;
-                chunks += 1;
-                if snapshot.match_limit_reached() {
-                    break;
-                }
-                continue;
             }
             let candidate = header_address + region.vs_header_size as u64;
             let physical_header = if region.pool_header.size == 0 {
@@ -3132,7 +3209,10 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 .diagnostics
                 .push(format!("VS traversal limit reached at {base:#x}"));
         }
-        (!lost).then_some(resume)
+        (!lost).then_some(VsResume {
+            next: resume,
+            covered_through,
+        })
     }
 
     fn walk_page_ranges(
@@ -4992,6 +5072,141 @@ mod tests {
             "and the walk says which chunk it dropped: {:?}",
             unasked.diagnostics.examples()
         );
+    }
+
+    /// The paged-out half of `windbg-mcp` FOLLOWUPS item 99, VS side. A big-pool chunk's tag
+    /// and length are the table's and its state is the free tree's; its own pages were never
+    /// going to be read. So a tail in a page the memory manager has trimmed takes nothing from
+    /// the span — and the walk used to drop the chunk for that tail and file its pages as an
+    /// untagged gap, which is what `pool_chunk` then answered for the allocation's own
+    /// address. Measured on `ctf-vm` (26100.33438, 2026-10-07): `CIcr` at 0xffffa9099c86f000,
+    /// 0x20 into a 0x12c0-byte chunk with a resident header and a trimmed tail, `!pool` naming
+    /// it and this walk answering `....`, 4096 bytes, `unreadable`.
+    ///
+    /// The control is the same fixture with no table entry, and it must still drop the chunk:
+    /// without the table, a chunk that large with an unread tail is a real hole in what was
+    /// seen, and a span over it would be the walk asserting what it did not read.
+    #[test]
+    fn test_a_big_pool_chunk_whose_tail_is_paged_out_is_still_named_from_the_table() {
+        let chunks = [(0x2000usize, 0usize), (0x40, 0x2000)];
+        let hole = VS_BASE + 0x1000;
+        let allocation = hole;
+        let walk = |named: bool| {
+            let bytes = vs_extent(&chunks);
+            let mut region = vs_region(bytes.len());
+            if named {
+                region.big_pool = Arc::new(HashMap::from([(
+                    allocation,
+                    BigPageEntry {
+                        tag: u32::from_le_bytes(*b"BIGV"),
+                        size: 0x1000,
+                    },
+                )]));
+            }
+            let mut memory = HoleyMemory::new(VS_BASE, bytes);
+            memory.holes.insert(hole);
+            // Committed, so the hole is memory the target has and cannot read — a trimmed
+            // page, not a decommitted interior.
+            let memory = memory.with_memory_manager(&[]);
+            walk_holey(&memory, &region)
+        };
+
+        let named = walk(true);
+        let big = named
+            .spans
+            .iter()
+            .find(|span| span.size_class == 0x2000)
+            .unwrap_or_else(|| panic!("the chunk the table names is missing: {:?}", named.spans));
+        assert_eq!(super::super::decode::display_tag(big.raw_tag), "BIGV");
+        assert_eq!(big.header_address, allocation);
+        assert_eq!(big.usable_address, allocation);
+        assert_eq!(big.size, 0x1000);
+        assert_eq!(big.state, PoolState::Allocated);
+        assert!(
+            !named
+                .spans
+                .iter()
+                .any(|span| span.state == PoolState::Unreadable),
+            "the trimmed page is inside a span the index holds, so it is not also a gap: {:?}",
+            named.spans
+        );
+        assert!(
+            named.spans.iter().any(|span| span.size_class == 0x40),
+            "the chain crosses the hole to the chunk after it: {:?}",
+            named.spans
+        );
+        assert_eq!(named.unplaced_bytes, 0);
+        assert!(
+            named.complete,
+            "nothing about the chunk was unknown: {:?}",
+            named.diagnostics.examples()
+        );
+
+        let unnamed = walk(false);
+        assert!(
+            !unnamed.spans.iter().any(|span| span.size_class == 0x2000),
+            "without the table the chunk is not invented: {:?}",
+            unnamed.spans
+        );
+        assert!(
+            unnamed
+                .spans
+                .iter()
+                .any(|span| span.state == PoolState::Unreadable && span.header_address == hole),
+            "and its trimmed page is filed as the gap it is: {:?}",
+            unnamed.spans
+        );
+        assert!(!unnamed.complete);
+    }
+
+    /// The same half, segment side. Discovery names an allocated page range from the table,
+    /// and there is nothing on its pages to add: `walk_page_ranges` emits the one span and
+    /// skips the header decode. Reading the pages anyway cost the allocation when they were
+    /// trimmed — the range was filed as an untagged gap and the name went unused (`Gcac` at
+    /// 0xffffa4b05e1b5000, lab 29671, 2026-10-07) — and cost every resident one a read whose
+    /// bytes were then discarded: 111 MB of them on that kernel, summed over the live entries.
+    /// So a named range is answered without asking the memory at all, which the query count
+    /// pins; the control is the same range unnamed, which has to be read and cannot be.
+    #[test]
+    fn test_a_page_range_the_table_names_is_answered_without_reading_it() {
+        let size = 0x2000usize;
+        let walk = |named: bool| {
+            let mut region = vs_region(size);
+            region.backend = PoolBackend::Segment;
+            region.unit_size = size as u32;
+            region.states = vec![PoolState::Allocated];
+            region.pool_header.size = 0;
+            region.known_tag = named.then_some(u32::from_le_bytes(*b"BIGP"));
+            let mut memory = HoleyMemory::new(VS_BASE, vec![0; size]);
+            memory.holes.extend([VS_BASE, VS_BASE + 0x1000]);
+            let memory = memory.with_memory_manager(&[]);
+            let snapshot = walk_holey(&memory, &region);
+            (snapshot, memory.queries.get())
+        };
+
+        let (named, queries) = walk(true);
+        assert_eq!(queries, 0, "the table answered; the pages were not asked");
+        let [span] = named.spans.as_slice() else {
+            panic!("one span for one allocation: {:?}", named.spans);
+        };
+        assert_eq!(super::super::decode::display_tag(span.raw_tag), "BIGP");
+        assert_eq!(span.header_address, VS_BASE);
+        assert_eq!(span.usable_address, VS_BASE);
+        assert_eq!(span.size, size as u64);
+        assert_eq!(span.state, PoolState::Allocated);
+        assert!(named.complete);
+
+        let (unnamed, queries) = walk(false);
+        assert!(queries > 0, "an unnamed range has to be read");
+        assert!(
+            unnamed
+                .spans
+                .iter()
+                .all(|span| span.state == PoolState::Unreadable),
+            "and when it cannot be, that is all the walk can say: {:?}",
+            unnamed.spans
+        );
+        assert!(!unnamed.complete);
     }
 
     /// glslang/dbgscope#104, settled on live 26100: every stall the walk met answered `0x0+0x0`,
