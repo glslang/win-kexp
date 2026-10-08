@@ -2522,6 +2522,99 @@ pub enum Effect {
     Other,
 }
 
+/// What a privileged instruction **reaches**: which family of machine state it needs the
+/// privilege for.
+///
+/// [`Instruction::privileged`] says *whether*; this says *which*, and it is `Some` exactly when
+/// that is `true`. That is not a coincidence for a caller to hope for but how both are built:
+/// every decoder here produces the family, and `privileged` is whether there is one. So the two
+/// cannot disagree, and no privileged instruction goes unclassified — one that none of the named
+/// families describes is [`Self::Other`], which costs a name and never a finding.
+///
+/// **From the decoder rather than from a table of mnemonics**, for the reason
+/// [`Instruction::privileged`] is: a consumer naming the family itself keeps one table per
+/// architecture, misses whatever its author did not remember, and has to keep two namespaces from
+/// colliding — x86's `str` stores the task register, and A64's stores a register to memory. On x86
+/// the answer is read off iced: its CPUID features, which separate the VMX and SVM families
+/// without naming their instructions; the registers the instruction touches, so `mov cr3,rax`
+/// reaches a control register because `cr3` is one, and `clts` because iced reports the `cr0` it
+/// writes without naming it; and the flags it sets or clears. Three families have no such signal
+/// and are matched on iced's typed mnemonic, as [`Effect`] is — port I/O, the descriptor-table
+/// loads, and cache or TLB maintenance, where `invd`, `wbinvd` and `invlpg` carry no feature of
+/// their own — and so is `xsetbv`, whose register iced does not model. On A64 it is the
+/// system-register encoding, which says which register space is reached rather than requiring the
+/// instruction to be recognised by name.
+///
+/// **It is not a severity.** Whether a control-register write matters more than a port read is the
+/// consumer's question. **Nor is it membership**: an instruction that needs no privilege answers
+/// `None` even where it touches one of these. `sgdt` reads the descriptor table from user mode,
+/// and a consumer that reports it anyway is making a judgement that belongs to that consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Privilege {
+    /// Reads or writes an I/O port — `in`, `out`, `ins`, `outs`. x86 only: A64 has no port space.
+    PortIo,
+    /// Reads or writes a model-specific register.
+    ///
+    /// On x86, `rdmsr`, `wrmsr` and their list and non-serialising forms, by iced's CPUID feature.
+    /// On A64, a register in the IMPLEMENTATION DEFINED space — `op0` 3 with `CRn` 11 or 15 — which
+    /// is what the architecture sets aside for registers a particular implementation defines.
+    ModelSpecificRegister,
+    /// Reads or writes a control or debug register.
+    ///
+    /// On x86, `cr0`–`cr15` and `dr0`–`dr15` by whatever form reaches them — `mov`, and `clts` and
+    /// `lmsw`, which write `cr0` without naming it — and `xsetbv`, which writes the extended
+    /// control register `ecx` selects.
+    ///
+    /// On A64, every system register the encoding puts above EL0 that no other family claims,
+    /// the debug registers (`op0` 2) included, and the processor-state fields an immediate `msr`
+    /// reaches — `pan`, `uao`, `spsel` — those being the same registers under their other
+    /// encoding. A64 has no control-register file apart from its system registers: `SCTLR_EL1`
+    /// and `TTBR1_EL1` are what x86 calls `cr0` and `cr3`.
+    ControlRegister,
+    /// Loads a descriptor table — `lgdt`, `lidt`, `lldt`, `ltr`.
+    ///
+    /// x86 only. A64 has no descriptor tables, and the register holding its exception vectors'
+    /// base, `VBAR_EL1`, is a [`Self::ControlRegister`] like the rest of its system registers.
+    /// The *stores* — `sgdt`, `sidt`, `sldt`, `str` — need no privilege and are not here.
+    DescriptorTable,
+    /// Masks or unmasks interrupts: `cli` and `sti`, and A64's `DAIF` and `ALLINT` by either
+    /// encoding — as a register, and as a processor-state field.
+    ///
+    /// On x86 this is read from the flags: an instruction that **sets or clears** `IF` outright.
+    /// `sysret`, `rsm` and `erets` *write* `IF` too, restoring the whole of the flags from a saved
+    /// image, and they are returns rather than interrupt-mask operations — which is the difference
+    /// between iced's set-or-cleared and its written, and why the first is the one asked.
+    ///
+    /// The interrupt *priority* registers — x86's `cr8`, A64's `ICC_PMR_EL1` — are
+    /// [`Self::ControlRegister`]: they raise a threshold rather than masking, and each is reached
+    /// as the register it is.
+    InterruptFlag,
+    /// Invalidates or writes back a cache or a TLB: `invd`, `wbinvd`, `wbnoinvd`, `invlpg`,
+    /// `invpcid`, `invlpgb` and `tlbsync`; A64's `dc`, `ic` and `tlbi`, `tlbi`'s `nXS` forms
+    /// included.
+    ///
+    /// The VMX and SVM invalidations — `invept`, `invvpid`, `invlpga` — are
+    /// [`Self::Virtualization`] instead: they invalidate a guest's translations, and the CPUID
+    /// feature they carry names the family that has guests. A64's `at` is not here either. It asks
+    /// for a translation and maintains nothing, so it is [`Self::Other`].
+    CacheOrTlb,
+    /// A hardware-virtualisation operation: the VMX, SVM, SEV-SNP and TDX families on x86, by
+    /// iced's CPUID feature; A64's `hvc`, and `smc` beside it, which is the same act one layer
+    /// further out — a call that leaves the kernel for the secure monitor rather than the
+    /// hypervisor.
+    ///
+    /// `vmcall` and `vmmcall` are absent because they need no privilege — a guest makes them from
+    /// any level — and so answer `None` like any other unprivileged instruction.
+    Virtualization,
+    /// Privileged, and in none of the families above: `hlt`, `swapgs`, `sysret`, the SMAP and CET
+    /// supervisor operations on x86; A64's `eret`, `at`, and the `sys` space past the operations
+    /// it names.
+    ///
+    /// **This is what lets the family be incomplete safely.** One nobody wrote down lands here,
+    /// with [`Instruction::mnemonic`] still beside it to say what it was, rather than vanishing.
+    Other,
+}
+
 /// One operand of an instruction, as its **encoding** says rather than as the engine printed it.
 ///
 /// There is no symbol anywhere in here, and that is the point. A destination is an address;
@@ -2552,7 +2645,8 @@ pub enum Operand {
     /// `sve`, `advanced-simd`, `unallocated`. It is the whole operand list where it appears, and
     /// every other field of the [`Instruction`] is a default rather than an answer — no
     /// registers in [`Instruction::writes`] or [`Instruction::reads`], `false` for
-    /// [`Instruction::privileged`] and [`Instruction::writes_flags`], [`Effect::Other`].
+    /// [`Instruction::privileged`] and [`Instruction::writes_flags`], `None` for
+    /// [`Instruction::privilege`], [`Effect::Other`].
     ///
     /// # Why an instruction set can be read and an instruction in it not
     ///
@@ -2650,6 +2744,14 @@ pub struct Instruction {
     /// One deliberate gap on x64, iced's rather than this crate's: `vmcall` is excluded, being the
     /// one CPL=0-encoded instruction a guest executes at any privilege level.
     pub privileged: bool,
+    /// Which family of machine state a privileged instruction reaches — an I/O port, a
+    /// model-specific or control register, a descriptor table, the interrupt mask, a cache or TLB,
+    /// virtualisation, or [`Privilege::Other`] for the rest.
+    ///
+    /// `Some` exactly when [`Self::privileged`] is `true`, both being built from this one value,
+    /// so a caller can match on it alone. `None` on an instruction set whose operands this build
+    /// does not decode, for the reason `privileged` is `false` there.
+    pub privilege: Option<Privilege>,
     /// What the instruction does to its operands, in the classes an analysis branches on.
     ///
     /// [`Effect::Other`] for an instruction set whose operands this build does not decode, which
@@ -3240,6 +3342,7 @@ pub fn decode_instruction(bytes: &[u8], address: u64, set: InstructionSet) -> In
         operands: decoded.operands,
         flow: decoded.flow,
         privileged: decoded.privileged,
+        privilege: decoded.privilege,
         effect: decoded.effect,
         condition: decoded.condition,
         writes_flags: decoded.writes_flags,
@@ -3308,6 +3411,7 @@ fn split_instruction(address: u64, line: &str, set: InstructionSet) -> Instructi
         operands: decoded.operands,
         flow: decoded.flow,
         privileged: decoded.privileged,
+        privilege: decoded.privilege,
         effect: decoded.effect,
         condition: decoded.condition,
         writes_flags: decoded.writes_flags,
@@ -3346,6 +3450,9 @@ pub(crate) struct Decoded {
     pub(crate) operands: Vec<Operand>,
     pub(crate) flow: Flow,
     pub(crate) privileged: bool,
+    /// `Some` exactly when [`Self::privileged`] is `true`, and set beside it from one value by
+    /// each of the two decoders that build this.
+    pub(crate) privilege: Option<Privilege>,
     pub(crate) effect: Effect,
     pub(crate) condition: Option<Condition>,
     pub(crate) writes_flags: bool,
@@ -3369,6 +3476,7 @@ impl Decoded {
             operands: Vec::new(),
             flow,
             privileged: false,
+            privilege: None,
             effect: Effect::Other,
             condition: None,
             writes_flags: false,
@@ -3426,11 +3534,13 @@ fn decode_operation(bytes: &[u8], address: u64, set: InstructionSet) -> Decoded 
         .map(|index| read_decoded_operand(&decoded, index, bitness))
         .collect();
     let (reads, writes) = touched_registers(&decoded, bitness);
+    let privilege = decoded_privilege(&decoded);
     Decoded {
         mnemonic,
         operands,
         flow: decoded_flow(&decoded),
-        privileged: decoded.is_privileged(),
+        privileged: privilege.is_some(),
+        privilege,
         effect: decoded_effect(&decoded),
         condition: decoded_condition(&decoded),
         // Any flag at all: what a caller is asking is "did this set the flags the branch after it
@@ -3453,6 +3563,19 @@ fn decode_operation(bytes: &[u8], address: u64, set: InstructionSet) -> Decoded 
 /// per instruction — which `decode_range` pays over hundreds of functions to split something it
 /// already had. The two filters below run over the one borrow.
 ///
+/// The factory is [`with_used_registers`]', and is shared with [`decoded_privilege`].
+fn touched_registers(
+    decoded: &iced_x86::Instruction,
+    bitness: u32,
+) -> (Vec<RegisterOperand>, Vec<RegisterOperand>) {
+    with_used_registers(decoded, |used| {
+        (read_from(used, bitness), written_from(used, bitness))
+    })
+}
+
+/// Every register an instruction uses, explicit and implicit, handed to `read` while the
+/// factory that computed them is borrowed.
+///
 /// **One factory, kept for the thread.** iced's factory exists to be reused -- it owns the vectors
 /// the answer is built in -- so making one per instruction throws those away and allocates again
 /// for the next, which `decode_range` does once per instruction over hundreds of functions.
@@ -3461,10 +3584,10 @@ fn decode_operation(bytes: &[u8], address: u64, set: InstructionSet) -> Decoded 
 /// spread this crate's bookkeeping into theirs. `NO_MEMORY_USAGE` because the memory half of the
 /// answer is gathered and thrown away here — the registers that *form* an address are in
 /// `used_registers()` either way, which is why [`Instruction::reads`] has them.
-fn touched_registers(
+fn with_used_registers<R>(
     decoded: &iced_x86::Instruction,
-    bitness: u32,
-) -> (Vec<RegisterOperand>, Vec<RegisterOperand>) {
+    read: impl FnOnce(&[iced_x86::UsedRegister]) -> R,
+) -> R {
     use iced_x86::InstructionInfoOptions;
     thread_local! {
         static FACTORY: std::cell::RefCell<iced_x86::InstructionInfoFactory> =
@@ -3472,10 +3595,11 @@ fn touched_registers(
     }
     FACTORY.with(|factory| {
         let mut factory = factory.borrow_mut();
-        let used = factory
-            .info_options(decoded, InstructionInfoOptions::NO_MEMORY_USAGE)
-            .used_registers();
-        (read_from(used, bitness), written_from(used, bitness))
+        read(
+            factory
+                .info_options(decoded, InstructionInfoOptions::NO_MEMORY_USAGE)
+                .used_registers(),
+        )
     })
 }
 
@@ -3564,6 +3688,81 @@ fn decoded_effect(decoded: &iced_x86::Instruction) -> Effect {
         Mnemonic::Pop => Effect::Pop,
         _ => Effect::Other,
     }
+}
+
+/// Which family a privileged x86 instruction reaches, from what iced already knows about it; `None`
+/// for one that needs no privilege. [`Privilege`] says what each family is.
+///
+/// **The order is the precedence, and it decides exactly one encoding.** iced 1.21 calls 156
+/// encodings privileged, and 132 of them decode without options -- the other 24 are Cyrix,
+/// `loadall`, `mov tr` and similar forms a decoder option has to turn on, which this crate never
+/// sets. Every one of the 132 answers yes to at most one of the questions below, except `skinit`,
+/// which clears every flag, `IF` included, on its way into a secure loader. It is an SVM
+/// instruction, and asking the feature first is what says so.
+fn decoded_privilege(decoded: &iced_x86::Instruction) -> Option<Privilege> {
+    use iced_x86::{CpuidFeature, Mnemonic, RflagsBits};
+    if !decoded.is_privileged() {
+        return None;
+    }
+    let feature = |wanted: &[CpuidFeature]| {
+        decoded
+            .cpuid_features()
+            .iter()
+            .any(|feature| wanted.contains(feature))
+    };
+    let family = if feature(&[
+        CpuidFeature::VMX,
+        CpuidFeature::SVM,
+        CpuidFeature::SKINIT_or_SVM,
+        CpuidFeature::SEV_SNP,
+        CpuidFeature::RMPQUERY,
+        CpuidFeature::TDX,
+    ]) {
+        Privilege::Virtualization
+    } else if feature(&[
+        CpuidFeature::MSR,
+        CpuidFeature::MSRLIST,
+        CpuidFeature::WRMSRNS,
+    ]) {
+        Privilege::ModelSpecificRegister
+    } else if decoded.mnemonic() == Mnemonic::Xsetbv
+        || with_used_registers(decoded, |used| {
+            used.iter()
+                .any(|used| used.register().is_cr() || used.register().is_dr())
+        })
+    {
+        // The used registers rather than the operands, which is what reaches `clts` and `lmsw`:
+        // both write `cr0` and neither names it. `xsetbv` writes `XCR0`, which iced has no
+        // register for, so it is the one control-register write matched by name.
+        Privilege::ControlRegister
+    } else if (decoded.rflags_set() | decoded.rflags_cleared()) & RflagsBits::IF != 0 {
+        // Set or cleared, not written: `sysret`, `rsm` and `erets` write `IF` by restoring every
+        // flag at once, and they are returns.
+        Privilege::InterruptFlag
+    } else {
+        match decoded.mnemonic() {
+            Mnemonic::In
+            | Mnemonic::Out
+            | Mnemonic::Insb
+            | Mnemonic::Insw
+            | Mnemonic::Insd
+            | Mnemonic::Outsb
+            | Mnemonic::Outsw
+            | Mnemonic::Outsd => Privilege::PortIo,
+            Mnemonic::Lgdt | Mnemonic::Lidt | Mnemonic::Lldt | Mnemonic::Ltr => {
+                Privilege::DescriptorTable
+            }
+            Mnemonic::Invd
+            | Mnemonic::Wbinvd
+            | Mnemonic::Wbnoinvd
+            | Mnemonic::Invlpg
+            | Mnemonic::Invpcid
+            | Mnemonic::Invlpgb
+            | Mnemonic::Tlbsync => Privilege::CacheOrTlb,
+            _ => Privilege::Other,
+        }
+    };
+    Some(family)
 }
 
 /// The condition a conditional branch reads, from the decoder's `ConditionCode`.
@@ -7359,6 +7558,12 @@ impl DebugEngine {
                 true => (Vec::new(), Vec::new()),
                 false => touched_registers(&decoded, bitness),
             };
+            // `None` for bytes that did not decode, for the same reason the flow below is
+            // `Unknown` there: nothing was read, so nothing is claimed.
+            let privilege = match decoded.is_invalid() {
+                true => None,
+                false => decoded_privilege(&decoded),
+            };
             out.push(Instruction {
                 address: at,
                 bytes: hex::encode(encoding),
@@ -7383,9 +7588,8 @@ impl DebugEngine {
                 } else {
                     decoded_flow(&decoded)
                 },
-                // `false` for bytes that did not decode, for the same reason the flow is
-                // `Unknown` there: nothing was read, so nothing is claimed.
-                privileged: !decoded.is_invalid() && decoded.is_privileged(),
+                privileged: privilege.is_some(),
+                privilege,
                 effect: if decoded.is_invalid() {
                     Effect::Other
                 } else {
@@ -7432,6 +7636,7 @@ impl DebugEngine {
                     operands: decoded.operands,
                     flow: decoded.flow,
                     privileged: decoded.privileged,
+                    privilege: decoded.privilege,
                     effect: decoded.effect,
                     condition: decoded.condition,
                     writes_flags: decoded.writes_flags,
@@ -11534,6 +11739,75 @@ mod tests {
         );
         assert!(!arm32.privileged);
         assert_eq!(arm32.flow, Flow::Unknown);
+    }
+
+    /// Which family a privileged instruction reaches is the decoder's answer too, read off what it
+    /// already knows: a CPUID feature, a register the instruction touches whether or not it names
+    /// it, the flags it sets or clears -- and for the three families with no such signal, port
+    /// I/O, the descriptor-table loads and cache or TLB maintenance, iced's typed mnemonic.
+    ///
+    /// The cases are the ones a table keyed on a printed mnemonic gets wrong or never reaches:
+    /// `mov` is a control-register access only when a control register is an operand; `clts` and
+    /// `lmsw` write `cr0` without naming it; `invept` is a TLB invalidation that belongs with
+    /// VMX; `skinit` clears `IF` and is an SVM instruction first; `sysretq` writes `IF` and is a
+    /// return rather than an interrupt mask; and `sgdt`, which a hazard report may well want,
+    /// needs no privilege and so has no family here.
+    ///
+    /// `bytes` is asserted as well as the flow, because [`decode_instruction`] reports only what
+    /// it consumed: a row whose encoding decoded as something shorter fails there rather than
+    /// asserting a family about a different instruction.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
+    fn test_a_privileged_instruction_says_which_family_it_reaches() {
+        use Privilege::*;
+        let (x64, x86) = (InstructionSet::Amd64, InstructionSet::X86);
+        for (set, bytes, text, family) in [
+            (x64, "ec", "in al,dx", Some(PortIo)),
+            (x64, "e680", "out 80h,al", Some(PortIo)),
+            (x64, "6c", "insb", Some(PortIo)),
+            (x64, "0f32", "rdmsr", Some(ModelSpecificRegister)),
+            (x64, "0f30", "wrmsr", Some(ModelSpecificRegister)),
+            (x64, "0f22d8", "mov cr3,rax", Some(ControlRegister)),
+            (x64, "0f20d8", "mov rax,cr3", Some(ControlRegister)),
+            (x64, "440f22c0", "mov cr8,rax", Some(ControlRegister)),
+            (x64, "0f23f8", "mov dr7,rax", Some(ControlRegister)),
+            (x64, "0f06", "clts", Some(ControlRegister)),
+            (x64, "0f01f0", "lmsw ax", Some(ControlRegister)),
+            (x64, "0f01d1", "xsetbv", Some(ControlRegister)),
+            (x64, "0f0110", "lgdt [rax]", Some(DescriptorTable)),
+            (x64, "0f0118", "lidt [rax]", Some(DescriptorTable)),
+            (x64, "0f00d0", "lldt ax", Some(DescriptorTable)),
+            (x64, "0f00d8", "ltr ax", Some(DescriptorTable)),
+            (x64, "fa", "cli", Some(InterruptFlag)),
+            (x64, "fb", "sti", Some(InterruptFlag)),
+            (x64, "0f08", "invd", Some(CacheOrTlb)),
+            (x64, "0f09", "wbinvd", Some(CacheOrTlb)),
+            (x64, "0f0138", "invlpg [rax]", Some(CacheOrTlb)),
+            (x64, "660f388200", "invpcid rax,[rax]", Some(CacheOrTlb)),
+            (x64, "0f01c2", "vmlaunch", Some(Virtualization)),
+            (x64, "0f01d8", "vmrun", Some(Virtualization)),
+            (x64, "660f388000", "invept rax,[rax]", Some(Virtualization)),
+            (x64, "0f01de", "skinit", Some(Virtualization)),
+            (x64, "f4", "hlt", Some(Other)),
+            (x64, "0f01f8", "swapgs", Some(Other)),
+            (x64, "480f07", "sysretq", Some(Other)),
+            (x64, "0f01cb", "stac", Some(Other)),
+            (x64, "0f0100", "sgdt [rax]", None),
+            (x64, "0f01c1", "vmcall", None),
+            (x64, "0f31", "rdtsc", None),
+            (x64, "4889d8", "mov rax,rbx", None),
+            (x86, "0f22d8", "mov cr3,eax", Some(ControlRegister)),
+            (x86, "fa", "cli", Some(InterruptFlag)),
+        ] {
+            let one = decode_instruction(&hex::decode(bytes).unwrap(), 0x1000, set);
+            assert_ne!(one.flow, Flow::Unknown, "`{text}` must decode: {one:?}");
+            assert_eq!(one.bytes, bytes, "`{text}` must decode whole: {one:?}");
+            assert_eq!(one.privilege, family, "`{text}`: {one:?}");
+            assert_eq!(one.privileged, family.is_some(), "`{text}`: {one:?}");
+        }
     }
 
     /// The address is the walk's, not the line's. Asserted against a line that disagrees, because

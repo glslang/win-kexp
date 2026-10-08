@@ -228,7 +228,9 @@
 //! about. A post-indexed addressing mode's amount is named, having nowhere to be folded into —
 //! see [`post_index_amount`].
 
-use crate::dbgeng::{Condition, Decoded, Effect, MemoryOperand, Operand, RegisterOperand};
+use crate::dbgeng::{
+    Condition, Decoded, Effect, MemoryOperand, Operand, Privilege, RegisterOperand,
+};
 
 /// One instruction's decoded shape, built up by the arms below.
 ///
@@ -240,7 +242,7 @@ struct Out {
     effect: Effect,
     condition: Option<Condition>,
     writes_flags: bool,
-    privileged: bool,
+    privilege: Option<Privilege>,
     writes: Vec<RegisterOperand>,
     reads: Vec<RegisterOperand>,
 }
@@ -253,7 +255,7 @@ impl Out {
             effect: Effect::Other,
             condition: None,
             writes_flags: false,
-            privileged: false,
+            privilege: None,
             writes: Vec::new(),
             reads: Vec::new(),
         }
@@ -285,8 +287,11 @@ impl Out {
         self
     }
 
-    fn privileged(mut self) -> Self {
-        self.privileged = true;
+    /// Needs privilege to execute, and reaches `family` with it. There is no way to say the first
+    /// without the second, which is what keeps [`Decoded::privileged`] and
+    /// [`Decoded::privilege`] from disagreeing.
+    fn privileged(mut self, family: Privilege) -> Self {
+        self.privilege = Some(family);
         self
     }
 
@@ -629,7 +634,8 @@ pub(crate) fn decode(word: u32, address: u64) -> Decoded {
         mnemonic: out.mnemonic,
         operands: out.operands,
         flow: super::flow(word, address),
-        privileged: out.privileged,
+        privileged: out.privilege.is_some(),
+        privilege: out.privilege,
         effect: out.effect,
         condition: out.condition,
         writes_flags: out.writes_flags,
@@ -1211,7 +1217,7 @@ fn branch_register(word: u32) -> Out {
                 "" => "eret".to_string(),
                 key => format!("ereta{key}"),
             })
-            .privileged();
+            .privileged(Privilege::Other);
             // `eretaa`/`eretab` authenticate the saved exception return address against the stack
             // pointer, exactly as `retaa` does the link register, and name it no more than that
             // one does. Raised on dbgscope#171: the `ret` arm above recorded the modifier and this
@@ -1221,7 +1227,9 @@ fn branch_register(word: u32) -> Out {
                 false => out.reads_only(stack_pointer()),
             }
         }
-        0b0101 if key.is_empty() && rn == 0b11111 && op4 == 0 => Out::new("drps").privileged(),
+        0b0101 if key.is_empty() && rn == 0b11111 && op4 == 0 => {
+            Out::new("drps").privileged(Privilege::Other)
+        }
         _ => Out::undecoded("unallocated"),
     }
 }
@@ -1237,8 +1245,12 @@ fn exception(word: u32) -> Out {
     let (opc, ll) = (field(word, 21, 3), field(word, 0, 2));
     match (opc, ll) {
         (0b000, 0b01) => Out::new("svc").imm(immediate),
-        (0b000, 0b10) => Out::new("hvc").imm(immediate).privileged(),
-        (0b000, 0b11) => Out::new("smc").imm(immediate).privileged(),
+        (0b000, 0b10) => Out::new("hvc")
+            .imm(immediate)
+            .privileged(Privilege::Virtualization),
+        (0b000, 0b11) => Out::new("smc")
+            .imm(immediate)
+            .privileged(Privilege::Virtualization),
         (0b001, 0b00) => Out::new("brk").imm(immediate),
         // **`hlt` is not privileged here, though the x86 instruction of that name is.** A64's is a
         // debug trap -- it enters Debug state where halting is allowed and is UNDEFINED where it
@@ -1248,7 +1260,7 @@ fn exception(word: u32) -> Out {
         (0b011, 0b00) => Out::new("tcancel").imm(immediate),
         (0b101, level @ 0b01..=0b11) => Out::new(&format!("dcps{level}"))
             .imm(immediate)
-            .privileged(),
+            .privileged(Privilege::Other),
         _ => Out::undecoded("unallocated"),
     }
 }
@@ -1290,17 +1302,29 @@ fn system(word: u32) -> Out {
         // operation names: what the four are is decided by which register space is reached, and
         // the operation's own name would be a table of a hundred rows to gain a spelling the
         // engine's rendering already carries.
+        //
+        // **The family comes out of the same match**, so a name and a family cannot disagree --
+        // and three cells this match used to miss would have carried the miss into both. Measured
+        // by disassembling every word of `CRn` 7, 8 and 9 with LLVM, whose aliases are generated
+        // from the architecture: `CRn` 9 is `CRn` 8's operations again, the `nXS` forms of
+        // `tlbi` (FEAT_XS); `CRm` 9 is `at s1e1rp`, `s1e1wp` and `s1e1a` (FEAT_PAN2, FEAT_ATS1A);
+        // and `CRm` 15 is `dc civaps`, `cigdvaps`, `civaoc` and `cigdvaoc`. All three came out
+        // `sys`. What is left as `sys` in `CRn` 7 -- `apas`, `trcit`, the prediction restrictions
+        // and the guarded-stack operations -- is [`Privilege::Other`], as `at` is: none of them
+        // maintains a cache.
         (0b01, _) => {
-            let mnemonic = match (crn, crm) {
-                (0b0111, 0b1000) => "at",
-                (0b0111, 0b0001 | 0b0101) => "ic",
+            let (mnemonic, family) = match (crn, crm) {
+                (0b0111, 0b1000 | 0b1001) => ("at", Privilege::Other),
+                (0b0111, 0b0001 | 0b0101) => ("ic", Privilege::CacheOrTlb),
                 // The data-cache operations, by the `CRm` values that name one. `CRn` 7 alone is
                 // too wide: `CRm` 3 there is the prediction-restriction family, which the engine
                 // itself renders as a bare `sys`.
-                (0b0111, 0b0100 | 0b0110 | 0b1010 | 0b1011 | 0b1100 | 0b1101 | 0b1110) => "dc",
-                (0b1000, _) => "tlbi",
-                _ if load => "sysl",
-                _ => "sys",
+                (0b0111, 0b0100 | 0b0110 | 0b1010 | 0b1011 | 0b1100 | 0b1101 | 0b1110 | 0b1111) => {
+                    ("dc", Privilege::CacheOrTlb)
+                }
+                (0b1000 | 0b1001, _) => ("tlbi", Privilege::CacheOrTlb),
+                _ if load => ("sysl", Privilege::Other),
+                _ => ("sys", Privilege::Other),
             };
             let out = Out::new(mnemonic);
             let out = match load {
@@ -1332,7 +1356,7 @@ fn system(word: u32) -> Out {
             // set, and a rule with no exceptions is the one that stops generating them. Raised on
             // dbgscope#171, whose reviewer reached `dc cvau` by the same argument that reached
             // `DAIF` two rounds earlier; the third time it would have been `dc zva`.
-            out.privileged()
+            out.privileged(family)
         }
         // `msr`/`mrs` against a named system register. `op0` is 2 or 3 and is part of the name.
         (_, load) => {
@@ -1353,8 +1377,20 @@ fn system(word: u32) -> Out {
             // few lines above -- and there are 241 of them in this bench's kernel, which a hazard
             // scan was seeing none of. Raised on dbgscope#171; the `NZCV` beside it, one `op2`
             // away, really is EL0's to read and write.
+            // Which family, from the same five fields: the two interrupt masks by encoding, the
+            // IMPLEMENTATION DEFINED space by `CRn`, and every other system register a control
+            // register -- A64 having no control-register file apart from these.
+            let family = if interrupt_mask(op0, op1, crn, crm, op2)
+                || all_interrupts_mask(op0, op1, crn, crm, op2)
+            {
+                Privilege::InterruptFlag
+            } else if implementation_defined(op0, crn) {
+                Privilege::ModelSpecificRegister
+            } else {
+                Privilege::ControlRegister
+            };
             match privileged_level(op1) || interrupt_mask(op0, op1, crn, crm, op2) {
-                true => out.privileged(),
+                true => out.privileged(family),
                 false => out,
             }
         }
@@ -1382,6 +1418,24 @@ const fn privileged_level(op1: u32) -> bool {
 /// nothing rather than carrying a second table this one's shape would have suggested.
 const fn interrupt_mask(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> bool {
     op0 == 0b11 && op1 == 0b011 && crn == 0b0100 && crm == 0b0010 && op2 == 0b001
+}
+
+/// Whether a system *register* encoding is `ALLINT`, FEAT_NMI's mask over every interrupt,
+/// superpriority ones included.
+///
+/// **Only the family asks**, where [`interrupt_mask`] is asked by privilege too: `ALLINT`'s `op1`
+/// is EL1's, so the general rule already makes it privileged. What this adds is which family -- it
+/// masks interrupts as `DAIF` does, and [`pstate`] reaches it as a field as it reaches `daifset`.
+const fn all_interrupts_mask(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> bool {
+    op0 == 0b11 && op1 == 0b000 && crn == 0b0100 && crm == 0b0011 && op2 == 0b000
+}
+
+/// Whether a system *register* encoding is in the IMPLEMENTATION DEFINED space -- `op0` 3 with
+/// `CRn` 11 or 15 -- which the architecture sets aside for registers a particular implementation
+/// defines: A64's model-specific registers. None of the 1,118 registers `disarm64`'s generated
+/// table names is there, which is the check that this space holds nothing architected.
+const fn implementation_defined(op0: u32, crn: u32) -> bool {
+    op0 == 0b11 && matches!(crn, 0b1011 | 0b1111)
 }
 
 /// The `hint` space, by the seven bits of `CRm:op2`.
@@ -1553,8 +1607,15 @@ fn pstate(op1: u32, crm: u32, op2: u32) -> Out {
         (0b011, 0b110 | 0b111) => true,
         (op1, _) => privileged_level(op1),
     };
+    // **A field is the register it is a field of**, so the family is the one that register's own
+    // encoding gets: `daifset`, `daifclr` and `allint` mask interrupts, and `pan`, `uao` and
+    // `spsel` are system registers like any other.
+    let family = match (op1, op2) {
+        (0b011, 0b110 | 0b111) | (0b001, 0b000) => Privilege::InterruptFlag,
+        _ => Privilege::ControlRegister,
+    };
     match privileged {
-        true => out.privileged(),
+        true => out.privileged(family),
         false => out,
     }
 }
@@ -4008,6 +4069,73 @@ mod tests {
                 Operand::Immediate(4),
             ]
         );
+    }
+
+    /// Which family a privileged instruction reaches is read off the same fields its privilege
+    /// is, and it is `Some` exactly when the instruction is privileged: the builder cannot say one
+    /// without the other.
+    ///
+    /// A system register is a control register unless its encoding says otherwise -- the two
+    /// interrupt masks by their full encoding, and the IMPLEMENTATION DEFINED space by `CRn` --
+    /// and a processor-state field is the register it is a field of. A system *operation* is
+    /// cache or TLB maintenance where its `CRn`/`CRm` name one, and [`Privilege::Other`] where
+    /// they name `at` or nothing.
+    #[test]
+    fn test_a_privileged_instruction_says_which_family_it_reaches() {
+        use Privilege::*;
+        for (word, text, family) in [
+            (0xd518_2025_u32, "msr TTBR1_EL1,x5", Some(ControlRegister)),
+            // `op0` two is the debug registers, which are this family's other half on x86 too.
+            (0xd510_0240, "msr MDSCR_EL1,x0", Some(ControlRegister)),
+            (0xd51b_4220, "msr DAIF,x0", Some(InterruptFlag)),
+            (0xd53b_4221, "mrs x1,DAIF", Some(InterruptFlag)),
+            (0xd538_4300, "mrs x0,ALLINT", Some(InterruptFlag)),
+            (
+                0xd538_f200,
+                "mrs x0,S3_0_C15_C2_0",
+                Some(ModelSpecificRegister),
+            ),
+            (
+                0xd53f_b000,
+                "mrs x0,S3_7_C11_C0_0",
+                Some(ModelSpecificRegister),
+            ),
+            // `op1` three is EL0's in the IMPLEMENTATION DEFINED space as everywhere else, so this
+            // one needs no privilege and has no family -- the space does not make it a finding.
+            (0xd53b_f000, "mrs x0,S3_3_C15_C0_0", None),
+            (0xd53b_e04d, "mrs x13,CNTVCT_EL0", None),
+            (0xd53b_4208, "mrs x8,NZCV", None),
+            (0xd503_41df, "msr daifset,#1", Some(InterruptFlag)),
+            (0xd503_42ff, "msr daifclr,#2", Some(InterruptFlag)),
+            (0xd501_411f, "msr allint,#1", Some(InterruptFlag)),
+            (0xd500_419f, "msr pan,#1", Some(ControlRegister)),
+            (0xd500_40bf, "msr spsel,#0", Some(ControlRegister)),
+            (0xd508_871f, "tlbi VMALLE1", Some(CacheOrTlb)),
+            (0xd508_931f, "tlbi VMALLE1ISnXS", Some(CacheOrTlb)),
+            (0xd50b_7e20, "dc CIVAC,x0", Some(CacheOrTlb)),
+            (0xd50b_7420, "dc ZVA,x0", Some(CacheOrTlb)),
+            (0xd50b_7f01, "dc CIVAOC,x1", Some(CacheOrTlb)),
+            (0xd508_751f, "ic IALLU", Some(CacheOrTlb)),
+            (0xd508_7855, "at S1E0R,x21", Some(Other)),
+            (0xd508_7901, "at S1E1RP,x1", Some(Other)),
+            (0xd50b_7388, "sys #3,C7,C3,#4,x8", Some(Other)),
+            (0xd400_0002, "hvc #0", Some(Virtualization)),
+            (0xd400_0003, "smc #0", Some(Virtualization)),
+            (0xd400_0001, "svc #0", None),
+            (0xd69f_03e0, "eret", Some(Other)),
+            (0xd4a0_0001, "dcps1", Some(Other)),
+            (0xd503_201f, "nop", None),
+        ] {
+            let one = shapes(word);
+            assert_eq!(one.privilege, family, "`{text}` {word:#010x}: {one:?}");
+            assert_eq!(one.privileged, family.is_some(), "`{text}`: {one:?}");
+        }
+        // The three cells the name match used to miss, whose family comes out of the same arm:
+        // `CRn` 9 is `tlbi`'s `nXS` forms, `CRm` 9 is `at`, and `CRm` 15 is `dc`. LLVM disassembles
+        // all three that way.
+        assert_eq!(shapes(0xd508_931f).mnemonic, "tlbi");
+        assert_eq!(shapes(0xd508_7901).mnemonic, "at");
+        assert_eq!(shapes(0xd50b_7f01).mnemonic, "dc");
     }
 
     /// A pointer-authentication hint writes the link register and names nothing at all, which is

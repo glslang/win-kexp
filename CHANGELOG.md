@@ -34,6 +34,41 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`Instruction::privilege`: which family a privileged instruction reaches** (#153) — an I/O
+  port, a model-specific register, a control or debug register, a descriptor table, the interrupt
+  mask, a cache or TLB, hardware virtualisation, or `Privilege::Other` for the rest. It is `Some`
+  exactly when `privileged` is `true`, and that is how both are built rather than a property to
+  hope for: each decoder produces the family and `privileged` is whether there is one. So a
+  privileged instruction no family names is `Other`, with its mnemonic beside it, rather than
+  absent.
+
+  **From the decoder rather than from a table of mnemonics**, for the reason `privileged` is.
+  #151 took membership out of `windbg-mcp`'s `driver_hazards`, and the family stayed behind as a
+  per-architecture list — the next architecture would have needed one of its own, and x86's `str`
+  and A64's `str` already collide. On x86 the family is read from iced: its CPUID features for the
+  VMX, SVM, SEV-SNP and TDX families and for the MSR instructions; the registers an instruction
+  uses, which is how `clts` and `lmsw` are control-register writes by a `cr0` neither names; and
+  the flags it **sets or clears**, which keeps `sysret`, `rsm` and `erets` — which *write* `IF`,
+  restoring every flag at once — out of the interrupt-mask family. Port I/O, the descriptor-table
+  loads and cache or TLB maintenance have no such signal and are matched on iced's typed
+  `Mnemonic`, as is `xsetbv`, whose `XCR0` iced does not model. Measured
+  over iced 1.21's whole table: of the 156 encodings it calls privileged, the 132 that decode
+  without a decoder option each answer exactly one family, except `skinit`, which clears `IF` and
+  is placed by its SVM feature.
+
+  On A64 it is the encoding. A system register is a control register unless it is `DAIF` or
+  `ALLINT` — the interrupt masks, by either encoding — or lies in the IMPLEMENTATION DEFINED space,
+  `op0` 3 with `CRn` 11 or 15, which is A64's model-specific registers (none of the 1,118
+  registers `disarm64`'s generated table names is there). `dc`, `ic` and `tlbi` are cache or TLB
+  maintenance; `hvc` and `smc` are virtualisation; `eret`, `at` and the rest of the `sys` space are
+  `Other`. Over the executable sections of the 26100 ARM64 `ntoskrnl.exe`, 2,084 of 2,448,790
+  words are privileged: 956 interrupt-mask, 841 control-register, 207 cache or TLB, 41
+  virtualisation and 39 other — 32 of those the `cfp`/`dvp`/`cpp rctx` speculation restrictions —
+  and no model-specific register access at all.
+
+  It is not a severity, and not membership: `sgdt` reads the descriptor table from user mode,
+  needs no privilege, and answers `None`. A consumer that reports it anyway is making its own call.
+
 - **`DebugEngine::debuggee_type` and `DebugEngine::dump_files`** — the two engine queries that
   answer *what is this engine holding right now*, rather than what the opener asked for.
   `debuggee_type` is `GetDebuggeeType`'s `(class, qualifier)` pair as a `DebuggeeType`, with
@@ -178,6 +213,13 @@ All notable changes to this project are documented here. The format follows
   error. windbg-mcp `FOLLOWUPS.md` item 96.
 
 ### Fixed
+
+- **Three cells of A64's system-operation space were named `sys`**: `CRn` 9, which is `tlbi`'s
+  `nXS` forms (FEAT_XS); `CRm` 9, which is `at s1e1rp`, `s1e1wp` and `s1e1a`; and `CRm` 15, which
+  is `dc civaps`, `cigdvaps`, `civaoc` and `cigdvaoc`. Found when `Instruction::privilege` began
+  coming out of the same match as the name, by disassembling every word of `CRn` 7, 8 and 9 with
+  LLVM, whose aliases are generated from the architecture; left alone, the family would have
+  carried the same miss.
 
 - **A big-pool allocation on a page the memory manager had trimmed lost its name, in both of the
   places the table names one.** The table was consulted correctly — on two live guests the hash
