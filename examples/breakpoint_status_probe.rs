@@ -564,8 +564,7 @@ impl<'a> Armed<'a> {
             address,
         };
         if let Some(callback) = callback {
-            let callbacks = DebugEngine::create_debug_event_context_callbacks(Some(callback));
-            if let Err(e) = engine.set_breakpoint_event_callbacks(callbacks) {
+            if let Err(e) = engine.set_breakpoint_callback(callback) {
                 println!("  could not register the callbacks: {e}");
                 return None;
             }
@@ -576,7 +575,7 @@ impl<'a> Armed<'a> {
 
 impl Drop for Armed<'_> {
     fn drop(&mut self) {
-        if let Err(e) = self.engine.clear_breakpoint_event_callbacks() {
+        if let Err(e) = self.engine.clear_breakpoint_callback() {
             println!("  could not unregister the callbacks: {e}");
         }
         if let Err(e) = self.engine.remove_breakpoint(self.id) {

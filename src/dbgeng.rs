@@ -75,8 +75,8 @@ impl BreakpointAction {
     }
 }
 
-/// Called for every breakpoint event the engine delivers to a client holding the callbacks
-/// [`DebugEngine::create_debug_event_context_callbacks`] makes, on the engine thread, inside the
+/// Called for every breakpoint event the engine delivers to the client
+/// [`DebugEngine::set_breakpoint_callback`] registered it on, on that client's thread, inside the
 /// wait the hit arrived in. Every breakpoint, not only the ones its owner set: a callback that
 /// does not recognise one -- by [`BreakpointHit::id`] -- should answer
 /// [`BreakpointAction::Default`], which leaves it exactly as it was.
@@ -88,9 +88,14 @@ pub type BreakpointCallback = Box<dyn Fn(&BreakpointHit<'_>) -> BreakpointAction
 /// **The engine is the point.** A callback that records a hit has to read it -- the arguments of
 /// the call it trapped, the thread it trapped on -- and the callback is a `'static` closure called
 /// from inside `dbgeng.dll`, so it cannot borrow the [`DebugEngine`] that registered it. This is a
-/// borrowed view of the client that *added* the breakpoint (`GetAdder`), built per hit: a view
-/// never ends the session when it drops, and building one is a few interface queries, which
-/// `examples/breakpoint_status_probe.rs` measured at about two microseconds. What a view reads is
+/// borrowed view of **the client the callback is registered on**, built per hit: a view never ends
+/// the session when it drops, and building one is a few interface queries, which
+/// `examples/breakpoint_status_probe.rs` measured at about two microseconds.
+///
+/// **That client and not the breakpoint's adder**, because a DbgEng client may be used only on the
+/// thread that created it. The callback runs on the registering client's thread; a breakpoint added
+/// by another client, created on another thread, would hand `GetAdder` a client this thread may not
+/// call -- review on #195. What a view reads is
 /// what the stop already carried, so registers cost microseconds; memory the engine has not cached
 /// costs a round trip over the link, which on serial KD is about a millisecond.
 pub struct BreakpointHit<'a> {
@@ -99,15 +104,7 @@ pub struct BreakpointHit<'a> {
 }
 
 impl<'a> BreakpointHit<'a> {
-    fn new(breakpoint: &'a IDebugBreakpoint2) -> Result<Self, DbgEngError> {
-        let client = unsafe { breakpoint.GetAdder() }.map_err(|source| DbgEngError::Context {
-            operation: "reading the client that added a breakpoint".into(),
-            source,
-        })?;
-        let client: IDebugClient6 = client.cast().map_err(|source| DbgEngError::Context {
-            operation: "querying IDebugClient6".into(),
-            source,
-        })?;
+    fn new(breakpoint: &'a IDebugBreakpoint2, client: IDebugClient6) -> Result<Self, DbgEngError> {
         Ok(Self {
             breakpoint,
             engine: DebugEngine::try_from_client_interface(client)?,
@@ -6612,23 +6609,20 @@ impl DebugEngine {
         Ok(RunToResult { outcome, output })
     }
 
-    /// Event callbacks that hand every breakpoint event to `callback` and answer the engine with
-    /// the [`BreakpointAction`] it returns. Register them with
-    /// [`Self::set_breakpoint_event_callbacks`].
-    pub fn create_debug_event_context_callbacks(
-        callback: Option<BreakpointCallback>,
-    ) -> IDebugEventContextCallbacks {
-        let callbacks = DebugEventContextCallbacks::new(callback);
-        callbacks.into()
-    }
-
-    /// Registers `event_callbacks` on this client, replacing any it held. The engine calls them
-    /// from the next event on.
-    pub fn set_breakpoint_event_callbacks(
-        &self,
-        event_callbacks: IDebugEventContextCallbacks,
-    ) -> Result<(), DbgEngError> {
-        unsafe { self.client.SetEventContextCallbacks(Some(&event_callbacks)) }.map_err(|source| {
+    /// Hands every breakpoint event this client receives to `callback`, and answers the engine with
+    /// the [`BreakpointAction`] it returns -- replacing whatever event callbacks the client held.
+    ///
+    /// **One call that makes the callbacks and registers them**, where it was two: the callbacks
+    /// show each hit through this client (see [`BreakpointHit`]), so they must be registered on
+    /// this client and no other, and a callbacks object that never leaves this crate cannot be
+    /// registered anywhere else.
+    pub fn set_breakpoint_callback(&self, callback: BreakpointCallback) -> Result<(), DbgEngError> {
+        let callbacks: IDebugEventContextCallbacks = DebugEventContextCallbacks {
+            callback,
+            client: self.client.as_raw(),
+        }
+        .into();
+        unsafe { self.client.SetEventContextCallbacks(Some(&callbacks)) }.map_err(|source| {
             DbgEngError::Context {
                 operation: "registering event context callbacks".into(),
                 source,
@@ -6637,7 +6631,7 @@ impl DebugEngine {
     }
 
     /// Unregisters this client's event callbacks, so every breakpoint stops as it would with none.
-    pub fn clear_breakpoint_event_callbacks(&self) -> Result<(), DbgEngError> {
+    pub fn clear_breakpoint_callback(&self) -> Result<(), DbgEngError> {
         unsafe { self.client.SetEventContextCallbacks(None) }.map_err(|source| {
             DbgEngError::Context {
                 operation: "unregistering event context callbacks".into(),
@@ -16120,8 +16114,15 @@ mod tests {
     fn test_a_breakpoint_callback_reads_its_hit_and_lets_it_go_past() {
         let _debuggee = one_debuggee();
         let engine = DebugEngine::new();
+        // **`ping.exe` itself, not `cmd.exe /c ping`.** Ending a session kills the process it
+        // launched and not that process's children, so `cmd` leaves its `ping` running orphaned for
+        // thirty seconds -- and under `cargo test`, where tests share one process,
+        // `test_quit_detach_removes_breakpoints_and_leaves_an_attached_process_alive` then saw its
+        // own detached `ping` die with `0xC0000005` in 2 of 7 serial and 3 of 16 parallel runs of
+        // the `breakpoint` filter. Launched directly, 0 of 12 and 0 of 16 (ARM64). Why an orphan
+        // reaches a different process is not known; what is known is that this stops supplying one.
         engine
-            .launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .launch_process("ping.exe -n 30 127.0.0.1")
             .expect("launch failed");
         let set = engine
             .set_breakpoint(&BreakpointSpec::code(BreakpointAt::Expression(
@@ -16158,13 +16159,11 @@ mod tests {
             }
         });
         engine
-            .set_breakpoint_event_callbacks(DebugEngine::create_debug_event_context_callbacks(
-                Some(callback),
-            ))
+            .set_breakpoint_callback(callback)
             .expect("registering the callbacks failed");
         let run = engine.execute_and_wait("g", 20_000);
         engine
-            .clear_breakpoint_event_callbacks()
+            .clear_breakpoint_callback()
             .expect("unregistering the callbacks failed");
         let run = run.expect("go failed");
         assert!(
@@ -16263,14 +16262,16 @@ fn unwound_to_default(callback: impl FnOnce() -> BreakpointAction) -> Breakpoint
 #[windows::core::implement(
     windows::Win32::System::Diagnostics::Debug::Extensions::IDebugEventContextCallbacks
 )]
-pub struct DebugEventContextCallbacks {
-    callback: Option<BreakpointCallback>,
-}
-
-impl DebugEventContextCallbacks {
-    pub fn new(callback: Option<BreakpointCallback>) -> Self {
-        Self { callback }
-    }
+struct DebugEventContextCallbacks {
+    callback: BreakpointCallback,
+    /// The client these callbacks are registered on, **borrowed**: no reference is held.
+    ///
+    /// Owning it would be a cycle -- the client holds these callbacks -- and borrowing is sound
+    /// because of what a client is to its callbacks: it holds a reference to them, and it is the
+    /// one that calls them, so while a call into them runs it is alive. They are made by
+    /// [`DebugEngine::set_breakpoint_callback`] and registered on this client only, and this type
+    /// is private, so they cannot be registered on a client this does not name.
+    client: *mut std::ffi::c_void,
 }
 
 #[allow(non_snake_case)]
@@ -16287,14 +16288,20 @@ impl windows::Win32::System::Diagnostics::Debug::Extensions::IDebugEventContextC
         _context: *const std::ffi::c_void,
         _context_size: u32,
     ) -> windows::core::Result<()> {
-        let (Some(callback), Some(bp)) = (&self.callback, bp.as_ref()) else {
+        let Some(bp) = bp.as_ref() else {
+            return Ok(());
+        };
+        // SAFETY: `client` is the client calling us -- see the field -- so it is alive for the
+        // duration of this call, and borrowing it adds no reference; the clone below is the
+        // view's own, released when the view drops.
+        let Some(client) = (unsafe { IDebugClient6::from_raw_borrowed(&self.client) }) else {
             return Ok(());
         };
         // A hit the callback cannot be shown has no opinion on it, exactly as a panic has none.
-        let Ok(hit) = BreakpointHit::new(bp) else {
+        let Ok(hit) = BreakpointHit::new(bp, client.clone()) else {
             return Ok(());
         };
-        event_status(unwound_to_default(|| callback(&hit)).status())
+        event_status(unwound_to_default(|| (self.callback)(&hit)).status())
     }
 
     fn Exception(
