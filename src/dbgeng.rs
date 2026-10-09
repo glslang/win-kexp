@@ -76,12 +76,66 @@ impl BreakpointAction {
 }
 
 /// Called for every breakpoint event the engine delivers to a client holding the callbacks
-/// [`DebugEngine::create_debug_event_context_callbacks`] makes -- the breakpoint, the event's
-/// `DEBUG_EVENT_CONTEXT` and that context's size in bytes -- on the engine thread, inside the wait
-/// the hit arrived in. Every breakpoint, not only the ones its owner set: a callback that does not
-/// recognise one should answer [`BreakpointAction::Default`], which leaves it exactly as it was.
-pub type BreakpointCallback =
-    Box<dyn Fn(&IDebugBreakpoint2, *const std::ffi::c_void, u32) -> BreakpointAction>;
+/// [`DebugEngine::create_debug_event_context_callbacks`] makes, on the engine thread, inside the
+/// wait the hit arrived in. Every breakpoint, not only the ones its owner set: a callback that
+/// does not recognise one -- by [`BreakpointHit::id`] -- should answer
+/// [`BreakpointAction::Default`], which leaves it exactly as it was.
+pub type BreakpointCallback = Box<dyn Fn(&BreakpointHit<'_>) -> BreakpointAction>;
+
+/// One breakpoint hit, as a [`BreakpointCallback`] is handed it: which breakpoint, where it is,
+/// and an engine to read the stop through.
+///
+/// **The engine is the point.** A callback that records a hit has to read it -- the arguments of
+/// the call it trapped, the thread it trapped on -- and the callback is a `'static` closure called
+/// from inside `dbgeng.dll`, so it cannot borrow the [`DebugEngine`] that registered it. This is a
+/// borrowed view of the client that *added* the breakpoint (`GetAdder`), built per hit: a view
+/// never ends the session when it drops, and building one is a few interface queries, which
+/// `examples/breakpoint_status_probe.rs` measured at about two microseconds. What a view reads is
+/// what the stop already carried, so registers cost microseconds; memory the engine has not cached
+/// costs a round trip over the link, which on serial KD is about a millisecond.
+pub struct BreakpointHit<'a> {
+    breakpoint: &'a IDebugBreakpoint2,
+    engine: DebugEngine,
+}
+
+impl<'a> BreakpointHit<'a> {
+    fn new(breakpoint: &'a IDebugBreakpoint2) -> Result<Self, DbgEngError> {
+        let client = unsafe { breakpoint.GetAdder() }.map_err(|source| DbgEngError::Context {
+            operation: "reading the client that added a breakpoint".into(),
+            source,
+        })?;
+        let client: IDebugClient6 = client.cast().map_err(|source| DbgEngError::Context {
+            operation: "querying IDebugClient6".into(),
+            source,
+        })?;
+        Ok(Self {
+            breakpoint,
+            engine: DebugEngine::try_from_client_interface(client)?,
+        })
+    }
+
+    /// The breakpoint's id: what [`DebugEngine::set_breakpoint`] answered when it was set, and how
+    /// a callback tells its own breakpoints from everyone else's.
+    pub fn id(&self) -> Result<u32, DbgEngError> {
+        unsafe { self.breakpoint.GetId() }.map_err(|source| DbgEngError::Context {
+            operation: "reading a hit breakpoint's id".into(),
+            source,
+        })
+    }
+
+    /// The address the breakpoint is set at.
+    pub fn address(&self) -> Result<u64, DbgEngError> {
+        unsafe { self.breakpoint.GetOffset() }.map_err(|source| DbgEngError::Context {
+            operation: "reading a hit breakpoint's address".into(),
+            source,
+        })
+    }
+
+    /// The engine, stopped at this hit.
+    pub fn engine(&self) -> &DebugEngine {
+        &self.engine
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum DbgEngError {
@@ -165,6 +219,11 @@ pub enum DbgEngError {
 
     #[error("Operation failed: {0}")]
     OperationFailed(windows::core::Error),
+
+    /// A register that cannot answer the question asked of it, by name: one whose name cannot be
+    /// handed to the engine, or an integer read of one that holds no integer.
+    #[error("register `{name}`: {reason}")]
+    Register { name: String, reason: &'static str },
 
     #[error("{operation} failed: {source}")]
     Context {
@@ -4926,6 +4985,24 @@ impl DebugEngine {
         })
     }
 
+    /// The address of the system structure describing DbgEng's current thread
+    /// (`GetCurrentThreadDataOffset`): the TEB on a user-mode target, and on a kernel target the
+    /// thread running on the current processor.
+    ///
+    /// **The kernel answer is the one this exists for.** There the engine's threads are the
+    /// processors, so [`Self::current_thread_system_id`] says which *processor* stopped -- and a
+    /// thread preempted between two breakpoints can resume on another one, while another thread
+    /// takes the processor. Matching an allocation's entry to its return needs the thread, and
+    /// this names it. Like that query, it answers about the engine's current thread whatever
+    /// context `.thread` has switched the registers to.
+    pub fn current_thread_data_offset(&self) -> Result<u64, DbgEngError> {
+        let objects = self.system_objects()?;
+        unsafe { objects.GetCurrentThreadDataOffset() }.map_err(|source| DbgEngError::Context {
+            operation: "reading the current thread's data offset".into(),
+            source,
+        })
+    }
+
     /// Which of the target's processors the debugger is currently on, or `None` where no
     /// processor number applies.
     ///
@@ -6818,6 +6895,48 @@ impl DebugEngine {
             });
         }
         Ok(out)
+    }
+
+    /// One integer register by name -- `rip`, `rcx`, `x0`, `sp` -- zero-extended to 64 bits.
+    ///
+    /// The read a breakpoint callback makes: one name lookup and one value, where
+    /// [`Self::register_values`] describes and reads every register the engine knows -- 194 of
+    /// them on an ARM64 user-mode target, 214 on its kernel, measured. A register holding no integer
+    /// (a vector, a float) is a [`DbgEngError::Register`] rather than a number made of part of it,
+    /// and so is one the engine holds no value for.
+    pub fn integer_register(&self, name: &str) -> Result<u64, DbgEngError> {
+        let registers: IDebugRegisters =
+            self.client.cast().map_err(|source| DbgEngError::Context {
+                operation: "obtaining the register interface".into(),
+                source,
+            })?;
+        let name_c = CString::new(name).map_err(|_| DbgEngError::Register {
+            name: name.to_string(),
+            reason: "the name contains a NUL",
+        })?;
+        let index = unsafe { registers.GetIndexByName(PCSTR::from_raw(name_c.as_ptr().cast())) }
+            .map_err(|source| DbgEngError::Context {
+                operation: format!("looking up register `{name}`"),
+                source,
+            })?;
+        let mut value = DEBUG_VALUE::default();
+        unsafe { registers.GetValue(index, &mut value) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: format!("reading register `{name}`"),
+                source,
+            }
+        })?;
+        match RegisterValue::decode(&value) {
+            RegisterValue::Int(value) => Ok(value),
+            RegisterValue::Unavailable => Err(DbgEngError::Register {
+                name: name.to_string(),
+                reason: "the engine holds no value for it",
+            }),
+            RegisterValue::Float(_) | RegisterValue::Bytes(_) => Err(DbgEngError::Register {
+                name: name.to_string(),
+                reason: "it holds no integer",
+            }),
+        }
     }
 
     /// Every register's **description**, without reading a value for any of them.
@@ -15988,6 +16107,113 @@ mod tests {
         }
     }
 
+    /// A breakpoint callback is handed its hit as a typed view, and `Go` lets a hit go past.
+    ///
+    /// The real-engine half of [`BreakpointAction`] and [`BreakpointHit`], on CI's runners: a
+    /// launched process, a breakpoint on an allocator it calls many times while it starts, and a
+    /// callback answering `Go` on the first hit and `Break` on the second. Each hit is read through
+    /// its own view -- id, address, program counter, thread -- and the run stops once, at the
+    /// breakpoint, having seen two. `examples/breakpoint_status_probe.rs` measures the same thing
+    /// at volume and on a live kernel; this is what keeps it true between those runs.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_breakpoint_callback_reads_its_hit_and_lets_it_go_past() {
+        let _debuggee = one_debuggee();
+        let engine = DebugEngine::new();
+        engine
+            .launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+        let set = engine
+            .set_breakpoint(&BreakpointSpec::code(BreakpointAt::Expression(
+                "ntdll!RtlAllocateHeap".into(),
+            )))
+            .expect("set breakpoint failed");
+        let address = set
+            .breakpoint
+            .address
+            .expect("an exported function resolves");
+        let pc = match engine.processor_type() {
+            Ok(0xaa64) => "pc",
+            _ => "rip",
+        };
+
+        type Seen = Result<(u32, u64, u64, u64), String>;
+        let hits: std::rc::Rc<RefCell<Vec<Seen>>> = std::rc::Rc::default();
+        let recorded = std::rc::Rc::clone(&hits);
+        let callback: BreakpointCallback = Box::new(move |hit: &BreakpointHit<'_>| {
+            let read = (|| {
+                Ok::<_, DbgEngError>((
+                    hit.id()?,
+                    hit.address()?,
+                    hit.engine().integer_register(pc)?,
+                    hit.engine().current_thread_data_offset()?,
+                ))
+            })();
+            let mut recorded = recorded.borrow_mut();
+            recorded.push(read.map_err(|e| e.to_string()));
+            if recorded.len() < 2 {
+                BreakpointAction::Go
+            } else {
+                BreakpointAction::Break
+            }
+        });
+        engine
+            .set_breakpoint_event_callbacks(DebugEngine::create_debug_event_context_callbacks(
+                Some(callback),
+            ))
+            .expect("registering the callbacks failed");
+        let run = engine.execute_and_wait("g", 20_000);
+        engine
+            .clear_breakpoint_event_callbacks()
+            .expect("unregistering the callbacks failed");
+        let run = run.expect("go failed");
+        assert!(
+            run.cut_short.is_none() && !run.target_gone,
+            "the run must end on the callback's Break: {run:?}"
+        );
+
+        let hits = hits.borrow();
+        assert_eq!(
+            hits.len(),
+            2,
+            "Go on the first hit and Break on the second: {hits:?}"
+        );
+        for hit in hits.iter() {
+            let (id, at, pc_value, thread) = hit.clone().expect("every read through the view");
+            assert_eq!(id, set.breakpoint.id);
+            assert_eq!(at, address);
+            assert_eq!(pc_value, address, "`{pc}` at the hit is the breakpoint");
+            assert_ne!(thread, 0, "a thread's data offset");
+        }
+        assert_eq!(engine.instruction_pointer().ok(), Some(address));
+
+        // An integer read of a register that holds no integer is refused, not truncated.
+        let not_integer = engine
+            .register_values()
+            .expect("registers")
+            .into_iter()
+            .find(|register| {
+                matches!(
+                    register.value,
+                    RegisterValue::Float(_) | RegisterValue::Bytes(_)
+                )
+            })
+            .map(|register| register.name);
+        if let Some(name) = not_integer {
+            assert!(
+                matches!(
+                    engine.integer_register(&name),
+                    Err(DbgEngError::Register { .. })
+                ),
+                "`{name}` read as an integer"
+            );
+        }
+        engine
+            .remove_breakpoint(set.breakpoint.id)
+            .expect("removing the breakpoint failed");
+        engine.end_session().expect("ending the session failed");
+    }
+
     /// A callback that panics answers `Default` rather than unwinding into `dbgeng.dll`, and one
     /// that does not is answered unchanged.
     #[test]
@@ -16058,13 +16284,17 @@ impl windows::Win32::System::Diagnostics::Debug::Extensions::IDebugEventContextC
     fn Breakpoint(
         &self,
         bp: windows::core::Ref<'_, IDebugBreakpoint2>,
-        context: *const std::ffi::c_void,
-        context_size: u32,
+        _context: *const std::ffi::c_void,
+        _context_size: u32,
     ) -> windows::core::Result<()> {
         let (Some(callback), Some(bp)) = (&self.callback, bp.as_ref()) else {
             return Ok(());
         };
-        event_status(unwound_to_default(|| callback(bp, context, context_size)).status())
+        // A hit the callback cannot be shown has no opinion on it, exactly as a panic has none.
+        let Ok(hit) = BreakpointHit::new(bp) else {
+            return Ok(());
+        };
+        event_status(unwound_to_default(|| callback(&hit)).status())
     }
 
     fn Exception(
