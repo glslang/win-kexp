@@ -622,12 +622,23 @@ fn clipped_reader<'a>(
 
 /// A span the image declares, read whole: refused if any of it is outside the image, and
 /// [`PeError::Unreadable`] if any of it does not read -- never clipped to what does.
+///
+/// **And refused at RVA zero**, where a table that is not empty would be the image's own header.
+/// Zero is how a PE field says *absent*, and read as an address it parses the DOS header as
+/// whatever was asked for -- found by review on dbgscope#196 three rounds running, for a library
+/// name, an export name, then the export tables. Names come through [`read_c_string`], which
+/// refuses it too; every declared table comes through here.
 fn read_declared(
     image: &Image,
     read: &mut impl FnMut(u64, usize) -> Option<Vec<u8>>,
     rva: u32,
     len: usize,
 ) -> Result<Vec<u8>, PeError> {
+    if rva == 0 && len > 0 {
+        return Err(PeError::Malformed {
+            reason: "a table at RVA zero, which is the image's header rather than a table",
+        });
+    }
     let address = image.checked_va(rva, len)?;
     read(address, len)
         .filter(|bytes| bytes.len() == len)
@@ -737,10 +748,17 @@ const MAX_EXPORTS: usize = 1 << 16;
 /// where every read is a round trip. An empty `rvas` reads the directory and the library name and
 /// nothing else.
 ///
-/// The directory's declared span is checked against the image and must hold the fixed header;
-/// every table is a declared span too, refused rather than clipped; and an ordinal past the end of
-/// the address table, or a library name at RVA zero, is the image contradicting itself. `halt` is
-/// polled between the tables and per name read, as [`read_imports`] polls it.
+/// **What constrains every field it reads, and the ones it leaves unread on purpose.** The directory
+/// itself: its declared span is checked against the image and must hold the forty-byte header.
+/// `Name` and each `AddressOfNames` entry are read through [`read_c_string`], bounded by the image
+/// and refused at RVA zero. `NumberOfFunctions` and `NumberOfNames` are bounded by what a sixteen-bit
+/// ordinal can number, and either at zero means there is nothing to name. `AddressOfFunctions`,
+/// `AddressOfNames` and `AddressOfNameOrdinals` are declared spans read whole, refused outside the
+/// image and at RVA zero. Each ordinal must index the address table. The function RVAs are only
+/// **compared** with the addresses asked about, never followed, so a forwarder's string RVA among
+/// them needs nothing. `Characteristics`, `TimeDateStamp`, the version and the ordinal `Base` are
+/// not read: names are matched to functions by position in the tables, which `Base` does not
+/// change. `halt` is polled between the tables and per name read, as [`read_imports`] polls it.
 pub fn read_exports_at(
     image: &Image,
     mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
@@ -1715,7 +1733,7 @@ mod tests {
             let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
             read_exports_at(&image, |at, len| fake.read(at, len), &asked, || false)
         };
-        let cases: [(&str, &Change); 6] = [
+        let cases: [(&str, &Change); 9] = [
             ("a size smaller than the header", &|fake| {
                 put(&mut fake.bytes, 0x16c, &39u32.to_le_bytes())
             }),
@@ -1733,6 +1751,29 @@ mod tests {
             }),
             ("an export name at RVA zero", &|fake| {
                 put(&mut fake.bytes, 0x2270, &0u32.to_le_bytes())
+            }),
+            ("an export address table at RVA zero", &|fake| {
+                put(&mut fake.bytes, 0x221c, &0u32.to_le_bytes())
+            }),
+            // Read at zero, the name table is the DOS header: its first entry is `MZ`, an RVA of
+            // 0x5a4d, and the next two are whatever the header holds there. Both would let a
+            // neighbouring rule refuse this case without the one it is for -- 0x5a4d is outside
+            // this fixture's 0x4000 bytes, and a zero entry is refused by `read_c_string` -- so the
+            // image is grown past 0x5a4d and the header given in-image values where a real one has
+            // its `e_cblp`..`e_cparhdr`. Then the entries read as names, and only the RVA-zero rule
+            // on the table stands between them and an answer.
+            ("an export name table at RVA zero", &|fake| {
+                fake.bytes.resize(0x6000, 0);
+                put(&mut fake.bytes, 0x130, &0x6000u32.to_le_bytes()); // SizeOfImage
+                put(&mut fake.bytes, 4, &0x5000u32.to_le_bytes());
+                put(&mut fake.bytes, 8, &0x5000u32.to_le_bytes());
+                put(&mut fake.bytes, 0x2220, &0u32.to_le_bytes())
+            }),
+            // Read at zero, the first ordinal is `MZ` too -- 0x5a4d, past a three-function table, so
+            // the ordinal range check refuses this case as well; isolating the rule would take an
+            // address table of 23,000 entries. It is kept for the outcome, not as the rule's pin.
+            ("an export ordinal table at RVA zero", &|fake| {
+                put(&mut fake.bytes, 0x2224, &0u32.to_le_bytes())
             }),
         ];
         for (why, change) in cases {
