@@ -8,6 +8,32 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **A breakpoint callback decides whether the target stops.** `BreakpointCallback` returns a
+  `BreakpointAction` -- `Default`, `Go` or `Break`, the `DEBUG_STATUS_*` an
+  `IDebugEventContextCallbacks::Breakpoint` answers with -- where it returned
+  `windows::core::Result<()>`. That type could not say it: the engine reads the status out of the
+  callback's `HRESULT`, every status is a success code, and a `Result`'s `Ok` reaches the engine as
+  `S_OK`, which is `DEBUG_STATUS_NO_CHANGE`; the dispatch discarded what the callback returned
+  besides. So a callback could watch a breakpoint but never let one go past. **Breaking** for a caller
+  that implements one; nothing in this crate or in `windbg-mcp` does.
+
+  The status leaves through one function, `event_status`, as an `Err` carrying the code, because
+  `windows` gives an implementer no other way to return a success `HRESULT`: `From<Result<T>> for
+  HRESULT` passes the code through unchanged. That is pinned by
+  `test_a_breakpoint_action_reaches_the_engine_as_its_status`, which fails against an
+  `event_status` that answers `Ok(())` (mutated and run on ARM64). Upstream:
+  microsoft/win32metadata#2075.
+
+  Two hazards in the same dispatch went with it: a callback that **panics** now answers `Default`
+  rather than unwinding into `dbgeng.dll`, which aborts the process, and a null breakpoint is no
+  longer `unwrap`ped. `set_breakpoint_event_callbacks` returns `Result<(), DbgEngError>` rather
+  than panicking, and `clear_breakpoint_event_callbacks` unregisters them.
+
+  `examples/breakpoint_status_probe.rs` is the measurement against a real engine, user-mode and
+  live kernel over serial: `Default` stops exactly as no callback does, `Go` lets every hit through
+  and stops on the one answered `Break`, the callback can read the engine from inside the hit, and a
+  hit costs one trap however it is let through.
+
 - **CI's ARM64 entry names an image rather than the moving `windows-11-arm` label**, and the
   architecture is a matrix value rather than that label matched a second time. Both entries here
   drive a real engine — 46 of this crate's non-ignored tests reach `DebugCreate`, and several
