@@ -756,8 +756,9 @@ const MAX_EXPORTS: usize = 1 << 16;
 /// contradiction, since each name's ordinal indexes the address table. `AddressOfFunctions`,
 /// `AddressOfNames` and `AddressOfNameOrdinals` are declared spans read whole, refused outside the
 /// image and at RVA zero. Each ordinal must index the address table. The function RVAs are only
-/// **compared** with the addresses asked about, never followed, so a forwarder's string RVA among
-/// them needs nothing. `Characteristics`, `TimeDateStamp`, the version and the ordinal `Base` are
+/// **compared** with the addresses asked about, never followed -- and one inside the directory's own
+/// span is a forwarder, a string rather than code, which is never matched at all (round 6 of review
+/// on #196: an address equal to one would otherwise name the export it forwards). `Characteristics`, `TimeDateStamp`, the version and the ordinal `Base` are
 /// not read: names are matched to functions by position in the tables, which `Base` does not
 /// change. `halt` is polled before each table and per name read, as [`read_imports`] polls it.
 pub fn read_exports_at(
@@ -827,11 +828,15 @@ pub fn read_exports_at(
         return Err(PeError::Interrupted);
     }
     let addresses = read_declared(image, &mut read, functions_at, functions * 4)?;
+    // An entry inside the directory's own span is a forwarder: the RVA of a `library.name` string,
+    // not of code. It is never matched -- an address asked about that equals one is a pointer to
+    // that string, not an import of the export it forwards.
+    let directory = rva..rva.saturating_add(size);
     let wanted: BTreeMap<usize, u32> = (0..functions)
         .map(|index| u32(&addresses, index * 4).map(|address| (index, address)))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
-        .filter(|(_, address)| rvas.contains(address))
+        .filter(|(_, address)| rvas.contains(address) && !directory.contains(address))
         .collect();
     if wanted.is_empty() {
         return Ok(Some(exports));
@@ -1736,6 +1741,31 @@ mod tests {
         assert_eq!(
             read_exports_at(&image, |at, len| plain.read(at, len), &asked, || false),
             Ok(None)
+        );
+    }
+
+    /// A forwarder is not an address: an entry inside the export directory's own span points at a
+    /// `library.name` string, and an address asked about that equals it names nothing.
+    #[test]
+    fn test_a_forwarder_is_not_matched_as_an_address() {
+        let mut fake = exporting_image();
+        // Function 1 (`__C_specific_handler`) becomes a forwarder: its RVA is a string inside the
+        // directory's span, 0x2200..0x2300.
+        put(&mut fake.bytes, 0x2264, &0x22f0u32.to_le_bytes());
+        put(&mut fake.bytes, 0x22f0, b"HAL.Forwarded\0");
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        let exports = read_exports_at(
+            &image,
+            |at, len| fake.read(at, len),
+            &BTreeSet::from([0x22f0, 0x1010]),
+            || false,
+        )
+        .expect("the exports read")
+        .expect("the image exports");
+        assert_eq!(
+            exports.names.keys().copied().collect::<Vec<_>>(),
+            vec![0x1010],
+            "the forwarder's string is not an export's address: {exports:?}"
         );
     }
 
