@@ -778,11 +778,6 @@ pub fn read_exports_at(
     let functions_at = u32(&header, 28)?;
     let names_at = u32(&header, 32)?;
     let ordinals_at = u32(&header, 36)?;
-    if name_rva == 0 {
-        return Err(PeError::Malformed {
-            reason: "the export directory names no library",
-        });
-    }
     if functions > MAX_EXPORTS || named > MAX_EXPORTS {
         return Err(PeError::Malformed {
             reason: "more exports than an ordinal can number",
@@ -1095,6 +1090,15 @@ fn read_c_string(
     rva: u32,
     at: &mut impl FnMut(u32, usize) -> Result<Vec<u8>, PeError>,
 ) -> Result<String, PeError> {
+    // **RVA zero names nothing**: it is the image's own DOS header, which reads as the string
+    // `"MZ"`. Refused here rather than at each field that holds a name, because review on
+    // dbgscope#196 found it twice in two rounds -- an export directory's library name, then each
+    // export's own -- and every name this module reads comes through this one door.
+    if rva == 0 {
+        return Err(PeError::Malformed {
+            reason: "a name at RVA zero, which is the image's header rather than a string",
+        });
+    }
     let mut raw: Vec<u8> = Vec::new();
     while raw.len() < MAX_NAME {
         let taken = u32::try_from(raw.len()).map_err(|_| PeError::Malformed {
@@ -1711,7 +1715,7 @@ mod tests {
             let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
             read_exports_at(&image, |at, len| fake.read(at, len), &asked, || false)
         };
-        let cases: [(&str, &Change); 5] = [
+        let cases: [(&str, &Change); 6] = [
             ("a size smaller than the header", &|fake| {
                 put(&mut fake.bytes, 0x16c, &39u32.to_le_bytes())
             }),
@@ -1726,6 +1730,9 @@ mod tests {
             }),
             ("an ordinal past the address table", &|fake| {
                 put(&mut fake.bytes, 0x2280, &3u16.to_le_bytes())
+            }),
+            ("an export name at RVA zero", &|fake| {
+                put(&mut fake.bytes, 0x2270, &0u32.to_le_bytes())
             }),
         ];
         for (why, change) in cases {
