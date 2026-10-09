@@ -23,17 +23,18 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_EVENT_BREAKPOINT, DEBUG_EVENT_EXCEPTION, DEBUG_EXECUTE_ECHO, DEBUG_INTERRUPT_ACTIVE,
     DEBUG_KERNEL_SMALL_DUMP, DEBUG_LAST_EVENT_INFO_EXCEPTION, DEBUG_MODNAME_SYMBOL_FILE,
     DEBUG_MODULE_PARAMETERS, DEBUG_MODULE_USER_MODE, DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL,
-    DEBUG_REGISTER_DESCRIPTION, DEBUG_REGISTER_SUB_REGISTER, DEBUG_STACK_FRAME, DEBUG_STATUS_GO,
-    DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED, DEBUG_STATUS_MASK,
-    DEBUG_STATUS_NO_DEBUGGEE, DEBUG_STATUS_REVERSE_GO, DEBUG_STATUS_REVERSE_STEP_BRANCH,
-    DEBUG_STATUS_REVERSE_STEP_INTO, DEBUG_STATUS_REVERSE_STEP_OVER, DEBUG_STATUS_STEP_BRANCH,
-    DEBUG_STATUS_STEP_INTO, DEBUG_STATUS_STEP_OVER, DEBUG_SYMINFO_IMAGEHLP_MODULEW64,
-    DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA,
-    DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_NONE, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM, DEBUG_VALUE,
-    DEBUG_VALUE_FLOAT32, DEBUG_VALUE_FLOAT64, DEBUG_VALUE_FLOAT80, DEBUG_VALUE_FLOAT82,
-    DEBUG_VALUE_FLOAT128, DEBUG_VALUE_INT8, DEBUG_VALUE_INT16, DEBUG_VALUE_INT32,
-    DEBUG_VALUE_INT64, DEBUG_VALUE_VECTOR64, DEBUG_VALUE_VECTOR128, DebugConnectWide,
-    IDebugAdvanced2, IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
+    DEBUG_REGISTER_DESCRIPTION, DEBUG_REGISTER_SUB_REGISTER, DEBUG_STACK_FRAME, DEBUG_STATUS_BREAK,
+    DEBUG_STATUS_GO, DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED, DEBUG_STATUS_MASK,
+    DEBUG_STATUS_NO_CHANGE, DEBUG_STATUS_NO_DEBUGGEE, DEBUG_STATUS_REVERSE_GO,
+    DEBUG_STATUS_REVERSE_STEP_BRANCH, DEBUG_STATUS_REVERSE_STEP_INTO,
+    DEBUG_STATUS_REVERSE_STEP_OVER, DEBUG_STATUS_STEP_BRANCH, DEBUG_STATUS_STEP_INTO,
+    DEBUG_STATUS_STEP_OVER, DEBUG_SYMINFO_IMAGEHLP_MODULEW64, DEBUG_SYMTYPE_CODEVIEW,
+    DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA, DEBUG_SYMTYPE_EXPORT,
+    DEBUG_SYMTYPE_NONE, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM, DEBUG_VALUE, DEBUG_VALUE_FLOAT32,
+    DEBUG_VALUE_FLOAT64, DEBUG_VALUE_FLOAT80, DEBUG_VALUE_FLOAT82, DEBUG_VALUE_FLOAT128,
+    DEBUG_VALUE_INT8, DEBUG_VALUE_INT16, DEBUG_VALUE_INT32, DEBUG_VALUE_INT64,
+    DEBUG_VALUE_VECTOR64, DEBUG_VALUE_VECTOR128, DebugConnectWide, IDebugAdvanced2,
+    IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
     IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugRegisters, IDebugSymbols3,
     IDebugSystemObjects,
 };
@@ -42,9 +43,45 @@ use windows::Win32::System::Memory::{
     MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION64,
 };
 
-/// Callback type for breakpoint events that receives the breakpoint, context, and flags
+/// What a [`BreakpointCallback`] tells the engine to do about the hit it was handed: the
+/// `DEBUG_STATUS_*` an `IDebugEventContextCallbacks::Breakpoint` returns.
+///
+/// **The engine reads that status out of the callback's `HRESULT`**, and every status is a success
+/// code -- `DEBUG_STATUS_GO` is 1, the same value as `S_FALSE`. That is why this is a type of its
+/// own rather than the `windows::core::Result<()>` the callback used to return: a `Result`'s `Ok`
+/// can only produce `S_OK`, which is `DEBUG_STATUS_NO_CHANGE`, so no callback could ever let the
+/// target run on -- and the old dispatch discarded whatever one returned besides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BreakpointAction {
+    /// `DEBUG_STATUS_NO_CHANGE`: no opinion. The engine does what it would have done with no
+    /// callback registered, which for a breakpoint is to stop -- subject to its pass count, match
+    /// thread and command, all of which it applies as before.
+    Default,
+    /// `DEBUG_STATUS_GO`: resume without stopping. The hit is the callback's alone, and no wait
+    /// sees it as a stop.
+    Go,
+    /// `DEBUG_STATUS_BREAK`: stop the target here.
+    Break,
+}
+
+impl BreakpointAction {
+    /// The `DEBUG_STATUS_*` this action is.
+    pub fn status(self) -> u32 {
+        match self {
+            Self::Default => DEBUG_STATUS_NO_CHANGE,
+            Self::Go => DEBUG_STATUS_GO,
+            Self::Break => DEBUG_STATUS_BREAK,
+        }
+    }
+}
+
+/// Called for every breakpoint event the engine delivers to a client holding the callbacks
+/// [`DebugEngine::create_debug_event_context_callbacks`] makes -- the breakpoint, the event's
+/// `DEBUG_EVENT_CONTEXT` and that context's size in bytes -- on the engine thread, inside the wait
+/// the hit arrived in. Every breakpoint, not only the ones its owner set: a callback that does not
+/// recognise one should answer [`BreakpointAction::Default`], which leaves it exactly as it was.
 pub type BreakpointCallback =
-    Box<dyn Fn(&IDebugBreakpoint2, *const std::ffi::c_void, u32) -> windows::core::Result<()>>;
+    Box<dyn Fn(&IDebugBreakpoint2, *const std::ffi::c_void, u32) -> BreakpointAction>;
 
 #[derive(Debug, Error)]
 pub enum DbgEngError {
@@ -6498,6 +6535,9 @@ impl DebugEngine {
         Ok(RunToResult { outcome, output })
     }
 
+    /// Event callbacks that hand every breakpoint event to `callback` and answer the engine with
+    /// the [`BreakpointAction`] it returns. Register them with
+    /// [`Self::set_breakpoint_event_callbacks`].
     pub fn create_debug_event_context_callbacks(
         callback: Option<BreakpointCallback>,
     ) -> IDebugEventContextCallbacks {
@@ -6505,12 +6545,28 @@ impl DebugEngine {
         callbacks.into()
     }
 
-    pub fn set_breakpoint_event_callbacks(&self, event_callbacks: IDebugEventContextCallbacks) {
-        unsafe {
-            self.client
-                .SetEventContextCallbacks(Some(&event_callbacks))
-                .expect("[-] Failed to set event callbacks");
-        };
+    /// Registers `event_callbacks` on this client, replacing any it held. The engine calls them
+    /// from the next event on.
+    pub fn set_breakpoint_event_callbacks(
+        &self,
+        event_callbacks: IDebugEventContextCallbacks,
+    ) -> Result<(), DbgEngError> {
+        unsafe { self.client.SetEventContextCallbacks(Some(&event_callbacks)) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: "registering event context callbacks".into(),
+                source,
+            }
+        })
+    }
+
+    /// Unregisters this client's event callbacks, so every breakpoint stops as it would with none.
+    pub fn clear_breakpoint_event_callbacks(&self) -> Result<(), DbgEngError> {
+        unsafe { self.client.SetEventContextCallbacks(None) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: "unregistering event context callbacks".into(),
+                source,
+            }
+        })
     }
 
     pub fn log(&self, message: &str) {
@@ -15911,6 +15967,71 @@ mod tests {
             );
         }
     }
+
+    /// The pass-through [`event_status`] stands on: each action has to reach the engine as
+    /// exactly its own status. `Default` is `S_OK`; `Go` is 1, which a `windows-result` that
+    /// normalised an `Err` would turn into something else -- and a callback that asked the target
+    /// to run on would then stop it on every hit.
+    #[test]
+    fn test_a_breakpoint_action_reaches_the_engine_as_its_status() {
+        for (action, status) in [
+            (BreakpointAction::Default, DEBUG_STATUS_NO_CHANGE),
+            (BreakpointAction::Go, DEBUG_STATUS_GO),
+            (BreakpointAction::Break, DEBUG_STATUS_BREAK),
+        ] {
+            assert_eq!(action.status(), status, "{action:?}");
+            assert_eq!(
+                HRESULT::from(event_status(action.status())),
+                HRESULT(status as i32),
+                "{action:?} did not reach the engine as its own status"
+            );
+        }
+    }
+
+    /// A callback that panics answers `Default` rather than unwinding into `dbgeng.dll`, and one
+    /// that does not is answered unchanged.
+    #[test]
+    fn test_a_panicking_breakpoint_callback_leaves_the_engine_its_default() {
+        assert_eq!(
+            unwound_to_default(|| panic!("a callback that panicked")),
+            BreakpointAction::Default
+        );
+        assert_eq!(
+            unwound_to_default(|| BreakpointAction::Go),
+            BreakpointAction::Go
+        );
+    }
+}
+
+/// The `HRESULT` an event callback answers with, carrying `status`.
+///
+/// **A workaround, and the one place this crate needs it.** The status *is* the method's `HRESULT`,
+/// and a success code, but `windows` gives an implementer `windows::core::Result<()>` -- in 0.62,
+/// and on windows-rs `master` too, which keeps raw `HRESULT`s for callers only -- and its `Ok` can
+/// only produce `S_OK`. So any other status travels as an `Err`, which the generated shim turns
+/// back into exactly the code it was made from: `From<Result<T>> for HRESULT` answers
+/// `error.code()`, and an `Error` made by `from_hresult` carries no `IErrorInfo` to leave on the
+/// thread. An `Err` that is a success is the kind of thing that gets "fixed", which is why it lives
+/// here and nowhere else, and why `test_a_breakpoint_action_reaches_the_engine_as_its_status` pins
+/// the pass-through: a `windows-result` that normalised it fails there, rather than as a target
+/// that stops on every hit. Upstream: microsoft/win32metadata#2075.
+fn event_status(status: u32) -> windows::core::Result<()> {
+    if status == DEBUG_STATUS_NO_CHANGE {
+        Ok(())
+    } else {
+        Err(windows::core::Error::from_hresult(HRESULT(status as i32)))
+    }
+}
+
+/// Runs a breakpoint callback, answering [`BreakpointAction::Default`] if it panics.
+///
+/// A panic must not unwind out of an event callback: the frame above it is `dbgeng.dll`, reached
+/// through an `extern "system"` shim, and unwinding into one aborts the process -- in a worker, the
+/// session and its target with it. A callback that panicked has no opinion, so the engine does what
+/// it would have done without one.
+fn unwound_to_default(callback: impl FnOnce() -> BreakpointAction) -> BreakpointAction {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback))
+        .unwrap_or(BreakpointAction::Default)
 }
 
 #[windows::core::implement(
@@ -15937,13 +16058,13 @@ impl windows::Win32::System::Diagnostics::Debug::Extensions::IDebugEventContextC
     fn Breakpoint(
         &self,
         bp: windows::core::Ref<'_, IDebugBreakpoint2>,
-        _context: *const std::ffi::c_void,
-        _flags: u32,
+        context: *const std::ffi::c_void,
+        context_size: u32,
     ) -> windows::core::Result<()> {
-        if let Some(callback) = &self.callback {
-            let _ = callback(bp.as_ref().unwrap(), _context, _flags);
-        }
-        Ok(())
+        let (Some(callback), Some(bp)) = (&self.callback, bp.as_ref()) else {
+            return Ok(());
+        };
+        event_status(unwound_to_default(|| callback(bp, context, context_size)).status())
     }
 
     fn Exception(
