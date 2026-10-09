@@ -87,6 +87,17 @@ All notable changes to this project are documented here. The format follows
   mode and the thread running on the current processor on a kernel -- which is what names a
   *thread* there, where `current_thread_system_id` names a processor. Checked against the engine's
   own `@$thread` at a stop, user mode and live kernel, by `examples/breakpoint_status_probe.rs`.
+- **`pe::read_import_address_table` and `Image::iat_directory`**: the import address table
+  (`IMAGE_DIRECTORY_ENTRY_IAT`) slot by slot, each with the value it holds, leaving out the zero
+  that ends a library. The import directory is what `read_imports` names imports from, and a
+  linker may put it in a discardable section the loader frees once the driver starts: HEVD's ARM64
+  build keeps it in `INIT`, which reads `??` on a live ARM64 kernel while its fifteen address-table
+  slots read and hold `nt!ExAllocatePoolWithTag` and the rest. On a loaded image a slot holds the
+  address its import was bound to, so naming that address -- which needs an engine -- names the
+  import. Declared spans are checked against the image, refused rather than truncated.
+- **`pe::read_export_library_name`**: the name an export directory gives its own library, which is
+  the spelling an importer uses -- the kernel is loaded as `ntkrnlmp.exe` and imported as
+  `ntoskrnl.exe`.
 
 - **`Instruction::privilege`: which family a privileged instruction reaches** (#153) — an I/O
   port, a model-specific register, a control or debug register, a descriptor table, the interrupt

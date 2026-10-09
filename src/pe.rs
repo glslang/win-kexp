@@ -182,6 +182,9 @@ pub struct Image {
     pub export_directory: (u32, u32),
     /// `(rva, size)` of the import directory.
     pub import_directory: (u32, u32),
+    /// `(rva, size)` of the import address table (`IMAGE_DIRECTORY_ENTRY_IAT`); both zero when the
+    /// image declares none. See [`read_import_address_table`] for why it is read at all.
+    pub iat_directory: (u32, u32),
 }
 
 impl Image {
@@ -541,6 +544,7 @@ pub fn read_image(
     };
     let export_directory = directory(0)?;
     let import_directory = directory(1)?;
+    let iat_directory = directory(12)?;
 
     if section_count > MAX_SECTIONS {
         return Err(PeError::Malformed {
@@ -595,7 +599,130 @@ pub fn read_image(
         sections,
         export_directory,
         import_directory,
+        iat_directory,
     })
+}
+
+/// A reader of image offsets, for the reads whose length this module chooses.
+///
+/// Clipped to the image rather than refused for overrunning it: a name near the end is
+/// legitimately shorter than the bounded read asks for, and a fixed-size structure that comes back
+/// short fails its own field parse. The *start* is still bounded, by [`Image::checked_va`].
+fn clipped_reader<'a>(
+    image: &'a Image,
+    read: &'a mut impl FnMut(u64, usize) -> Option<Vec<u8>>,
+) -> impl FnMut(u32, usize) -> Result<Vec<u8>, PeError> + 'a {
+    move |rva: u32, len: usize| {
+        let room = image.size_of_image.saturating_sub(rva) as usize;
+        let len = len.min(room);
+        let address = image.checked_va(rva, len)?;
+        read(address, len).ok_or(PeError::Unreadable { at: address, len })
+    }
+}
+
+/// One slot of the import address table, and what it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IatSlot {
+    /// The slot's virtual address -- the same `slot` [`Import`] carries for the import it holds.
+    pub slot: u64,
+    /// What the slot holds. In a loaded image that is the address the loader bound the import to;
+    /// in an image file it is an unbound thunk, which is why this is asked of a live target.
+    pub value: u64,
+}
+
+/// Reads the import address table (`IMAGE_DIRECTORY_ENTRY_IAT`), slot by slot, leaving out the
+/// zero that ends each library's run.
+///
+/// **The import table's other half, and the one a loaded driver keeps.** [`read_imports`] names
+/// imports from the import directory, which a linker may put in a discardable section, and the
+/// loader frees that section once the driver has started -- so on a live target there is nothing
+/// left to name them from. HEVD's ARM64 build is the case: its import directory is in `INIT`, which
+/// on a live ARM64 kernel reads `??`, while its fifteen slots at `.rdata+0` read and hold
+/// `nt!ExAllocatePoolWithTag` and the rest (measured 2026-10-09). The address table is what the
+/// driver's own calls go through, so it is kept. Naming what a slot holds is the caller's: it needs
+/// the module the address is in, which an engine knows and this parser does not.
+///
+/// The span is the image's own declaration, so it is checked against the image whole rather than
+/// clipped, and bounded like the import table: refused rather than truncated.
+pub fn read_import_address_table(
+    image: &Image,
+    mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
+) -> Result<Vec<IatSlot>, PeError> {
+    let (rva, size) = image.iat_directory;
+    match (rva, size) {
+        (0, 0) => return Ok(Vec::new()),
+        (0, _) | (_, 0) => {
+            return Err(PeError::Malformed {
+                reason: "the import address table has a size without an address, or the reverse",
+            });
+        }
+        _ => {}
+    }
+    let pointer = image.bitness.pointer();
+    let len = size as usize;
+    if !len.is_multiple_of(pointer) {
+        return Err(PeError::Malformed {
+            reason: "the import address table is not a whole number of slots",
+        });
+    }
+    if len / pointer > MAX_IMPORTS_TOTAL + MAX_LIBRARIES {
+        return Err(PeError::Malformed {
+            reason: "more import address slots than an image plausibly has",
+        });
+    }
+    // `checked_va` refuses the whole span, end included, so a table running past the image is
+    // `Malformed` here rather than clipped.
+    let address = image.checked_va(rva, len)?;
+    let bytes = read(address, len)
+        .filter(|bytes| bytes.len() == len)
+        .ok_or(PeError::Unreadable { at: address, len })?;
+    let mut slots = Vec::new();
+    for (index, raw) in bytes.chunks_exact(pointer).enumerate() {
+        let value = match image.bitness {
+            Bitness::Bits64 => u64_at(raw, 0)?,
+            Bitness::Bits32 => u64::from(u32(raw, 0)?),
+        };
+        if value != 0 {
+            slots.push(IatSlot {
+                slot: address + (index * pointer) as u64,
+                value,
+            });
+        }
+    }
+    Ok(slots)
+}
+
+/// The library name an image's export directory gives itself (`IMAGE_EXPORT_DIRECTORY.Name`), or
+/// `None` for an image that exports nothing.
+///
+/// **The spelling an importer uses**, which is the reason to read it rather than take a module's
+/// image name: the kernel is loaded as `ntkrnlmp.exe` and imported as `ntoskrnl.exe`, and naming
+/// an import from the address it was bound to has to land on the second to match anything keyed
+/// by an import table.
+pub fn read_export_library_name(
+    image: &Image,
+    mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
+) -> Result<Option<String>, PeError> {
+    let (rva, size) = image.export_directory;
+    match (rva, size) {
+        (0, 0) => return Ok(None),
+        (0, _) | (_, 0) => {
+            return Err(PeError::Malformed {
+                reason: "the export directory has a size without an address, or the reverse",
+            });
+        }
+        _ => {}
+    }
+    // `IMAGE_EXPORT_DIRECTORY` is forty bytes; its `Name` is the RVA at offset twelve.
+    declared_fits(
+        rva,
+        40,
+        image.size_of_image,
+        "the export directory runs past the end of the image",
+    )?;
+    let mut at = clipped_reader(image, &mut read);
+    let name_rva = u32(&at(rva + 12, 4)?, 0)?;
+    read_c_string(name_rva, &mut at).map(Some)
 }
 
 /// Reads the import table, naming every slot without reading one.
@@ -634,15 +761,7 @@ pub fn read_imports(
     // refused; a length that would run past its end is clipped to it, because a name near the end
     // is legitimately shorter than the bounded read asks for, and a structure that comes back
     // short fails its own field parse.
-    let mut at = |rva: u32, len: usize| -> Result<Vec<u8>, PeError> {
-        // Clipped to the image rather than refused for overrunning it: a name near the end is
-        // legitimately shorter than the bounded read asks for, and a fixed-size structure that
-        // comes back short fails its own field parse. The *start* is still bounded.
-        let room = image.size_of_image.saturating_sub(rva) as usize;
-        let len = len.min(room);
-        let address = image.checked_va(rva, len)?;
-        read(address, len).ok_or(PeError::Unreadable { at: address, len })
-    };
+    let mut at = clipped_reader(image, &mut read);
 
     // Refused rather than truncated, which is this module's stated rule and was not followed
     // here: reading the first `MAX_LIBRARIES` and returning `Ok` drops the rest in silence, and a
@@ -1108,6 +1227,7 @@ mod tests {
             sections: Vec::new(),
             export_directory: (0, 0),
             import_directory: (0x1000, 40),
+            iat_directory: (0, 0),
         };
         // One descriptor whose lookup and address tables both sit at the very top of the image,
         // then a terminator. Every thunk read comes back as an ordinal, so the walk never stops
@@ -1214,6 +1334,7 @@ mod tests {
             }],
             export_directory: (0, 0),
             import_directory: (0, 0),
+            iat_directory: (0, 0),
         };
 
         // The start is inside the image and inside the address space; the end is not.
@@ -1289,6 +1410,129 @@ mod tests {
         );
     }
 
+    /// The import address table is read slot by slot, leaving out the zeros that end a library.
+    ///
+    /// The shape of a live driver whose import directory the loader has freed: only the address
+    /// table is left, and on a loaded image its slots hold bound addresses. Values are HEVD's,
+    /// read off a live ARM64 kernel. The zero in the middle is where one library's slots end and
+    /// the next one's begin, and the slot addresses are the ones [`Import::slot`] uses.
+    #[test]
+    fn test_the_import_address_table_is_read_slot_by_slot() {
+        let mut fake = driver_image();
+        // IMAGE_DIRECTORY_ENTRY_IAT is directory [12], at 0x168 + 12 * 8.
+        put(&mut fake.bytes, 0x1c8, &0x3000u32.to_le_bytes());
+        put(&mut fake.bytes, 0x1cc, &0x20u32.to_le_bytes());
+        put(
+            &mut fake.bytes,
+            0x3000,
+            &0xffff_f801_cdeb_8670u64.to_le_bytes(),
+        );
+        put(
+            &mut fake.bytes,
+            0x3008,
+            &0xffff_f801_cdd8_4f30u64.to_le_bytes(),
+        );
+        put(
+            &mut fake.bytes,
+            0x3018,
+            &0xffff_f801_cd60_0638u64.to_le_bytes(),
+        );
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        assert_eq!(image.iat_directory, (0x3000, 0x20));
+        let slots = read_import_address_table(&image, |at, len| fake.read(at, len))
+            .expect("the table reads");
+        assert_eq!(
+            slots,
+            vec![
+                IatSlot {
+                    slot: BASE + 0x3000,
+                    value: 0xffff_f801_cdeb_8670
+                },
+                IatSlot {
+                    slot: BASE + 0x3008,
+                    value: 0xffff_f801_cdd8_4f30
+                },
+                IatSlot {
+                    slot: BASE + 0x3018,
+                    value: 0xffff_f801_cd60_0638
+                },
+            ]
+        );
+    }
+
+    /// An image that declares no address table has none, and one whose declaration does not
+    /// describe a table is refused rather than read as an empty one.
+    #[test]
+    fn test_an_import_address_table_that_does_not_fit_is_refused() {
+        let fake = driver_image();
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        assert_eq!(
+            read_import_address_table(&image, |at, len| fake.read(at, len)),
+            Ok(Vec::new()),
+            "no directory, no slots"
+        );
+
+        let refused = |rva: u32, size: u32| {
+            let mut image = image.clone();
+            image.iat_directory = (rva, size);
+            read_import_address_table(&image, |at, len| fake.read(at, len))
+        };
+        for (rva, size, why) in [
+            (0x3000, 0, "an address without a size"),
+            (0, 0x20, "a size without an address"),
+            (0x3000, 0x1c, "a size that is not a whole number of slots"),
+            (0x3ff0, 0x20, "a table running past the end of the image"),
+        ] {
+            assert!(
+                matches!(refused(rva, size), Err(PeError::Malformed { .. })),
+                "{why} was read: {:?}",
+                refused(rva, size)
+            );
+        }
+    }
+
+    /// An address table that cannot be read says where, rather than coming back empty.
+    #[test]
+    fn test_an_unreadable_import_address_table_says_where() {
+        let mut fake = driver_image();
+        put(&mut fake.bytes, 0x1c8, &0x3000u32.to_le_bytes());
+        put(&mut fake.bytes, 0x1cc, &0x20u32.to_le_bytes());
+        fake.unreadable.push((BASE + 0x3000, BASE + 0x4000));
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        assert_eq!(
+            read_import_address_table(&image, |at, len| fake.read(at, len)),
+            Err(PeError::Unreadable {
+                at: BASE + 0x3000,
+                len: 0x20
+            })
+        );
+    }
+
+    /// The export directory names its own library -- the spelling an importer uses -- and an
+    /// image without one has no name to give.
+    #[test]
+    fn test_the_export_directory_names_its_library() {
+        let mut fake = driver_image();
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        assert_eq!(
+            read_export_library_name(&image, |at, len| fake.read(at, len)),
+            Ok(None)
+        );
+
+        // Export directory [0] at 0x168, forty bytes at 0x2200; its Name RVA is at +12.
+        put(&mut fake.bytes, 0x168, &0x2200u32.to_le_bytes());
+        put(&mut fake.bytes, 0x16c, &40u32.to_le_bytes());
+        put(&mut fake.bytes, 0x220c, &0x2240u32.to_le_bytes());
+        put(&mut fake.bytes, 0x2240, b"ntoskrnl.exe\0");
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        assert_eq!(
+            read_export_library_name(&image, |at, len| fake.read(at, len)),
+            Ok(Some("ntoskrnl.exe".to_string()))
+        );
+    }
+
     /// An executable section running past the image is **clipped**, not dropped.
     ///
     /// Dropping it is a silent truncation of the shape this module refuses everywhere else: the
@@ -1324,6 +1568,7 @@ mod tests {
             ],
             export_directory: (0, 0),
             import_directory: (0, 0),
+            iat_directory: (0, 0),
         };
 
         assert_eq!(
@@ -1495,6 +1740,7 @@ mod tests {
             }],
             export_directory: (0, 0),
             import_directory: (0, 0),
+            iat_directory: (0, 0),
         };
 
         assert_eq!(
