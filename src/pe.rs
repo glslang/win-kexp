@@ -752,13 +752,14 @@ const MAX_EXPORTS: usize = 1 << 16;
 /// itself: its declared span is checked against the image and must hold the forty-byte header.
 /// `Name` and each `AddressOfNames` entry are read through [`read_c_string`], bounded by the image
 /// and refused at RVA zero. `NumberOfFunctions` and `NumberOfNames` are bounded by what a sixteen-bit
-/// ordinal can number, and either at zero means there is nothing to name. `AddressOfFunctions`,
+/// ordinal can number; no functions means nothing to name, and names beside no functions are a
+/// contradiction, since each name's ordinal indexes the address table. `AddressOfFunctions`,
 /// `AddressOfNames` and `AddressOfNameOrdinals` are declared spans read whole, refused outside the
 /// image and at RVA zero. Each ordinal must index the address table. The function RVAs are only
 /// **compared** with the addresses asked about, never followed, so a forwarder's string RVA among
 /// them needs nothing. `Characteristics`, `TimeDateStamp`, the version and the ordinal `Base` are
 /// not read: names are matched to functions by position in the tables, which `Base` does not
-/// change. `halt` is polled between the tables and per name read, as [`read_imports`] polls it.
+/// change. `halt` is polled before each table and per name read, as [`read_imports`] polls it.
 pub fn read_exports_at(
     image: &Image,
     mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
@@ -801,6 +802,13 @@ pub fn read_exports_at(
             reason: "more exports than an ordinal can number",
         });
     }
+    // Every name's ordinal indexes the address table, so names beside an empty one cannot all be
+    // valid -- not one of them can.
+    if functions == 0 && named > 0 {
+        return Err(PeError::Malformed {
+            reason: "export names with no export address table for them to index",
+        });
+    }
     let library = {
         let mut at = clipped_reader(image, &mut read);
         read_c_string(name_rva, &mut at)?
@@ -813,6 +821,11 @@ pub fn read_exports_at(
         return Ok(Some(exports));
     }
 
+    // Polled before the address table as well as after it: it is read whole, up to 256 KiB, which
+    // over a serial link is most of half a minute -- not a read to start once the clock has gone.
+    if halt() {
+        return Err(PeError::Interrupted);
+    }
     let addresses = read_declared(image, &mut read, functions_at, functions * 4)?;
     let wanted: BTreeMap<usize, u32> = (0..functions)
         .map(|index| u32(&addresses, index * 4).map(|address| (index, address)))
@@ -1720,6 +1733,23 @@ mod tests {
         );
     }
 
+    /// A halt stops the walk before it reads a table, including the address table read to find out
+    /// that nothing asked about is exported -- which on a live target is up to 256 KiB.
+    #[test]
+    fn test_a_halt_stops_the_export_walk_before_its_tables() {
+        let fake = exporting_image();
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        assert_eq!(
+            read_exports_at(
+                &image,
+                |at, len| fake.read(at, len),
+                &BTreeSet::from([0x9999]),
+                || true
+            ),
+            Err(PeError::Interrupted)
+        );
+    }
+
     /// An export directory whose declaration does not describe one is refused rather than read
     /// out of bytes outside it -- and so is one that names no library, or an ordinal past its own
     /// address table, which would otherwise be read as a name the image does not give.
@@ -1733,7 +1763,7 @@ mod tests {
             let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
             read_exports_at(&image, |at, len| fake.read(at, len), &asked, || false)
         };
-        let cases: [(&str, &Change); 9] = [
+        let cases: [(&str, &Change); 10] = [
             ("a size smaller than the header", &|fake| {
                 put(&mut fake.bytes, 0x16c, &39u32.to_le_bytes())
             }),
@@ -1745,6 +1775,9 @@ mod tests {
             }),
             ("more functions than an ordinal can number", &|fake| {
                 put(&mut fake.bytes, 0x2214, &0x1_0001u32.to_le_bytes())
+            }),
+            ("names beside an empty address table", &|fake| {
+                put(&mut fake.bytes, 0x2214, &0u32.to_le_bytes())
             }),
             ("an ordinal past the address table", &|fake| {
                 put(&mut fake.bytes, 0x2280, &3u16.to_le_bytes())
