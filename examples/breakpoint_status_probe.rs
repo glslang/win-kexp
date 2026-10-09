@@ -10,9 +10,10 @@
 //!    stop once, at the breakpoint, having seen exactly `n` hits. Before `BreakpointAction` the
 //!    callback could not say this at all: its `Result<()>` reached the engine as `S_OK`, which is
 //!    `DEBUG_STATUS_NO_CHANGE`.
-//! 3. **Can the callback use the engine?** On every hit it builds a borrowed [`DebugEngine`] from the
-//!    breakpoint's own client and reads the instruction pointer, the registers and the bytes at the
-//!    breakpoint. A recorder that cannot read the arguments of the call it trapped records nothing.
+//! 3. **Can the callback use the engine?** On every hit it reads through the hit's own view
+//!    ([`BreakpointHit::engine`]): the instruction pointer, the thread, three argument registers
+//!    and the stack pointer, and the bytes at the breakpoint and at the stack. A recorder that
+//!    cannot read the arguments of the call it trapped records nothing.
 //! 4. **What does a hit cost each way?** The same `n` hits let through four ways: a **pass count**,
 //!    which the engine applies itself and so is the bare cost of a trap; the callback answering
 //!    `Go`; the callback reading the engine on every hit; and **command text** -- an `.if` on a
@@ -57,23 +58,23 @@
 //! carried them; **8 bytes the engine had not cached cost 1.05 ms** over serial, a link round trip of
 //! its own. `ExAllocatePool2` is saturated at that rate: 100 hits arrive in 2.3 s, back to back.
 //!
+//! `current_thread_data_offset` equals the engine's own `@$thread` at the stop on both: the TEB
+//! user-mode (`0xa79cf3b000`) and the KTHREAD on the kernel (`0xffffc386c48ed080`), measured
+//! 2026-10-09 through the hit view, where every kernel figure above repeated within its noise.
+//!
 //! One trap measured nothing the first time and is worth knowing: every phase on **one** launched
 //! process read the later ways as up to 2000x slower, because the first phases spent `cmd.exe`'s
 //! startup burst of allocations and the rest waited on a process that had gone quiet. The rate was
 //! the target's, not the way's -- hence a fresh process per phase.
 
 use std::cell::{Cell, RefCell};
-use std::ffi::c_void;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use dbgscope::dbgeng::{
-    BreakpointAction, BreakpointAt, BreakpointCallback, BreakpointSpec, DebugEngine,
+    BreakpointAction, BreakpointAt, BreakpointCallback, BreakpointHit, BreakpointSpec, DebugEngine,
 };
-use windows::Win32::System::Diagnostics::Debug::Extensions::{
-    DEBUG_VALUE, IDebugBreakpoint2, IDebugClient6, IDebugRegisters,
-};
-use windows::core::Interface;
 
 /// A user-mode target that allocates, and exits on its own if this program dies holding it.
 ///
@@ -93,8 +94,10 @@ struct EngineReads {
     failed: u32,
     first_failure: Option<String>,
     /// Time spent in each step, summed over the clean hits.
-    view: Duration,
     ip: Duration,
+    /// `current_thread_data_offset`, and the distinct answers it gave.
+    thread: Duration,
+    threads: BTreeSet<u64>,
     arguments: Duration,
     memory: Duration,
     /// Eight bytes at the stack pointer: memory the engine has not cached for this stop, which on
@@ -210,11 +213,10 @@ fn default_is_no_callback(engine: &DebugEngine, location: &str, seconds: u32) {
     println!("\n======== 1. Default is what no callback is ========");
     let seen = Rc::new(Cell::new(0u32));
     let counter = Rc::clone(&seen);
-    let callback: BreakpointCallback =
-        Box::new(move |_: &IDebugBreakpoint2, _: *const c_void, _: u32| {
-            counter.set(counter.get() + 1);
-            BreakpointAction::Default
-        });
+    let callback: BreakpointCallback = Box::new(move |_: &BreakpointHit<'_>| {
+        counter.set(counter.get() + 1);
+        BreakpointAction::Default
+    });
     let Some(armed) = Armed::new(engine, location, None, None, Some(callback)) else {
         return;
     };
@@ -264,29 +266,27 @@ fn let_hits_through(engine: &DebugEngine, location: &str, hits: u32, seconds: u3
                 (
                     None,
                     None,
-                    Some(Box::new(
-                        move |bp: &IDebugBreakpoint2, _: *const c_void, _: u32| {
-                            let n = counter.get() + 1;
-                            counter.set(n);
-                            if read_engine {
-                                let result =
-                                    read_through(bp, &arguments, &mut reads.borrow_mut(), n == 1);
-                                match result {
-                                    Ok(()) => reads.borrow_mut().clean += 1,
-                                    Err(why) => {
-                                        let mut reads = reads.borrow_mut();
-                                        reads.failed += 1;
-                                        reads.first_failure.get_or_insert(why);
-                                    }
+                    Some(Box::new(move |hit: &BreakpointHit<'_>| {
+                        let n = counter.get() + 1;
+                        counter.set(n);
+                        if read_engine {
+                            let result =
+                                read_through(hit, &arguments, &mut reads.borrow_mut(), n == 1);
+                            match result {
+                                Ok(()) => reads.borrow_mut().clean += 1,
+                                Err(why) => {
+                                    let mut reads = reads.borrow_mut();
+                                    reads.failed += 1;
+                                    reads.first_failure.get_or_insert(why);
                                 }
                             }
-                            if n < hits {
-                                BreakpointAction::Go
-                            } else {
-                                BreakpointAction::Break
-                            }
-                        },
-                    )),
+                        }
+                        if n < hits {
+                            BreakpointAction::Go
+                        } else {
+                            BreakpointAction::Break
+                        }
+                    })),
                 )
             }
         };
@@ -336,10 +336,10 @@ fn let_hits_through(engine: &DebugEngine, location: &str, hits: u32, seconds: u3
         );
         let per_hit = |d: Duration| d.as_secs_f64() * 1000.0 / f64::from(reads.clean.max(1));
         println!(
-            "  per clean hit: view {:.3} ms, ip {:.3} ms, three argument registers and sp {:.3} ms, \
-             memory at ip {:.3} ms, 8 bytes at sp {:.3} ms",
-            per_hit(reads.view),
+            "  per clean hit: ip {:.3} ms, thread {:.3} ms, three argument registers and sp \
+             {:.3} ms, memory at ip {:.3} ms, 8 bytes at sp {:.3} ms",
             per_hit(reads.ip),
+            per_hit(reads.thread),
             per_hit(reads.arguments),
             per_hit(reads.memory),
             per_hit(reads.stack)
@@ -350,6 +350,18 @@ fn let_hits_through(engine: &DebugEngine, location: &str, hits: u32, seconds: u3
                 took.as_secs_f64() * 1000.0
             );
         }
+        // What `current_thread_data_offset` names, checked against the engine's own `@$thread`
+        // at the stop: the KTHREAD on a kernel, the TEB in user mode.
+        println!(
+            "  distinct threads hit: {}; at the stop current_thread_data_offset {} against \
+             @$thread {}",
+            reads.threads.len(),
+            engine
+                .current_thread_data_offset()
+                .map_or_else(|e| e.to_string(), |at| format!("{at:#x}")),
+            pseudo_register_u64(engine, "$thread")
+                .map_or_else(|| "?".into(), |at| format!("{at:#x}"))
+        );
     }
 }
 
@@ -358,16 +370,15 @@ fn command_beside_callback(engine: &DebugEngine, location: &str, seconds: u32) {
     println!("\n======== a command beside a callback that answers Go ========");
     let seen = Rc::new(Cell::new(0u32));
     let counter = Rc::clone(&seen);
-    let callback: BreakpointCallback =
-        Box::new(move |_: &IDebugBreakpoint2, _: *const c_void, _: u32| {
-            let n = counter.get() + 1;
-            counter.set(n);
-            if n < 3 {
-                BreakpointAction::Go
-            } else {
-                BreakpointAction::Break
-            }
-        });
+    let callback: BreakpointCallback = Box::new(move |_: &BreakpointHit<'_>| {
+        let n = counter.get() + 1;
+        counter.set(n);
+        if n < 3 {
+            BreakpointAction::Go
+        } else {
+            BreakpointAction::Break
+        }
+    });
     let Some(_armed) = Armed::new(
         engine,
         location,
@@ -390,66 +401,70 @@ fn command_beside_callback(engine: &DebugEngine, location: &str, seconds: u32) {
     }
 }
 
-/// Reads the engine from inside a callback, through a view of the breakpoint's own client, timing
-/// each step. `full_bank` additionally times one `register_values()`, the read a recorder should
-/// not make per hit.
+/// Reads the engine from inside a callback, through the hit's own view, timing each step.
+/// `full_bank` additionally times one `register_values()`, the read a recorder should not make per
+/// hit.
 fn read_through(
-    bp: &IDebugBreakpoint2,
-    arguments: &[&str],
+    hit: &BreakpointHit<'_>,
+    registers: &[&str],
     reads: &mut EngineReads,
     full_bank: bool,
 ) -> Result<(), String> {
+    let engine = hit.engine();
     let started = Instant::now();
-    let client = unsafe { bp.GetAdder() }.map_err(|e| format!("GetAdder: {e}"))?;
-    let client: IDebugClient6 = client.cast().map_err(|e| format!("IDebugClient6: {e}"))?;
-    let registers: IDebugRegisters = client.cast().map_err(|e| format!("IDebugRegisters: {e}"))?;
-    let view = DebugEngine::try_from_client_interface(client).map_err(|e| e.to_string())?;
-    let offset = unsafe { bp.GetOffset() }.map_err(|e| format!("GetOffset: {e}"))?;
-    let viewed = Instant::now();
-
-    let ip = view.instruction_pointer().map_err(|e| format!("ip: {e}"))?;
+    let offset = hit.address().map_err(|e| e.to_string())?;
+    let ip = engine
+        .instruction_pointer()
+        .map_err(|e| format!("ip: {e}"))?;
     if ip != offset {
         return Err(format!("ip {ip:#x} is not the breakpoint's {offset:#x}"));
     }
     let ip_read = Instant::now();
 
+    let thread = engine
+        .current_thread_data_offset()
+        .map_err(|e| format!("thread: {e}"))?;
+    let thread_read = Instant::now();
+
+    // The last name is the stack pointer.
     let mut stack_pointer = 0;
-    for name in arguments {
-        let name_c = std::ffi::CString::new(*name).map_err(|e| e.to_string())?;
-        let index = unsafe {
-            registers.GetIndexByName(windows::core::PCSTR::from_raw(name_c.as_ptr().cast()))
-        }
-        .map_err(|e| format!("index of {name}: {e}"))?;
-        let mut value = DEBUG_VALUE::default();
-        unsafe { registers.GetValue(index, &mut value) }
-            .map_err(|e| format!("value of {name}: {e}"))?;
-        // The last name is the stack pointer; a 64-bit integer register either way.
-        stack_pointer = unsafe { value.Anonymous.Anonymous.I64 };
+    for name in registers {
+        stack_pointer = engine.integer_register(name).map_err(|e| e.to_string())?;
     }
     let arguments_read = Instant::now();
 
-    view.read_memory(ip, 4)
+    engine
+        .read_memory(ip, 4)
         .map_err(|e| format!("memory at ip: {e}"))?;
     let memory_read = Instant::now();
 
-    view.read_memory(stack_pointer, 8)
+    engine
+        .read_memory(stack_pointer, 8)
         .map_err(|e| format!("memory at sp {stack_pointer:#x}: {e}"))?;
     let stack_read = Instant::now();
 
-    reads.view += viewed - started;
-    reads.ip += ip_read - viewed;
-    reads.arguments += arguments_read - ip_read;
+    reads.ip += ip_read - started;
+    reads.thread += thread_read - ip_read;
+    reads.threads.insert(thread);
+    reads.arguments += arguments_read - thread_read;
     reads.memory += memory_read - arguments_read;
     reads.stack += stack_read - memory_read;
     if full_bank {
         let bank_started = Instant::now();
-        let count = view
+        let count = engine
             .register_values()
             .map_err(|e| format!("register_values: {e}"))?
             .len();
         reads.full_bank = Some((bank_started.elapsed(), count));
     }
     Ok(())
+}
+
+/// A pseudo-register's full value, read from `?`'s `Evaluate expression: <dec> = <hex>`.
+fn pseudo_register_u64(engine: &DebugEngine, name: &str) -> Option<u64> {
+    let text = engine.execute_command(&format!("? @{name}")).ok()?;
+    let hex = text.split('=').nth(1)?.trim();
+    u64::from_str_radix(&hex.replace('`', ""), 16).ok()
 }
 
 /// A pseudo-register's value, read from `?`'s `Evaluate expression: <dec> = <hex>`.

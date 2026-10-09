@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **A breakpoint callback is handed a typed `BreakpointHit`** -- the breakpoint's `id()`, its
+  `address()`, and an `engine()` stopped at the hit -- where it was handed the raw
+  `IDebugBreakpoint2`, the event context and its size. A callback that records a hit has to read
+  it, and it is a `'static` closure called from inside `dbgeng.dll`, so it cannot borrow the
+  `DebugEngine` that registered it; the view is a borrowed engine on the client that added the
+  breakpoint, built per hit, and a hit whose view cannot be built is answered `Default`.
+  **Breaking** for a `BreakpointCallback`; the only one was `examples/breakpoint_status_probe.rs`,
+  which reads through the view now.
+  `test_a_breakpoint_callback_reads_its_hit_and_lets_it_go_past` is the real-engine check on CI's
+  runners: a launched process, `Go` on the first hit and `Break` on the second, each read through
+  its view.
+
 - **A breakpoint callback decides whether the target stops.** `BreakpointCallback` returns a
   `BreakpointAction` -- `Default`, `Go` or `Break`, the `DEBUG_STATUS_*` an
   `IDebugEventContextCallbacks::Breakpoint` answers with -- where it returned
@@ -59,6 +71,15 @@ All notable changes to this project are documented here. The format follows
   here unobserved — which is the argument for the recording step.
 
 ### Added
+
+- **`DebugEngine::integer_register(name)`**: one integer register by name, zero-extended -- the read
+  a breakpoint callback makes, where `register_values` describes and reads every register the
+  engine knows (194 on an ARM64 user-mode target, 214 on its kernel). A register holding no integer
+  is a new `DbgEngError::Register` rather than a number made of part of it.
+- **`DebugEngine::current_thread_data_offset()`**: `GetCurrentThreadDataOffset`, the TEB in user
+  mode and the thread running on the current processor on a kernel -- which is what names a
+  *thread* there, where `current_thread_system_id` names a processor. Checked against the engine's
+  own `@$thread` at a stop, user mode and live kernel, by `examples/breakpoint_status_probe.rs`.
 
 - **`Instruction::privilege`: which family a privileged instruction reaches** (#153) — an I/O
   port, a model-specific register, a control or debug register, a descriptor table, the interrupt
