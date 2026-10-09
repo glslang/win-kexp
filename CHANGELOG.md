@@ -12,8 +12,15 @@ All notable changes to this project are documented here. The format follows
   `address()`, and an `engine()` stopped at the hit -- where it was handed the raw
   `IDebugBreakpoint2`, the event context and its size. A callback that records a hit has to read
   it, and it is a `'static` closure called from inside `dbgeng.dll`, so it cannot borrow the
-  `DebugEngine` that registered it; the view is a borrowed engine on the client that added the
-  breakpoint, built per hit, and a hit whose view cannot be built is answered `Default`.
+  `DebugEngine` that registered it; the view is a borrowed engine on **the client the callback is
+  registered on**, built per hit, and a hit whose view cannot be built is answered `Default`. Not
+  the breakpoint's adder: a DbgEng client may be used only on the thread that made it, and a
+  breakpoint added by another client on another thread would have handed the callback one it may
+  not call. So registering is one call, `set_breakpoint_callback`, which makes the callbacks and
+  registers them on its own client, and `clear_breakpoint_callback` unregisters them -- replacing
+  `create_debug_event_context_callbacks` with `set_breakpoint_event_callbacks` and
+  `clear_breakpoint_event_callbacks`, which earlier in this release could register callbacks on a
+  client other than the one they would read through.
   **Breaking** for a `BreakpointCallback`; the only one was `examples/breakpoint_status_probe.rs`,
   which reads through the view now.
   `test_a_breakpoint_callback_reads_its_hit_and_lets_it_go_past` is the real-engine check on CI's
