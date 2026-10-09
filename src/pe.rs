@@ -350,6 +350,24 @@ const MAX_IMPORTS_PER_LIBRARY: usize = 8192;
 const MAX_IMPORTS_TOTAL: usize = 16 * 1024;
 const MAX_NAME: usize = 512;
 
+/// The boundary a name read never spans: **512 bytes, not a page**, because not every hole is
+/// page-granular.
+///
+/// A minidump's are, and a page was the granule until an **image-file** target -- a `.sys` opened
+/// as a dump -- turned up one that is not. The engine maps each of its sections only as far as the
+/// section's `SizeOfRawData`, so the readable bytes stop where the section's file data does, which
+/// is a multiple of `FileAlignment` and can be mid-page. Measured on HEVD's ARM64 build, whose
+/// import directory and names are in `INIT` (VA `0x8D000`, raw size `0x800`): `0x8D7FF` reads and
+/// `0x8D800` does not, the library name `ntoskrnl.exe` sits at `0x8D68C`, and a 512-byte read of it
+/// -- inside one page -- crossed `0x8D800` and failed, so a driver whose every import byte was there
+/// answered "could not be read".
+///
+/// 512 is `FileAlignment`'s smallest legal value for an image whose sections are page-aligned, so
+/// every such raw-data end falls on a granule boundary and no chunk crosses one. A page is a
+/// multiple of 512, so the page-granular holes this was first written for stay covered. The cost
+/// is a second read for a name that straddles a 512-byte boundary rather than a 4 KiB one.
+const NAME_READ_GRANULE: usize = 0x200;
+
 /// A span the **image itself declares**, checked against the image whole rather than clipped to
 /// it.
 ///
@@ -840,15 +858,14 @@ pub fn imports_by_slot(imports: &[Import]) -> BTreeMap<u64, &Import> {
 /// `ShortRead` rather than a short buffer, so `|at, len| engine.read_memory(at, len).ok()` is
 /// `None` for any request that crosses into a gap.
 ///
-/// So a read never spans a page. The chunk is whatever is left before the next page boundary,
-/// capped by the remaining name budget -- which is one read for a name that does not straddle one,
-/// and two for a name that does. An image's base is page-aligned by the loader, so an RVA boundary
-/// is an address boundary.
+/// So a read never spans a [`NAME_READ_GRANULE`]. The chunk is whatever is left before the next
+/// granule boundary, capped by the remaining name budget -- which is one read for a name that does
+/// not straddle one, and two for a name that does. An image's base is page-aligned by the loader,
+/// so an RVA boundary is an address boundary.
 fn read_c_string(
     rva: u32,
     at: &mut impl FnMut(u32, usize) -> Result<Vec<u8>, PeError>,
 ) -> Result<String, PeError> {
-    const PAGE: usize = 0x1000;
     let mut raw: Vec<u8> = Vec::new();
     while raw.len() < MAX_NAME {
         let taken = u32::try_from(raw.len()).map_err(|_| PeError::Malformed {
@@ -857,7 +874,8 @@ fn read_c_string(
         let here = rva.checked_add(taken).ok_or(PeError::Malformed {
             reason: "an import name runs past the end of a 32-bit image offset",
         })?;
-        let want = (PAGE - (here as usize % PAGE)).min(MAX_NAME - raw.len());
+        let want =
+            (NAME_READ_GRANULE - (here as usize % NAME_READ_GRANULE)).min(MAX_NAME - raw.len());
         let chunk = at(here, want)?;
         // Clipped to nothing means the image ended before the name did, which is the same answer
         // as no terminator: the loop below says so rather than returning a truncated name.
@@ -1232,6 +1250,34 @@ mod tests {
         let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
         let table = read_imports(&image, |at, len| fake.read(at, len), || false)
             .expect("the name is beside the hole, not inside it");
+
+        assert_eq!(table.imports.len(), 3, "{table:#?}");
+        assert!(
+            table
+                .imports
+                .iter()
+                .all(|import| import.library == "ntoskrnl.exe"),
+            "{table:#?}"
+        );
+    }
+
+    /// A name beside a hole that starts **mid-page** is read too.
+    ///
+    /// The shape an image-file target produces: a section is mapped only as far as its raw data,
+    /// so the readable bytes stop at a `FileAlignment` boundary inside a page. This is HEVD's
+    /// `INIT` in miniature -- the name `0x174` bytes before the end of the mapped data -- and a read
+    /// granule of a page asked for 512 bytes there and failed, though every byte of the name read.
+    #[test]
+    fn test_a_name_beside_a_hole_inside_a_page_is_still_read() {
+        let mut fake = driver_image();
+        put(&mut fake.bytes, 0x200c, &0x2c8cu32.to_le_bytes());
+        put(&mut fake.bytes, 0x2c8c, b"ntoskrnl.exe\0");
+        // Unreadable from 0x2e00 to the end of the page: the section's raw data ended there.
+        fake.unreadable.push((BASE + 0x2e00, BASE + 0x3000));
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        let table = read_imports(&image, |at, len| fake.read(at, len), || false)
+            .expect("the name ends before the hole, inside the same page");
 
         assert_eq!(table.imports.len(), 3, "{table:#?}");
         assert!(

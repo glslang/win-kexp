@@ -268,6 +268,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **An import name beside a hole that starts mid-page is read.** `read_c_string` never spanned a
+  page, because a minidump's holes are page-granular -- but an **image-file** target (a `.sys`
+  opened as a dump) maps each section only as far as its `SizeOfRawData`, so its readable bytes can
+  stop mid-page. HEVD's ARM64 build keeps its import directory and names in `INIT` (VA `0x8D000`,
+  raw size `0x800`): `0x8D7FF` reads and `0x8D800` does not, the library name `ntoskrnl.exe` sits at
+  `0x8D68C`, and the 512-byte read of it crossed `0x8D800`, so the whole import table came back
+  unreadable with every byte of it there. Reads now stop at 512-byte boundaries,
+  `FileAlignment`'s smallest legal value for page-aligned sections, so no raw-data end can fall
+  inside one. `test_a_name_beside_a_hole_inside_a_page_is_still_read` fails with the granule put
+  back to a page (measured on ARM64).
+
 - **A64's cache, TLB and address-translation operations are named from their whole encoding,
   not from their cell**, and the cell rule was wrong in both directions. Every word in a `dc`,
   `ic`, `at` or `tlbi` cell was given that name, though only some `op1`/`op2` pairs there are
