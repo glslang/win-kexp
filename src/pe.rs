@@ -840,6 +840,12 @@ pub fn read_exports_at(
         return Err(PeError::Interrupted);
     }
     let ordinals = read_declared(image, &mut read, ordinals_at, named * 2)?;
+    // And between the two name tables, which the doc above promises and round 5 of review on #196
+    // found it did not keep: an export asked about by ordinal alone reaches no per-name poll below,
+    // so without this the name table would be read, and the answer returned, past a halt.
+    if halt() {
+        return Err(PeError::Interrupted);
+    }
     let names = read_declared(image, &mut read, names_at, named * 4)?;
     let mut at = clipped_reader(image, &mut read);
     for index in 0..named {
@@ -1745,6 +1751,24 @@ mod tests {
                 |at, len| fake.read(at, len),
                 &BTreeSet::from([0x9999]),
                 || true
+            ),
+            Err(PeError::Interrupted)
+        );
+
+        // And between the ordinal table and the name table. Asked about the export that has no
+        // name (0x1030, by ordinal only), the walk reaches no per-name poll, so a halt that comes
+        // on the third poll -- after the address and ordinal tables -- is only seen by the one
+        // between those two tables.
+        let polls = std::cell::Cell::new(0);
+        assert_eq!(
+            read_exports_at(
+                &image,
+                |at, len| fake.read(at, len),
+                &BTreeSet::from([0x1030]),
+                || {
+                    polls.set(polls.get() + 1);
+                    polls.get() >= 3
+                }
             ),
             Err(PeError::Interrupted)
         );
