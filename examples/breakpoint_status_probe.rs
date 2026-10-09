@@ -218,12 +218,14 @@ fn default_is_no_callback(engine: &DebugEngine, location: &str, seconds: u32) {
     let Some(armed) = Armed::new(engine, location, None, None, Some(callback)) else {
         return;
     };
-    let (elapsed, stopped_at) = run(engine, seconds);
+    let ran = run(engine, seconds);
     println!(
-        "  hits seen {} (want 1), stopped at {} (breakpoint {:#x}), {elapsed:.1} ms",
+        "  hits seen {} (want 1), stopped at {} (breakpoint {:#x}), {:.1} ms",
         seen.get(),
-        stopped_at.map_or_else(|| "?".into(), |a| format!("{a:#x}")),
-        armed.address
+        ran.stopped_at
+            .map_or_else(|| "?".into(), |a| format!("{a:#x}")),
+        armed.address,
+        ran.elapsed
     );
 }
 
@@ -294,7 +296,8 @@ fn let_hits_through(engine: &DebugEngine, location: &str, hits: u32, seconds: u3
     let Some(armed) = Armed::new(engine, location, pass_count, command, callback) else {
         return;
     };
-    let (elapsed, stopped_at) = run(engine, seconds);
+    let ran = run(engine, seconds);
+    let elapsed = ran.elapsed;
     let counted = match way {
         Way::Go | Way::GoReadingEngine => Some(seen.get()),
         Way::CommandText => {
@@ -306,22 +309,18 @@ fn let_hits_through(engine: &DebugEngine, location: &str, hits: u32, seconds: u3
         }
         Way::PassCount => None,
     };
-    let stopped_here = stopped_at == Some(armed.address);
+    // A pass count reports no count of its own: it is `hits` exactly when the phase finished,
+    // and unknown otherwise.
+    let counted = counted.or(ran.finished_at(armed.address).then_some(hits));
+    let shown = counted.map_or_else(|| "?".into(), |n| n.to_string());
     match counted {
-        Some(n) if n > 0 => println!(
-            "  {n} hits in {elapsed:.1} ms = {:.3} ms/hit; stopped at the breakpoint: {stopped_here}",
+        Some(n) if n > 0 && ran.finished_at(armed.address) => println!(
+            "  {n} hits in {elapsed:.1} ms = {:.3} ms/hit; stopped at the breakpoint on the last",
             elapsed / f64::from(n)
         ),
-        Some(n) => {
-            println!("  {n} hits in {elapsed:.1} ms; stopped at the breakpoint: {stopped_here}")
-        }
-        None if matches!(way, Way::CommandText) => {
-            println!("  ? hits in {elapsed:.1} ms; stopped at the breakpoint: {stopped_here}")
-        }
-        None => println!(
-            "  {hits} hits (pass count) in {elapsed:.1} ms = {:.3} ms/hit; stopped at the breakpoint: \
-             {stopped_here}",
-            elapsed / f64::from(hits)
+        _ => println!(
+            "  INCOMPLETE: {shown} hits in {elapsed:.1} ms without stopping at the breakpoint, so \
+             no per-hit figure"
         ),
     }
     if matches!(way, Way::GoReadingEngine) {
@@ -465,9 +464,9 @@ fn pseudo_register(engine: &DebugEngine, name: &str) -> Option<u32> {
 }
 
 /// Resumes and waits for the next stop, bounded; answers the time taken and where it stopped.
-fn run(engine: &DebugEngine, seconds: u32) -> (f64, Option<u64>) {
+fn run(engine: &DebugEngine, seconds: u32) -> Ran {
     let started = Instant::now();
-    match engine.execute_and_wait("g", seconds * 1000) {
+    let on_its_own = match engine.execute_and_wait("g", seconds * 1000) {
         Ok(run) => {
             if run.cut_short.is_some() {
                 println!(
@@ -478,11 +477,36 @@ fn run(engine: &DebugEngine, seconds: u32) -> (f64, Option<u64>) {
             if run.target_gone {
                 println!("  the target is gone");
             }
+            run.cut_short.is_none() && !run.target_gone
         }
-        Err(e) => println!("  g failed: {e}"),
+        Err(e) => {
+            println!("  g failed: {e}");
+            false
+        }
+    };
+    Ran {
+        elapsed: started.elapsed().as_secs_f64() * 1000.0,
+        stopped_at: engine.instruction_pointer().ok(),
+        on_its_own,
     }
-    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-    (elapsed, engine.instruction_pointer().ok())
+}
+
+/// One resume: how long it took, where the target stopped, and whether the wait ended because the
+/// target stopped -- rather than on the cap, a lost target or a failed wait.
+struct Ran {
+    elapsed: f64,
+    stopped_at: Option<u64>,
+    on_its_own: bool,
+}
+
+impl Ran {
+    /// A phase finished only if the target stopped itself, at the breakpoint: that stop is the last
+    /// hit, so the count is the whole phase and the elapsed time is spent on hits. Anything else
+    /// leaves a time that includes waiting on a target that was not hitting -- which is how a 60s
+    /// cap once read as 331 ms a hit -- so it gets no per-hit figure at all.
+    fn finished_at(&self, address: u64) -> bool {
+        self.on_its_own && self.stopped_at == Some(address)
+    }
 }
 
 /// One breakpoint and its callbacks, removed and unregistered when it goes out of scope.
