@@ -95,9 +95,16 @@ All notable changes to this project are documented here. The format follows
   slots read and hold `nt!ExAllocatePoolWithTag` and the rest. On a loaded image a slot holds the
   address its import was bound to, so naming that address -- which needs an engine -- names the
   import. Declared spans are checked against the image, refused rather than truncated.
-- **`pe::read_export_library_name`**: the name an export directory gives its own library, which is
-  the spelling an importer uses -- the kernel is loaded as `ntkrnlmp.exe` and imported as
-  `ntoskrnl.exe`.
+- **`pe::read_exports_at`**: an image's own library name and the names its exports have at a set of
+  addresses -- what an import bound to one of them is called, and the library it is filed under.
+  The library is the spelling an importer uses: the kernel loads as `ntkrnlmp.exe` and is imported
+  as `ntoskrnl.exe`. It reads the export address table and the name tables whole, since an address
+  is found only by looking, and a **name string** only for an export at a requested address, which
+  for a kernel is a handful of strings rather than thousands. A symbol lookup is the tempting
+  alternative and the wrong one: on a live ARM64 kernel HEVD's `__C_specific_handler` slot is bound
+  to an address the engine names `nt!_C_specific_handler`. A directory declared smaller than its
+  header or past the image, a library name at RVA zero, and an ordinal past the address table are
+  refused rather than read.
 
 - **`Instruction::privilege`: which family a privileged instruction reaches** (#153) — an I/O
   port, a model-specific register, a control or debug register, a descriptor table, the interrupt

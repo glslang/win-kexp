@@ -86,7 +86,7 @@
 //!
 //! [dbgscope#150]: https://github.com/glslang/dbgscope/issues/150
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
@@ -620,6 +620,20 @@ fn clipped_reader<'a>(
     }
 }
 
+/// A span the image declares, read whole: refused if any of it is outside the image, and
+/// [`PeError::Unreadable`] if any of it does not read -- never clipped to what does.
+fn read_declared(
+    image: &Image,
+    read: &mut impl FnMut(u64, usize) -> Option<Vec<u8>>,
+    rva: u32,
+    len: usize,
+) -> Result<Vec<u8>, PeError> {
+    let address = image.checked_va(rva, len)?;
+    read(address, len)
+        .filter(|bytes| bytes.len() == len)
+        .ok_or(PeError::Unreadable { at: address, len })
+}
+
 /// One slot of the import address table, and what it holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IatSlot {
@@ -673,9 +687,7 @@ pub fn read_import_address_table(
     // `checked_va` refuses the whole span, end included, so a table running past the image is
     // `Malformed` here rather than clipped.
     let address = image.checked_va(rva, len)?;
-    let bytes = read(address, len)
-        .filter(|bytes| bytes.len() == len)
-        .ok_or(PeError::Unreadable { at: address, len })?;
+    let bytes = read_declared(image, &mut read, rva, len)?;
     let mut slots = Vec::new();
     for (index, raw) in bytes.chunks_exact(pointer).enumerate() {
         let value = match image.bitness {
@@ -692,17 +704,49 @@ pub fn read_import_address_table(
     Ok(slots)
 }
 
-/// The library name an image's export directory gives itself (`IMAGE_EXPORT_DIRECTORY.Name`), or
-/// `None` for an image that exports nothing.
+/// What an image exports at a set of addresses: its own library name, and the names each address is
+/// exported under.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExportsAt {
+    /// `IMAGE_EXPORT_DIRECTORY.Name`: the name the image gives its own library, which is the
+    /// spelling an importer uses -- the kernel is loaded as `ntkrnlmp.exe` and imported as
+    /// `ntoskrnl.exe`.
+    pub library: String,
+    /// The names each requested RVA is exported under, in the export name table's order. Several
+    /// where names share an address; absent where none is exported there -- an export by ordinal
+    /// only, or an address that is not an export at all.
+    pub names: BTreeMap<u32, Vec<String>>,
+}
+
+/// Ordinals are sixteen bits, so an export address table longer than this is not one a loader built.
+const MAX_EXPORTS: usize = 1 << 16;
+
+/// The exports of an image at `rvas` -- what an import bound to one of those addresses is called,
+/// and the library it is filed under -- or `None` for an image that exports nothing.
 ///
-/// **The spelling an importer uses**, which is the reason to read it rather than take a module's
-/// image name: the kernel is loaded as `ntkrnlmp.exe` and imported as `ntoskrnl.exe`, and naming
-/// an import from the address it was bound to has to land on the second to match anything keyed
-/// by an import table.
-pub fn read_export_library_name(
+/// **For naming an import from the address it was bound to**, where a symbol lookup is the
+/// tempting shortcut and the wrong one: the symbol at an exported address need not be the export's
+/// name. Measured on a live ARM64 kernel: HEVD's slot for `__C_specific_handler` is bound to an
+/// address the engine names `nt!_C_specific_handler`. The export table is the name the importer
+/// used, and it needs no symbols at all.
+///
+/// **Reads only what the question needs.** The export address table is read whole, since an
+/// address is found only by looking; the name and ordinal tables are read whole for the same
+/// reason; and a **name string** is read only for an export at a requested address -- which for a
+/// kernel exporting thousands of names is a handful of strings rather than all of them, on a link
+/// where every read is a round trip. An empty `rvas` reads the directory and the library name and
+/// nothing else.
+///
+/// The directory's declared span is checked against the image and must hold the fixed header;
+/// every table is a declared span too, refused rather than clipped; and an ordinal past the end of
+/// the address table, or a library name at RVA zero, is the image contradicting itself. `halt` is
+/// polled between the tables and per name read, as [`read_imports`] polls it.
+pub fn read_exports_at(
     image: &Image,
     mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
-) -> Result<Option<String>, PeError> {
+    rvas: &BTreeSet<u32>,
+    mut halt: impl FnMut() -> bool,
+) -> Result<Option<ExportsAt>, PeError> {
     let (rva, size) = image.export_directory;
     match (rva, size) {
         (0, 0) => return Ok(None),
@@ -713,16 +757,82 @@ pub fn read_export_library_name(
         }
         _ => {}
     }
-    // `IMAGE_EXPORT_DIRECTORY` is forty bytes; its `Name` is the RVA at offset twelve.
+    // `IMAGE_EXPORT_DIRECTORY` is forty bytes, and the data directory's size is the size of that
+    // and of the tables an image may place inside it -- so a declaration smaller than the header
+    // describes no directory, and one past the image describes somebody else's bytes.
+    if size < 40 {
+        return Err(PeError::Malformed {
+            reason: "the export directory is smaller than its own header",
+        });
+    }
     declared_fits(
         rva,
-        40,
+        size,
         image.size_of_image,
         "the export directory runs past the end of the image",
     )?;
+    let header = read_declared(image, &mut read, rva, 40)?;
+    let name_rva = u32(&header, 12)?;
+    let functions = u32(&header, 20)? as usize;
+    let named = u32(&header, 24)? as usize;
+    let functions_at = u32(&header, 28)?;
+    let names_at = u32(&header, 32)?;
+    let ordinals_at = u32(&header, 36)?;
+    if name_rva == 0 {
+        return Err(PeError::Malformed {
+            reason: "the export directory names no library",
+        });
+    }
+    if functions > MAX_EXPORTS || named > MAX_EXPORTS {
+        return Err(PeError::Malformed {
+            reason: "more exports than an ordinal can number",
+        });
+    }
+    let library = {
+        let mut at = clipped_reader(image, &mut read);
+        read_c_string(name_rva, &mut at)?
+    };
+    let mut exports = ExportsAt {
+        library,
+        names: BTreeMap::new(),
+    };
+    if rvas.is_empty() || functions == 0 || named == 0 {
+        return Ok(Some(exports));
+    }
+
+    let addresses = read_declared(image, &mut read, functions_at, functions * 4)?;
+    let wanted: BTreeMap<usize, u32> = (0..functions)
+        .map(|index| u32(&addresses, index * 4).map(|address| (index, address)))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(_, address)| rvas.contains(address))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(Some(exports));
+    }
+    if halt() {
+        return Err(PeError::Interrupted);
+    }
+    let ordinals = read_declared(image, &mut read, ordinals_at, named * 2)?;
+    let names = read_declared(image, &mut read, names_at, named * 4)?;
     let mut at = clipped_reader(image, &mut read);
-    let name_rva = u32(&at(rva + 12, 4)?, 0)?;
-    read_c_string(name_rva, &mut at).map(Some)
+    for index in 0..named {
+        let ordinal = usize::from(u16(&ordinals, index * 2)?);
+        if ordinal >= functions {
+            return Err(PeError::Malformed {
+                reason: "an export name's ordinal is past the end of the export address table",
+            });
+        }
+        let Some(&address) = wanted.get(&ordinal) else {
+            continue;
+        };
+        if halt() {
+            return Err(PeError::Interrupted);
+        }
+        let name = read_c_string(u32(&names, index * 4)?, &mut at)?;
+        exports.names.entry(address).or_default().push(name);
+    }
+    Ok(Some(exports))
 }
 
 /// Reads the import table, naming every slot without reading one.
@@ -1510,27 +1620,121 @@ mod tests {
         );
     }
 
-    /// The export directory names its own library -- the spelling an importer uses -- and an
-    /// image without one has no name to give.
-    #[test]
-    fn test_the_export_directory_names_its_library() {
+    /// An image with exports, for the readers that name an import from its bound address: three
+    /// functions, the first exported under two names, the third by ordinal only.
+    fn exporting_image() -> FakeImage {
         let mut fake = driver_image();
+        // Export directory [0] at 0x168: forty bytes at 0x2200, its tables inside it.
+        put(&mut fake.bytes, 0x168, &0x2200u32.to_le_bytes());
+        put(&mut fake.bytes, 0x16c, &0x100u32.to_le_bytes());
+        put(&mut fake.bytes, 0x220c, &0x2240u32.to_le_bytes()); // Name
+        put(&mut fake.bytes, 0x2214, &3u32.to_le_bytes()); // NumberOfFunctions
+        put(&mut fake.bytes, 0x2218, &3u32.to_le_bytes()); // NumberOfNames
+        put(&mut fake.bytes, 0x221c, &0x2260u32.to_le_bytes()); // AddressOfFunctions
+        put(&mut fake.bytes, 0x2220, &0x2270u32.to_le_bytes()); // AddressOfNames
+        put(&mut fake.bytes, 0x2224, &0x2280u32.to_le_bytes()); // AddressOfNameOrdinals
+        put(&mut fake.bytes, 0x2240, b"ntoskrnl.exe\0");
+        for (index, address) in [0x1010u32, 0x1020, 0x1030].into_iter().enumerate() {
+            put(&mut fake.bytes, 0x2260 + index * 4, &address.to_le_bytes());
+        }
+        for (index, (name_at, ordinal, name)) in [
+            (0x2290u32, 0u16, &b"ExAllocatePoolWithTag\0"[..]),
+            (0x22b0, 1, b"__C_specific_handler\0"),
+            (0x22d0, 0, b"AnAliasOfTheFirst\0"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put(&mut fake.bytes, 0x2270 + index * 4, &name_at.to_le_bytes());
+            put(&mut fake.bytes, 0x2280 + index * 2, &ordinal.to_le_bytes());
+            put(&mut fake.bytes, name_at as usize, name);
+        }
+        fake
+    }
+
+    /// An address is named by the export table: every name it is exported under, and nothing for
+    /// one exported by ordinal only or not at all -- with the library the directory names.
+    #[test]
+    fn test_exports_are_named_at_the_addresses_asked_about() {
+        let fake = exporting_image();
         let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        let asked = BTreeSet::from([0x1010, 0x1020, 0x1030, 0x1040]);
+        let exports = read_exports_at(&image, |at, len| fake.read(at, len), &asked, || false)
+            .expect("the exports read")
+            .expect("the image exports");
+        assert_eq!(exports.library, "ntoskrnl.exe");
         assert_eq!(
-            read_export_library_name(&image, |at, len| fake.read(at, len)),
-            Ok(None)
+            exports.names,
+            BTreeMap::from([
+                (
+                    0x1010,
+                    vec![
+                        "ExAllocatePoolWithTag".to_string(),
+                        "AnAliasOfTheFirst".to_string()
+                    ]
+                ),
+                (0x1020, vec!["__C_specific_handler".to_string()]),
+            ])
         );
 
-        // Export directory [0] at 0x168, forty bytes at 0x2200; its Name RVA is at +12.
-        put(&mut fake.bytes, 0x168, &0x2200u32.to_le_bytes());
-        put(&mut fake.bytes, 0x16c, &40u32.to_le_bytes());
-        put(&mut fake.bytes, 0x220c, &0x2240u32.to_le_bytes());
-        put(&mut fake.bytes, 0x2240, b"ntoskrnl.exe\0");
-        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        // Asking about nothing reads the library and stops there.
+        let library = read_exports_at(
+            &image,
+            |at, len| fake.read(at, len),
+            &BTreeSet::new(),
+            || false,
+        )
+        .expect("the directory reads")
+        .expect("the image exports");
+        assert_eq!(library.library, "ntoskrnl.exe");
+        assert!(library.names.is_empty());
+
+        // An image exporting nothing has nothing to say.
+        let plain = driver_image();
+        let image = read_image(BASE, |at, len| plain.read(at, len)).expect("the headers read");
         assert_eq!(
-            read_export_library_name(&image, |at, len| fake.read(at, len)),
-            Ok(Some("ntoskrnl.exe".to_string()))
+            read_exports_at(&image, |at, len| plain.read(at, len), &asked, || false),
+            Ok(None)
         );
+    }
+
+    /// An export directory whose declaration does not describe one is refused rather than read
+    /// out of bytes outside it -- and so is one that names no library, or an ordinal past its own
+    /// address table, which would otherwise be read as a name the image does not give.
+    #[test]
+    fn test_an_export_directory_that_contradicts_itself_is_refused() {
+        type Change = dyn Fn(&mut FakeImage);
+        let asked = BTreeSet::from([0x1010]);
+        let refused = |change: &Change| {
+            let mut fake = exporting_image();
+            change(&mut fake);
+            let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+            read_exports_at(&image, |at, len| fake.read(at, len), &asked, || false)
+        };
+        let cases: [(&str, &Change); 5] = [
+            ("a size smaller than the header", &|fake| {
+                put(&mut fake.bytes, 0x16c, &39u32.to_le_bytes())
+            }),
+            ("a span past the end of the image", &|fake| {
+                put(&mut fake.bytes, 0x16c, &0x2000u32.to_le_bytes())
+            }),
+            ("a library name at RVA zero", &|fake| {
+                put(&mut fake.bytes, 0x220c, &0u32.to_le_bytes())
+            }),
+            ("more functions than an ordinal can number", &|fake| {
+                put(&mut fake.bytes, 0x2214, &0x1_0001u32.to_le_bytes())
+            }),
+            ("an ordinal past the address table", &|fake| {
+                put(&mut fake.bytes, 0x2280, &3u16.to_le_bytes())
+            }),
+        ];
+        for (why, change) in cases {
+            assert!(
+                matches!(refused(change), Err(PeError::Malformed { .. })),
+                "{why} was read: {:?}",
+                refused(change)
+            );
+        }
     }
 
     /// An executable section running past the image is **clipped**, not dropped.
